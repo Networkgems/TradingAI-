@@ -343,4 +343,34 @@ describe('TRA-4978 §4 — nothing here can admit anything', () => {
       expect(describeCostBarCellStandDown(cell.cellKey, cell).admits).toBe(cell.admits);
     }
   });
+
+  // Requested on-thread by QuantTrader 2026-10-01T22:18Z, after reading n=293 /
+  // n=368 against OTM cells on one build and against RV cells on another and
+  // being unable to tell a mis-keyed join from a re-folded population.
+  //
+  // The join cannot be positional: `describeCostBarCellStandDown` takes the cell
+  // KEY, and the route looks the estimator cell up by that exact string. The
+  // discriminator a reader can use without the source is that every statement
+  // NAMES ITS OWN CELL — verified 4/4 against live `0d81630c` 2026-10-02T01:11Z,
+  // where the n=293 / n=368 populations belong to the two RV cells and the armed
+  // OTM cells hold n=66 / n=124.
+  it('a stand-down names ITS OWN cell, so a mis-keyed or positional join is visible', () => {
+    const pairs = [
+      [CELL_020, CELL_030],
+      [CELL_030, CELL_020],
+    ] as const;
+    for (const [a, b] of pairs) {
+      const sd = describeCostBarCellStandDown(a.cellKey, a);
+      expect(sd.statement).toContain(a.cellKey);
+      expect(sd.statement).not.toContain(b.cellKey);
+      // And the population published beside the key is that key's own.
+      expect(sd.n).toBe(a.n);
+    }
+    // The failing shape, spelled out: a join that handed cell A's key cell B's
+    // population would publish B's `n` under A's name, and nothing else in the
+    // payload would contradict it.
+    const miskeyed = describeCostBarCellStandDown(CELL_020.cellKey, CELL_030);
+    expect(miskeyed.n).toBe(CELL_030.n);
+    expect(miskeyed.n).not.toBe(CELL_020.n);
+  });
 });

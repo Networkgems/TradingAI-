@@ -10,6 +10,10 @@ import {
   catalystSweepStateCountForTests,
   CATALYST_SWEEP_MAX_ATTEMPTS,
   CATALYST_SWEEP_RETRY_BACKOFF_MS,
+  catalystSweepResidentKeys,
+  catalystSweepSessionsSweptByWindow,
+  catalystSweepEvictionProof,
+  catalystSweepEvictionVerdict,
   type CatalystMetrics,
 } from './news-catalyst-source.js';
 import {
@@ -288,6 +292,109 @@ describe('the probe survives an ET-day boundary (TRA-4737)', () => {
     expect(catalystSweepStateCountForTests()).toBe(2);
     expect(catalystSweepGateSnapshot('premarket')).toMatchObject({ session: '2026-09-21' });
     expect(catalystSweepGateSnapshot('midday')).toMatchObject({ session: '2026-09-21' });
+  });
+});
+
+// TRA-4777 blind 3 — TRA-4737 shipped the eviction and TRA-4761 could not
+// grade it in production. Two separate reasons, and the fix needs both halves:
+//
+//   1. The resident-key set alone cannot VERIFY. A live eviction holds one key
+//      per window; so does a process that only ever swept one session. Those
+//      are the same bytes. Only the session census separates them.
+//   2. Even with the census, the grade waits on one process surviving from
+//      before session D's 13:00Z sweep to D+1's. bqb1 restarts several times a
+//      day under the pm2 watchdog (no deploy record), so that is a lottery --
+//      both measured attempts landed on a box booted after the day's sweeps,
+//      holding zero keys. The in-band proof removes the wait entirely.
+describe('eviction is gradable from outside the process (TRA-4777)', () => {
+  const DAY = 24 * 3_600_000;
+
+  it('the in-band proof passes, in BOTH directions, with no traffic at all', () => {
+    // No sweeps have run in this test. That is the point: the proof needs no
+    // uptime and no market session.
+    expect(catalystSweepResidentKeys()).toEqual([]);
+    expect(catalystSweepEvictionProof()).toEqual({
+      proven: true,
+      checks: { sameWindowRetired: true, otherWindowPreserved: true },
+      detail: null,
+    });
+  });
+
+  it('the proof does not disturb the live gate it is reporting on', async () => {
+    // `retireStaleWindowKeys` deletes every OTHER key for its window, so a
+    // proof that ran against the live map would destroy the resident key the
+    // neighbouring fields publish. Grading the instrument with the instrument.
+    await sessionCatalystPicks(makeDeps({ healthy: true, at: NOW }).deps, 'premarket');
+    const before = catalystSweepResidentKeys();
+    expect(before).toEqual(['2026-09-17:premarket']);
+
+    catalystSweepEvictionProof();
+    catalystSweepEvictionProof();
+
+    expect(catalystSweepResidentKeys()).toEqual(before);
+    expect(catalystSweepGateSnapshot('premarket')).toMatchObject({ session: '2026-09-17' });
+  });
+
+  it('the session census is monotone: it counts sessions the eviction has deleted', async () => {
+    for (let d = 0; d < 3; d++) {
+      await sessionCatalystPicks(makeDeps({ healthy: true, at: NOW + d * DAY }).deps, 'premarket');
+    }
+    await sessionCatalystPicks(
+      makeDeps({ healthy: true, at: NOW + 3 * 3_600_000 }).deps,
+      'midday',
+    );
+
+    // One key survives per window...
+    expect(catalystSweepResidentKeys().filter((k) => k.endsWith(':premarket'))).toHaveLength(1);
+    // ...but the census still knows three sessions entered. This is the half
+    // that makes the surviving key mean something.
+    expect(catalystSweepSessionsSweptByWindow()).toEqual({ premarket: 3, midday: 1 });
+  });
+
+  it('a single-session read is VACUOUS, not a pass — and the wire says so', async () => {
+    await sessionCatalystPicks(makeDeps({ healthy: true, at: NOW }).deps, 'premarket');
+    const keys = catalystSweepResidentKeys();
+    const swept = catalystSweepSessionsSweptByWindow();
+
+    expect(keys).toEqual(['2026-09-17:premarket']);
+    expect(swept.premarket).toBe(1);
+    // One resident key and a healthy-looking snapshot...
+    expect(catalystSweepGateSnapshot('premarket')).toMatchObject({ session: '2026-09-17' });
+    // ...and the verdict still refuses to call it a pass.
+    expect(catalystSweepEvictionVerdict(keys, swept.premarket, 'premarket')).toBe(
+      'vacuous_single_session',
+    );
+  });
+
+  it('two sessions in one process is the real grade, and it reads `confirmed`', async () => {
+    await sessionCatalystPicks(makeDeps({ healthy: true, at: NOW }).deps, 'premarket');
+    await sessionCatalystPicks(makeDeps({ healthy: true, at: NOW + DAY }).deps, 'premarket');
+    const keys = catalystSweepResidentKeys();
+    const swept = catalystSweepSessionsSweptByWindow();
+
+    expect(swept.premarket).toBe(2);
+    expect(keys).toEqual(['2026-09-18:premarket']);
+    expect(catalystSweepEvictionVerdict(keys, swept.premarket, 'premarket')).toBe('confirmed');
+  });
+
+  // The negative controls. Each of these is the exact key set a DEAD eviction
+  // would emit; if the verdict cannot go red on them it is not an instrument.
+  it('a dead eviction reads `falsified` from a single read, per window', () => {
+    const dead = ['2026-09-17:premarket', '2026-09-18:premarket', '2026-09-18:midday'];
+    expect(catalystSweepEvictionVerdict(dead, 2, 'premarket')).toBe('falsified');
+    // ...and the window that is still healthy is NOT condemned with it.
+    expect(catalystSweepEvictionVerdict(dead, 1, 'midday')).toBe('vacuous_single_session');
+  });
+
+  it('`falsified` outranks the census — a dead eviction that swept one session still fails', () => {
+    // Guards against grading the census first and short-circuiting: two keys
+    // for one window is impossible under a live eviction however few sessions
+    // were swept, so it must never be softened to `vacuous`.
+    expect(catalystSweepEvictionVerdict(['a:midday', 'b:midday'], 0, 'midday')).toBe('falsified');
+  });
+
+  it('an empty process is vacuous, never confirmed', () => {
+    expect(catalystSweepEvictionVerdict([], 0, 'premarket')).toBe('vacuous_single_session');
   });
 });
 

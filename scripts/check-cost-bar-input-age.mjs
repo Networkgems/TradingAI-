@@ -131,12 +131,53 @@ export function gradeCostBarInputAge(payload) {
         + `${c.decisionsShortCircuitedUpstream ?? '?'} refused upstream`,
     )
     .join('; ');
-  if (entry.decisionsDecidedByStaleInput > 0) {
+  // ⭐ TRA-4978 (second pass) — GRADE THE RECENCY ARM, NOT THE LIFETIME ONE.
+  //
+  // `decisionsDecidedByStaleInput` folds the RETAINED archive, which is
+  // append-only with no backfill. It went nonzero on 2026-09-09 and will stay
+  // nonzero until those rows age out of the 30-day window, whatever anyone does
+  // to the input. Keying GOVERNING on it makes this grader unclearable: it would
+  // have paged every beat from 2026-09-25 onward for a constant that has decided
+  // nothing since 2026-09-24. Same shape as TRA-3703's invariant-derived
+  // `breach` — an identity built to EXPOSE a gap cannot grade its remedy.
+  //
+  // `recency.staleInputGovernsLatestSession` is three-valued and each value gets
+  // its own exit: `true` GOVERNING, `false` DEGRADED (dormant, disclosed),
+  // `null` BLIND (the latest refusing session carries no classified row, so the
+  // question was not answered — and unknown is not a clean bill).
+  const recency = entry.recency ?? null;
+  if (recency !== null && typeof recency === 'object') {
+    const governs = recency.staleInputGovernsLatestSession;
+    if (governs === null || governs === undefined) {
+      return {
+        exit: EXIT.BLIND,
+        reason:
+          `${CODE} recency arm is NOT COMPUTABLE on the latest refusing session `
+          + `(${recency.latestEtDayWithRefusals ?? 'unknown day'}): `
+          + `${recency.latestSessionUnclassified ?? '?'} refusal(s) carry no reason code. ${detail}`,
+      };
+    }
+    if (governs === true) {
+      return {
+        exit: EXIT.GOVERNING,
+        reason:
+          `${over.length} cell(s) over the ${bar} d bar AND the stale constant DECIDED `
+          + `${recency.latestSessionDecidedByStaleInput ?? '?'} refusal(s) on the latest session `
+          + `(${recency.latestEtDayWithRefusals ?? 'unknown day'}): ${detail}`,
+      };
+    }
+  } else if (entry.decisionsDecidedByStaleInput > 0) {
+    // No `recency` key: a build that predates this pass. Fall back to the
+    // lifetime arm so the grader still reports SOMETHING, but say out loud that
+    // the arm it fell back to cannot clear — a silent fallback to a latching
+    // predicate is how the misattribution this ticket fixes survived five weeks.
     return {
       exit: EXIT.GOVERNING,
       reason:
-        `${over.length} cell(s) over the ${bar} d bar AND the stale constant DECIDED `
-        + `${entry.decisionsDecidedByStaleInput} live refusal(s): ${detail}`,
+        `recency arm ABSENT (build predates TRA-4978 second pass) — graded on the LIFETIME arm, `
+        + `WHICH CANNOT CLEAR: ${over.length} cell(s) over the ${bar} d bar and the stale constant `
+        + `decided ${entry.decisionsDecidedByStaleInput} refusal(s) at SOME point in the retained `
+        + `fold, not necessarily recently: ${detail}`,
     };
   }
   const standDown = entry.standDown ?? null;
@@ -146,13 +187,18 @@ export function gradeCostBarInputAge(payload) {
       reason: `${CODE} carries no \`standDown.verdict\` — the fail direction is unpublished`,
     };
   }
+  const since = recency === null || typeof recency !== 'object'
+    ? ''
+    : ` DORMANT since ${recency.latestEtDayDecidedByStaleInput ?? 'never'}`
+      + `${typeof recency.sessionsSinceStaleInputLastDecided === 'number' ? ` (${recency.sessionsSinceStaleInputLastDecided} refusing session(s) ago)` : ''}`
+      + ' — dormant is NOT clear: the constant resumes governing the instant the upstream arm admits.';
   return {
     exit: EXIT.DEGRADED,
     reason:
       `${over.length} cell(s) over the ${bar} d bar, deciding NOTHING `
       + `(${entry.decisionsShortCircuitedUpstream ?? '?'} refused upstream of the constant). `
       + `Sleeve: ${standDown.verdict}`
-      + `${standDown.bindingConstraint ? ` (binding: ${standDown.bindingConstraint})` : ''}. ${detail}`,
+      + `${standDown.bindingConstraint ? ` (binding: ${standDown.bindingConstraint})` : ''}.${since} ${detail}`,
   };
 }
 
@@ -199,6 +245,62 @@ const CONTROLS = [
       cells: [cell({ decisionsDecidedByStaleInput: 4226, decisionsShortCircuitedUpstream: 4248 })],
     }),
     EXIT.GOVERNING,
+  ],
+  // ── the TRA-4978 second-pass arms ─────────────────────────────────────────
+  // ⭐ THE CONTROL THAT MATTERS. Lifetime 7,179 (nonzero, and it will stay
+  // nonzero for the whole retention window) beside a latest session that is
+  // 100% upstream. The old predicate paged GOVERNING here forever; the recency
+  // arm correctly reports a disclosed, inert condition.
+  [
+    'DEGRADED — lifetime arm nonzero but DORMANT 5 sessions (the live 2026-10-01 shape)',
+    payload({
+      decisionsDecidedByStaleInput: 7179,
+      cells: [cell({ decisionsDecidedByStaleInput: 4226, decisionsShortCircuitedUpstream: 4373 })],
+      recency: {
+        latestEtDayWithRefusals: '2026-10-01',
+        latestEtDayDecidedByStaleInput: '2026-09-24',
+        sessionsSinceStaleInputLastDecided: 5,
+        staleInputGovernsLatestSession: false,
+        latestSessionDecidedByStaleInput: 0,
+        latestSessionShortCircuitedUpstream: 1926,
+        latestSessionUnclassified: 0,
+      },
+    }),
+    EXIT.DEGRADED,
+  ],
+  [
+    'GOVERNING — recency says the constant decided on the latest session',
+    payload({
+      decisionsDecidedByStaleInput: 7219,
+      recency: {
+        latestEtDayWithRefusals: '2026-10-02',
+        latestEtDayDecidedByStaleInput: '2026-10-02',
+        sessionsSinceStaleInputLastDecided: 0,
+        staleInputGovernsLatestSession: true,
+        latestSessionDecidedByStaleInput: 40,
+        latestSessionShortCircuitedUpstream: 60,
+        latestSessionUnclassified: 0,
+      },
+    }),
+    EXIT.GOVERNING,
+  ],
+  // The lifetime arm reads ZERO here, which under the old predicate was a clean
+  // DEGRADED. It must not be: the latest session is wholly unclassified, so
+  // nobody measured whether the constant decided it.
+  [
+    'BLIND — recency NOT COMPUTABLE: the latest refusing session is unstamped',
+    payload({
+      recency: {
+        latestEtDayWithRefusals: '2026-10-01',
+        latestEtDayDecidedByStaleInput: null,
+        sessionsSinceStaleInputLastDecided: null,
+        staleInputGovernsLatestSession: null,
+        latestSessionDecidedByStaleInput: 0,
+        latestSessionShortCircuitedUpstream: 0,
+        latestSessionUnclassified: 500,
+      },
+    }),
+    EXIT.BLIND,
   ],
   ['BLIND — not an object', null, EXIT.BLIND],
   ['BLIND — no degradations key', {}, EXIT.BLIND],

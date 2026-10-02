@@ -60,6 +60,7 @@ import {
   TAPE_EXPECTANCY_MIN_CELL_REAL_FILL_N,
   type TapeExpectancyCell,
 } from './option-tape-expectancy.js';
+import { TAPE_EXPECTANCY_PRE_COMPARISON_REASON_CODES } from './live-enforce-gate-predicate.js';
 
 /**
  * The subset of a `cost_bar` `byCell` ledger row this fold reads.
@@ -375,6 +376,179 @@ export function summarizeCostBarSleeveStandDown(
     cellsConsidered: nominable.map((c) => c.cellKey),
     cellsTradeable: tradeable.map((c) => c.cellKey),
     bindingConstraint,
+    statement,
+  };
+}
+
+/* ------------------------------------------------------------------------- *
+ * TRA-4978 — THE RECENCY ARM.
+ *
+ * `decisionsDecidedByStaleInput` above is folded over the RETAINED archive (30
+ * ET days). That archive is append-only and has no backfill, so once a stale
+ * constant has decided a single refusal, `staleInputGovernsAnyDecision` is TRUE
+ * FOREVER — it cannot be cleared by any remedy, only by the row ageing out of
+ * retention. An assertion that can never go green is an assertion that stops
+ * being read, and it makes TRA-4978's own AC2 ("`tapeAgeDaysAtDecisionMax` must
+ * be under `thresholdDays` for every cell that recorded a refusal") structurally
+ * unsatisfiable: the cells that recorded those refusals recorded them in the
+ * past, at ages that are now frozen in the archive.
+ *
+ * This is the TRA-3703 shape — an identity derived to EXPOSE a gap cannot grade
+ * its own remedy, because it is an invariant and reads `breach` forever. The fix
+ * is NOT to delete the lifetime counter (TRA-3660 §10: a consistency fix that
+ * deletes the truthful surface is the failure, not the remedy). Both arms ship:
+ * the lifetime one stays exactly as it was, and this one says WHEN.
+ *
+ * Measured live on `0d81630c` 2026-10-02T01:11Z, `retained.byGate[cost_bar]`
+ * `byEtDay`, 17 ET days carrying refusals:
+ *   2026-09-09 … 2026-09-24  →  100% `shortfall_*`                 (compared)
+ *   2026-09-25 … 2026-10-01  →  100% `insufficient_real_fill_evidence`
+ * A clean cutover on 2026-09-25 and FIVE consecutive sessions in which the
+ * constant's age decided nothing, against a lifetime count of 7,179.
+ *
+ * ⚠️ The classifier is `TAPE_EXPECTANCY_PRE_COMPARISON_REASON_CODES`, imported
+ * from the DEPLOYED predicate rather than re-spelled as a `shortfall_` prefix
+ * test. The prefix would be a second, drifting definition of the same split, and
+ * `byEtDay` carries no `rowsCompared` column to check it against.
+ *
+ * ⚠️ `barRImplied` is NOT a usable discriminator here, which is why this folds
+ * `byReason` instead. On 2026-09-25 two of three cells publish a non-null
+ * `barRImplied` while 100% of that day's refusals are
+ * `insufficient_real_fill_evidence`: the bound is derivable off the day's 178
+ * ADMITTED rows (`excludesPublishedBarR: true`), not off a refusal the constant
+ * decided.
+ * ------------------------------------------------------------------------- */
+
+/** One ET day's `cost_bar` refusals, as `retained.byGate[].byEtDay[]` publishes them. */
+export interface CostBarEtDayReasonRow {
+  etDay: string;
+  blocked: number;
+  byReason: readonly { reasonCode: string; blocked: number }[];
+  /** Blocked rows carrying NO `reasonCode` — `byReason`'s missing denominator. */
+  blockedUnclassified?: number;
+}
+
+/** WHEN the stale constant last decided anything, not merely WHETHER it ever did. */
+export interface StaleCostBarRecency {
+  /** ET days in the retained fold that recorded at least one refusal. */
+  etDaysWithRefusals: number;
+  /** The most recent such day, or null if the fold recorded no refusal at all. */
+  latestEtDayWithRefusals: string | null;
+  /** The most recent day on which the constant was COMPARED on a refusal. */
+  latestEtDayDecidedByStaleInput: string | null;
+  /**
+   * Refusing sessions strictly AFTER {@link latestEtDayDecidedByStaleInput}.
+   * `null` when the constant has never decided a refusal in the fold (there is
+   * no "since" to count from) — never 0, which would read as "it decided one
+   * today".
+   */
+  sessionsSinceStaleInputLastDecided: number | null;
+  /**
+   * ⭐ The arm to grade. THREE-VALUED on purpose:
+   *   • `true`  — the constant decided >= 1 refusal on the latest refusing day.
+   *   • `false` — that day's refusals were ALL refused upstream of it.
+   *   • `null`  — NOT COMPUTABLE: the latest refusing day carries no classified
+   *     row (all `blockedUnclassified`, e.g. a pre-stamp day). Unknown is not a
+   *     clean bill, and coercing it to `false` would publish "the staleness is
+   *     inert" off a day nobody measured.
+   */
+  staleInputGovernsLatestSession: boolean | null;
+  /** Refusals on the latest refusing day the constant decided. */
+  latestSessionDecidedByStaleInput: number;
+  /** Refusals on that day refused by a precondition upstream of the constant. */
+  latestSessionShortCircuitedUpstream: number;
+  /** Refusals on that day carrying no `reasonCode` at all. */
+  latestSessionUnclassified: number;
+  statement: string;
+}
+
+/**
+ * Fold the retained per-ET-day `cost_bar` reason census into the recency arm.
+ *
+ * Pure. Days with `blocked === 0` are skipped entirely — a session the gate
+ * evaluated nothing on is silence, not evidence the constant stood down.
+ */
+export function foldStaleCostBarRecency(
+  etDayRows: readonly CostBarEtDayReasonRow[],
+): StaleCostBarRecency {
+  const classify = (row: CostBarEtDayReasonRow) => {
+    let decided = 0;
+    let shortCircuited = 0;
+    for (const r of row.byReason) {
+      if (TAPE_EXPECTANCY_PRE_COMPARISON_REASON_CODES.includes(r.reasonCode)) {
+        shortCircuited += r.blocked;
+      } else decided += r.blocked;
+    }
+    // Prefer the ledger's own unclassified column; fall back to the residual so
+    // a fold that omits it still cannot silently drop rows.
+    const unclassified = row.blockedUnclassified
+      ?? Math.max(0, row.blocked - decided - shortCircuited);
+    return { decided, shortCircuited, unclassified };
+  };
+
+  const refusing = etDayRows
+    .filter((r) => r.blocked > 0)
+    .slice()
+    .sort((a, b) => a.etDay.localeCompare(b.etDay));
+
+  if (refusing.length === 0) {
+    return {
+      etDaysWithRefusals: 0,
+      latestEtDayWithRefusals: null,
+      latestEtDayDecidedByStaleInput: null,
+      sessionsSinceStaleInputLastDecided: null,
+      staleInputGovernsLatestSession: null,
+      latestSessionDecidedByStaleInput: 0,
+      latestSessionShortCircuitedUpstream: 0,
+      latestSessionUnclassified: 0,
+      statement:
+        'NOT MEASURED — the retained fold recorded no cost_bar refusal on any ET day, so there is '
+        + 'no session in which to ask whether the stale constant decided anything.',
+    };
+  }
+
+  const latest = refusing[refusing.length - 1] as CostBarEtDayReasonRow;
+  const latestSplit = classify(latest);
+  const decidedDays = refusing.filter((r) => classify(r).decided > 0);
+  const lastDecidedDay = decidedDays.length === 0
+    ? null
+    : (decidedDays[decidedDays.length - 1] as CostBarEtDayReasonRow).etDay;
+  const sessionsSince = lastDecidedDay === null
+    ? null
+    : refusing.filter((r) => r.etDay > lastDecidedDay).length;
+
+  const governs = latestSplit.decided > 0
+    ? true
+    : latestSplit.shortCircuited > 0
+      ? false
+      : null;
+
+  const statement =
+    governs === true
+      ? `⚠️ GOVERNING — on the latest refusing session (${latest.etDay}) the stale constant DECIDED `
+        + `${latestSplit.decided} of ${latest.blocked} refusal(s). Refreshing the input would move `
+        + 'live decisions.'
+      : governs === false
+        ? 'DORMANT — the stale constant has not decided a cost_bar refusal since '
+          + `${lastDecidedDay ?? 'any recorded session'}`
+          + (sessionsSince === null ? '' : ` (${sessionsSince} refusing session(s) ago)`)
+          + `. On ${latest.etDay} all ${latestSplit.shortCircuited} refusal(s) were refused upstream `
+          + 'of it. The input IS stale and the lifetime counter beside this one is CORRECT about the '
+          + 'past; refreshing the tape today would move ZERO decisions. ⛔ Dormant is not clear — the '
+          + 'constant resumes governing the moment the upstream arm admits.'
+        : `NOT COMPUTABLE — the latest refusing session (${latest.etDay}) carries `
+          + `${latestSplit.unclassified} refusal(s) with no reason code and none classified, so `
+          + 'whether the stale constant decided them is UNKNOWN. Unknown is not a clean bill.';
+
+  return {
+    etDaysWithRefusals: refusing.length,
+    latestEtDayWithRefusals: latest.etDay,
+    latestEtDayDecidedByStaleInput: lastDecidedDay,
+    sessionsSinceStaleInputLastDecided: sessionsSince,
+    staleInputGovernsLatestSession: governs,
+    latestSessionDecidedByStaleInput: latestSplit.decided,
+    latestSessionShortCircuitedUpstream: latestSplit.shortCircuited,
+    latestSessionUnclassified: latestSplit.unclassified,
     statement,
   };
 }

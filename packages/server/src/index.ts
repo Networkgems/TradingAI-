@@ -697,7 +697,14 @@ import {
 import { initOiShadowLedger, listOiShadowSignals, isOiShadowEnabled, usableSignalCount as usableOiSignalCount } from './oi-shadow-ledger.js';
 import { initNewsCatalystLedger, listNewsCatalystSignals, isNewsCatalystEnabled, chosenSignalCount, rowContaminatedSessions } from './news-catalyst-ledger.js';
 import { initNewsCatalystRunLedger, summarizeCatalystRuns } from './news-catalyst-run-ledger.js';
-import { catalystUniverse, catalystSweepGateSnapshot, catalystSweepResidentKeys } from './news-catalyst-source.js';
+import {
+  catalystUniverse,
+  catalystSweepGateSnapshot,
+  catalystSweepResidentKeys,
+  catalystSweepSessionsSweptByWindow,
+  catalystSweepEvictionProof,
+  catalystSweepEvictionVerdict,
+} from './news-catalyst-source.js';
 import { initNewsCatalystLeanLedger, listCatalystLeans, leanBreakdown } from './news-catalyst-lean-ledger.js';
 import { initPcsShadowLedger, listPcsShadowSignals, isPcsShadowEnabled, settledSignalCount, PCS_SHADOW_STRATEGY_ID } from './pcs-shadow-ledger.js';
 import {
@@ -11163,7 +11170,49 @@ app.get('/api/health/news-catalyst-signals', async (_req, res) => {
       // before session D's sweep and still alive at session D+1's.
       ...(() => {
         const keys = catalystSweepResidentKeys();
-        return { sweepGateResidentKeys: keys.length, sweepGateResidentSessions: keys.slice(0, 8) };
+        const swept = catalystSweepSessionsSweptByWindow();
+        // TRA-4777 blind 3 — the resident set above is only HALF a grade, and
+        // the missing half is why TRA-4761 came away with nothing.
+        //
+        // A working eviction means you can never see two keys for one window.
+        // So "one resident premarket key" is emitted by BOTH a healthy process
+        // that swept two sessions AND a process that only ever saw one day --
+        // the pass and the vacuum are byte-identical on the wire. The
+        // discriminator is the session census, which is monotone and survives
+        // the eviction: it says how many keys there were to survive.
+        //
+        //   residentFor(w) > 1              -> `falsified`: eviction is dead and
+        //                                      the last-match backstop is
+        //                                      carrying the reported `session`.
+        //   swept[w] >= 2 && resident == 1  -> `confirmed`: a real grade. Two
+        //                                      sessions entered, one survived.
+        //   swept[w] < 2                    -> `vacuous_single_session`. NOT a
+        //                                      pass. Says so in the value, so it
+        //                                      cannot be read as one.
+        //
+        // `evictionProof` is the same invariant measured WITHOUT waiting for
+        // that: it runs the production insert+evict path on a scratch map every
+        // read, so a regression is visible on a box booted ten minutes ago.
+        // bqb1 restarts several times a day under the pm2 watchdog, so the
+        // two-swept-session window is a lottery -- both measured attempts to
+        // catch it landed on a process booted after that day's sweeps.
+        //
+        // Read them together: `proof.proven` false is a code regression,
+        // `liveTrafficVerdict` `falsified` is the same regression caught in
+        // flight, and `vacuous_single_session` means this process has not yet
+        // earned an opinion. See `catalystSweepEvictionVerdict`.
+        return {
+          sweepGateResidentKeys: keys.length,
+          sweepGateResidentSessions: keys.slice(0, 8),
+          sweepGateEviction: {
+            proof: catalystSweepEvictionProof(),
+            sessionsSweptByWindow: swept,
+            liveTrafficVerdict: {
+              premarket: catalystSweepEvictionVerdict(keys, swept.premarket, 'premarket'),
+              midday: catalystSweepEvictionVerdict(keys, swept.midday, 'midday'),
+            },
+          },
+        };
       })(),
       // TRA-4682 (CFO addendum) — row basis, beside the run-basis
       // `sessionsNoHealthyRun`: sessions whose rows carry a quote failure even

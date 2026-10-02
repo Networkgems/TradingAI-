@@ -8360,6 +8360,57 @@ describe('GET /api/health/live-enforce-gates — stale-input attribution (TRA-49
     });
   }
 
+  /**
+   * TRA-4978 second pass — the OPPOSITE arm: the pre-2026-09-25 shape, where the
+   * stale constant WAS read and lost the comparison. Same cell, same tape age;
+   * the only thing that moves is whether the gate reached the inequality. It is
+   * the positive control for the recency split, and the negative control for
+   * `alarm`, which must NOT move when `severity` does.
+   */
+  function recordComparedRefusal() {
+    const closeTs = Date.UTC(2026, 7, 4, 17, 0, 0);
+    const decidedAt = closeTs + Math.round(57.9 * 86_400_000);
+    const table = buildTapeExpectancyTable(
+      Array.from(
+        { length: 124 },
+        (_, i) =>
+          ({
+            structure: 'single_leg_otm',
+            outcome: 'LOSS',
+            entryDelta: 0.35,
+            realizedR: -0.05,
+            mode: 'demo',
+            closeTs: closeTs - i * 60_000,
+          }) as never,
+      ),
+      { config: DEFAULT_COST_GATE_CONFIG, nowMs: decidedAt },
+    );
+    const verdict = tapeExpectancyVerdict(
+      { structure: 'single_leg_otm', delta: 0.35 },
+      table,
+      DEFAULT_COST_GATE_CONFIG,
+    );
+    recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, '2026-10-01', 'refused', decidedAt, {
+      reasonCode: 'shortfall_gte_0.50',
+      cell: 'single_leg_otm::0.30-0.40',
+      symbol: 'MSFT',
+      grossR: verdict.lowerCI95,
+      cost: { costR: 0.707361, spreadR: 0.6, feeR: 0.1, costFracOfPremium: 0.2 },
+      grossRProvenance: tapeExpectancyGrossProvenance(table, verdict),
+      predicate: {
+        form: 'tape_expectancy_flat',
+        compared: true,
+        lhsLabel: 'grossR',
+        lhs: verdict.lowerCI95 ?? -0.2154,
+        op: '>=',
+        rhsLabel: 'barR',
+        rhs: 0.3386,
+        admit: false,
+        shortCircuit: null,
+      },
+    });
+  }
+
   function serveGates() {
     const { app, routes } = fakeApp();
     registerLiveHealthRoutes(app, {
@@ -8379,6 +8430,18 @@ describe('GET /api/health/live-enforce-gates — stale-input attribution (TRA-49
         decisionsDecidedByStaleInput: number;
         decisionsShortCircuitedUpstream: number;
         staleInputGovernsAnyDecision: boolean;
+        /** TRA-4978 second pass — WHEN the constant last decided, not merely WHETHER. */
+        recency: {
+          etDaysWithRefusals: number;
+          latestEtDayWithRefusals: string | null;
+          latestEtDayDecidedByStaleInput: string | null;
+          sessionsSinceStaleInputLastDecided: number | null;
+          staleInputGovernsLatestSession: boolean | null;
+          latestSessionDecidedByStaleInput: number;
+          latestSessionShortCircuitedUpstream: number;
+          latestSessionUnclassified: number;
+          statement: string;
+        };
         standDown: { verdict: string; bindingConstraint: string | null; statement: string };
         cells: Array<{
           cell: string;
@@ -8414,11 +8477,47 @@ describe('GET /api/health/live-enforce-gates — stale-input attribution (TRA-49
     expect(d.detail).toContain('refreshing the tape would move NO decision');
   });
 
-  it('is DEGRADED and explicitly NOT an alarm (AC4 / TRA-3711)', () => {
+  it('is ATTENTION when the constant decided nothing on the latest session, and NEVER an alarm (AC4 / TRA-3711)', () => {
+    // TRA-4978 second pass. The only refusal in this process is short-circuited
+    // upstream, so the recency arm reads `false` and the severity drops one
+    // notch: the condition is real and published, but refreshing the tape today
+    // would move zero decisions, so it is not the thing to work on first.
+    // ⛔ What must NOT move under any branch is `alarm`.
     recordShortCircuitedRefusal();
+    const d = serveGates().degradations.find((x) => x.code === 'cost_bar_edge_input_stale')!;
+    expect(d.severity).toBe('attention');
+    expect(d.alarm).toBe(false);
+    expect(d.recency.staleInputGovernsLatestSession).toBe(false);
+    expect(d.recency.latestEtDayDecidedByStaleInput).toBeNull();
+    // Never 0 — there is no "since" to count from when it has never decided.
+    expect(d.recency.sessionsSinceStaleInputLastDecided).toBeNull();
+    expect(d.detail).toContain('⏱ RECENCY:');
+    expect(d.detail).toContain('Dormant is not clear');
+  });
+
+  it('goes back to DEGRADED when the constant decides the latest session — and `alarm` still does not move', () => {
+    // The severity is allowed to move with the recency arm. `alarm` is NOT:
+    // AC4 / TRA-3711. Without this control the suite only ever observed one
+    // severity, so "alarm is false" would be a statement about a single branch.
+    recordComparedRefusal();
     const d = serveGates().degradations.find((x) => x.code === 'cost_bar_edge_input_stale')!;
     expect(d.severity).toBe('degraded');
     expect(d.alarm).toBe(false);
+    expect(d.recency.staleInputGovernsLatestSession).toBe(true);
+    expect(d.recency.latestEtDayDecidedByStaleInput).toBe('2026-10-01');
+    expect(d.recency.sessionsSinceStaleInputLastDecided).toBe(0);
+    expect(d.detail).toContain('GOVERNING');
+  });
+
+  it('the LIFETIME arm stays published beside the recency one — the old number must reconcile', () => {
+    // TRA-3660 §10: a consistency fix that deletes the truthful surface is the
+    // failure, not the remedy. `staleInputGovernsAnyDecision` is correct about
+    // the past and simply cannot grade a fix; both arms ship.
+    recordShortCircuitedRefusal();
+    const d = serveGates().degradations.find((x) => x.code === 'cost_bar_edge_input_stale')!;
+    expect(d.staleInputGovernsAnyDecision).toBe(false);
+    expect(d.decisionsDecidedByStaleInput).toBe(0);
+    expect(d.recency).toBeDefined();
   });
 
   it('a cell the estimator does not hold reads NULL and NOT_MEASURED, never a pass', () => {
