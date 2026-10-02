@@ -5453,7 +5453,13 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // can vanish, so the intent must not live there). `envIntent.ok` is
       // tri-state: `null` off-production is UNGRADED, never a pass — see
       // `pnpm check:env-intent`, which fails closed on it.
-      envIntent: summarizeEnvIntent(process.env),
+      // TRA-5014 — the second argument is the demo-flags OVERLAY env, and it is
+      // resolved HERE rather than inside `summarizeEnvIntent` because resolving
+      // it reads `DATA_DIR/demo-flags.json` and that function is contractually
+      // IO-free. Omitting it would not be a safe default: an `overlayBacked`
+      // lever (the paper sleeve's only admission path) would come back blind,
+      // and `ok` would correctly refuse to go green.
+      envIntent: summarizeEnvIntent(process.env, resolveDemoFlagEnvFromEnv()),
       note: durabilityNote(report),
     });
   });

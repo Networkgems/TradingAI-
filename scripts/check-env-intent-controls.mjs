@@ -99,8 +99,61 @@ const STORED_LIVE = { DURABILITY_POLICY: 'refuse', ENABLE_OPTION_LIVE_OTM: 'fals
 // the declaration that disagreed with it was sitting undeployed in the repo.
 const TRADIER_LIVE = withExtraLever(GOOD, lever('TRADIER_ENV', 'production', 'production', true, 'production'));
 
+// TRA-5014 — an OVERLAY-BACKED lever on the wire. Its home is
+// `DATA_DIR/demo-flags.json`, so it has NO service env var and `key ABSENT` from
+// the stored set is its HEALTHY state. These controls exist because the obvious
+// implementation gets that backwards: grading such a lever on the stored-env leg
+// reports a permanent "STAGED" mismatch, the check goes red forever, and an
+// operator learns to ignore the one instrument that can see a silent disarm.
+const overlayLever = (key, intended, effective, overlayVisible = true) => ({
+  ...lever(key, intended, effective, true, effective === 'on' ? '1' : 'false'),
+  matches: overlayVisible ? effective === intended : null,
+  overlayBacked: true,
+  overlayVisible,
+});
+const ARM = 'ENABLE_DIRECTIONAL_EXPLORATION_ALLOWANCE';
+/** The sleeve armed through the overlay, as bqb1 reads after the 2026-10-02T02:55Z re-arm. */
+const OVERLAY_ARMED = withExtraLever(GOOD, overlayLever(ARM, 'on', 'on'));
+/** The same build that could not read the overlay: effective is a DEFAULT, not a reading. */
+const OVERLAY_BLIND = withExtraLever(GOOD, overlayLever(ARM, 'on', 'off', false));
+
 const cases = [
   { name: 'CLEAN — armed as ruled', body: GOOD, want: 0 },
+  {
+    // The control that would have caught TRA-5014's seven dark sessions, and the
+    // one that keeps the fix for them from becoming a permanent red.
+    name: 'TRA-5014 overlay-backed — armed via demo-flags, key ABSENT from the stored set ⇒ 0, not a STAGED mismatch',
+    body: OVERLAY_ARMED,
+    stored: STORED_LIVE,
+    want: 0,
+    // Printed, never silent: a skipped lever that says nothing is how the next
+    // reader inherits the hole. The note text exists only in the new branch.
+    wants: ['overlay-backed (DATA_DIR/demo-flags.json)', "'key ABSENT' here is correct", 'Graded by leg 1'],
+    // It must NOT be accused of being staged — that is the pre-fix behaviour.
+    wantsNot: [`${ARM}: STAGED`],
+  },
+  {
+    name: 'TRA-5014 overlay-backed — the SAME key also stored in the service env list ⇒ TWO HOMES, non-zero',
+    body: OVERLAY_ARMED,
+    // The overlay WINS (`resolveDemoFlagEnv` layers the file over the base env),
+    // so this stored value is inert today and authoritative the moment the
+    // overlay file is lost — while Render's env list misreports the live posture
+    // the whole time. Silence here would be a disarm waiting to happen.
+    stored: { ...STORED_LIVE, [ARM]: '0' },
+    want: 1,
+    wants: ['TWO HOMES', 'Pick one home'],
+  },
+  {
+    name: 'TRA-5014 overlay-backed — route graded it WITHOUT the overlay ⇒ BLIND, never reported as a disarm',
+    body: OVERLAY_BLIND,
+    stored: STORED_LIVE,
+    want: 1,
+    // `effective: 'off'` here is the code DEFAULT. Labelling it "IN FORCE" would
+    // assert a measurement nobody took, in the direction that looks like a tidy
+    // stand-down — so the label itself is the thing pinned.
+    wants: [`${ARM}: BLIND`, 'code DEFAULT and not a measurement', 'Do NOT read this as a disarm'],
+    wantsNot: [`${ARM}: IN FORCE`],
+  },
   { name: 'BROKEN — the incident (key wiped, default deciding)', body: WIPED, want: 1 },
   { name: 'BLIND — running build publishes no envIntent', body: PRE_4474, want: 3 },
   { name: 'BLIND — box cannot prove it is production (applies:false)', body: UNGRADED, want: 3 },
