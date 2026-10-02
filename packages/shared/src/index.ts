@@ -2597,9 +2597,37 @@ export const DAILY_DRAWDOWN_HALT_PCT = 0.08; // halt if daily P&L < −8% of man
  * "+$1,599 → +$483" tail near +$960.
  */
 // Rule 1 — ATR chandelier trailing stop
-export const EXIT_CHANDELIER_ATR_MULT = 3.0;          // default trail width = 3.0 × ATR14 from the running extreme
+//
+// ⛔ ALL THREE OF THESE ARE CALIBRATED FOR A **DAILY** ATR (TRA-4992). They are
+// Chande's chandelier constants and his specification is a position-timeframe
+// ATR. They are UNITLESS MULTIPLIERS, so nothing in a type or a test can catch
+// them being applied to a different series — the caller owns the units, and the
+// options path applied them to ATR(14) on a **5-minute** cache for its whole
+// life, making the trail half-width three 70-MINUTE ranges instead of three
+// daily ones (on a $13 underlying, tens of cents — a level spot crosses on
+// noise; pooled median hold 1.04 h, shortest 1.9 s).
+//
+// So if you are reading these to wire up a new caller: name the timeframe of the
+// series you are feeding them, and if it is not daily these numbers are wrong
+// for you. The repair for a mis-scaled trail is the ATR INPUT, never the
+// multiplier — moving the multiplier to compensate masks the unit error and
+// leaves the next caller to rediscover it.
+//
+// Selection on the options path: `CHANDELIER_ATR_TIMEFRAME`
+// (`server/src/exit-risk-rules-flag.ts`), default `shadow_5m` = the defective
+// behaviour, pending QuantTrader's forward grade. The live-equity broker
+// stop-leg ratchet is a separate caller with its own series and is out of that
+// flag's scope.
+export const EXIT_CHANDELIER_ATR_MULT = 3.0;          // default trail width = 3.0 × ATR14(DAILY) from the running extreme
 export const EXIT_CHANDELIER_ATR_MULT_HIGHBETA = 3.5; // widen for high-beta names to avoid noise stop-outs
-export const EXIT_CHANDELIER_HIGHBETA_ATRPCT = 0.05;  // ATR/price above ~5% ⇒ treat as high-beta
+// ATR/price above ~5% ⇒ treat as high-beta. A **DAILY**-scale threshold: a 5%
+// DAILY range is a genuinely high-beta name, while a 5% 5-MINUTE range is a
+// near-unreachable extreme — so on a 5m `atrPct` this gate is effectively dead
+// and `EXIT_CHANDELIER_ATR_MULT_HIGHBETA` above is unreachable with it. Compared
+// against `atrPct = atr(series)/lastClose` on whatever series the caller chose
+// (`engine/src/indicators/atr.ts`), which is why the timeframe choice moves the
+// trail through two paths at once: the ATR level AND which multiplier scales it.
+export const EXIT_CHANDELIER_HIGHBETA_ATRPCT = 0.05;
 // Rule 2 — trade-level profit-lock (give-back cap per position)
 //
 // TRA-4006 (QuantTrader ruling, 2026-08-26) — the arm threshold and the give-back

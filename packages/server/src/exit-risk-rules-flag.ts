@@ -720,6 +720,91 @@ export function resolveOtmSleeveExitRule(
   return { rule: OTM_SLEEVE_EXIT_RULE_DEFAULT, source: 'env_invalid' };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-4992 (parent TRA-4945) — which ATR series the OPTIONS chandelier trails on
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ── The unit error this selects between ─────────────────────────────────────
+//
+// `EXIT_CHANDELIER_ATR_MULT = 3.0` is Chande's chandelier constant and it is
+// specified against a POSITION-TIMEFRAME (daily) ATR. The options path feeds it
+// `atr(shadowCandleCache)`, and that cache is `resampleCandles(minuteBars,
+// SUPERTREND_SHADOW_TF_MS)` with `SUPERTREND_SHADOW_TF_MS = 5 * 60_000`. So the
+// trail half-width shipped as three SEVENTY-MINUTE ranges instead of three daily
+// ranges — on a $13 underlying a couple of tens of cents, which spot crosses on
+// noise. That is a unit error against the constant's own stated specification,
+// not a tuning preference, which is why the repair is the INPUT and never
+// `EXIT_CHANDELIER_ATR_MULT` itself (moving the multiplier would mask it).
+//
+// The repo had already written this bug down for a SIBLING leg
+// (`signal-engine.ts`, `otmDailyAtr`'s docblock): *"NOT the
+// `underlyingAtrBySymbol` the chandelier used: that is ATR(14) on the 5m
+// shadow-candle cache, and 1x of it is a handful of cents — a level the spot
+// crosses on noise. The board wrote '1xATR(14, daily)' and the two are different
+// instruments wearing the same name."* TRA-3943 fixed the OTM
+// entry-invalidation leg and left the chandelier on the 5m instrument.
+//
+// Measured signature, pooled bare `chandelier` over 3,541 closed rows: median
+// hold 1.04 h against a 70-minute ATR lookback, 49.0% of fires under an hour,
+// shortest 1.9 SECONDS. The exit's holding period was being set by its own ATR
+// window.
+//
+// ── Fail direction — the OPPOSITE of `resolveOtmSleeveExitRule` above ───────
+//
+// ⛔ Absent / blank / garbage ⇒ `shadow_5m`, i.e. TODAY'S BEHAVIOUR, never the
+// repair. That is deliberately the reverse of the OTM sleeve rule next door,
+// where the default IS the ruling: there the board had ruled and the legacy path
+// was the hazard, whereas here the new input is UNGRADED. QuantTrader's own bear
+// case is ~45% — today's `>= 1d` hold bucket is the worst cell in the pooled set
+// (n=11, avgR -0.1702), so widening the trail to daily scale may trade a
+// scratch-heavy distribution for a larger left tail. An ungraded exit input must
+// not be reachable by a typo: `daily` requires spelling it exactly, and a
+// misspelling resolves to the old behaviour with `source: 'env_invalid'` so the
+// typo is loud on the wire instead of silently arming an exit change.
+//
+// Arming is a board call graded by QuantTrader off TRA-4991's instrumentation
+// against a pre-registered forward test (n >= 20 per side, desk rows,
+// cost-aware, hard stop 2026-12-31) — never part of the shipping change.
+
+/** Which ATR series the options chandelier's underlying trail is measured on. */
+export type ChandelierAtrTimeframeName = 'shadow_5m' | 'daily';
+
+/** Where the resolved timeframe came from — `env_invalid` makes a typo loud. */
+export interface ChandelierAtrTimeframeResolution {
+  timeframe: ChandelierAtrTimeframeName;
+  source: 'default' | 'env' | 'env_invalid';
+}
+
+export const CHANDELIER_ATR_TIMEFRAME_VALUE = 'CHANDELIER_ATR_TIMEFRAME';
+/** ⛔ Today's (defective) behaviour. The repair ships DARK — see the fail direction above. */
+export const CHANDELIER_ATR_TIMEFRAME_DEFAULT: ChandelierAtrTimeframeName = 'shadow_5m';
+
+/**
+ * Resolve which ATR series feeds the OPTIONS chandelier (TRA-4992).
+ *
+ * Only the exact token `daily` (case/space insensitive) selects the
+ * position-timeframe ATR; `shadow_5m` is the explicit status quo; anything else
+ * resolves to `shadow_5m` with `source: 'env_invalid'`.
+ *
+ * ⚠️ SCOPE — the OPTIONS path only. The live-equity broker stop-leg ratchet
+ * (`trailLiveEquityStops` → `stopModifyDecision`) shares
+ * `EXIT_CHANDELIER_ATR_MULT` but reads its OWN `candleCache`, never
+ * `underlyingAtrBySymbol`, so this resolver cannot reach it. That separation is
+ * AC2 and it is asserted by a test, not left as an assurance.
+ */
+export function resolveChandelierAtrTimeframe(
+  env: NodeJS.ProcessEnv = process.env,
+): ChandelierAtrTimeframeResolution {
+  const raw = env[CHANDELIER_ATR_TIMEFRAME_VALUE];
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    return { timeframe: CHANDELIER_ATR_TIMEFRAME_DEFAULT, source: 'default' };
+  }
+  const token = raw.trim().toLowerCase();
+  if (token === 'daily') return { timeframe: 'daily', source: 'env' };
+  if (token === 'shadow_5m') return { timeframe: 'shadow_5m', source: 'env' };
+  return { timeframe: CHANDELIER_ATR_TIMEFRAME_DEFAULT, source: 'env_invalid' };
+}
+
 export function resolveLiveOptionStopPolicy(env: NodeJS.ProcessEnv = process.env): LiveOptionStopPolicy {
   const rawPolicy = env[OPTION_LIVE_STOP_POLICY_VALUE]?.trim().toLowerCase();
   const policy: LiveOptionStopPolicyName = rawPolicy === 'intraday' ? 'intraday' : 'daily_close';

@@ -95,6 +95,7 @@ import {
   SHADOW_CANDLE_TIMEFRAME_MS,
   measureCandleTimeframeMs,
   type OptionChandelierAtrSource,
+  type ChandelierAtrInertReason,
 } from './option-chandelier-trail.js';
 import { trySma200ScanSlot, releaseSma200ScanSlot, fetchSma200CandlesShared } from './sma200-scan-admission.js';
 import { resolveSma200PullbackMaxDistAtr, resolveSma200PullbackTimeCapBars, sma200PullbackExitModel, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved, signalRingEvictionIndex, isSma200SignalType, type Sma200SweepVerdict } from './sma200-validity.js';
@@ -228,7 +229,7 @@ import {
 import { recordWheelBookSnapshot } from './wheel-promotion-gate-store.js';
 import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
 import { buildProfitFloorLadder, resolveOtmProfitSchedule } from './otm-profit-schedule.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isProfitFloorTrailEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, resolveSwingTimeStopTradingDays, resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isProfitFloorTrailEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, resolveSwingTimeStopTradingDays, resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule, resolveChandelierAtrTimeframe, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
 // TRA-4436 — the RV exit re-tune param set, extracted so the shipped demo/live
 // construction is testable and its demo-effective ma20 gate publishable.
 import { buildRvExitParams } from './rv-exit-params.js';
@@ -3824,10 +3825,17 @@ export class SignalEngine {
 
   /**
    * TRA-1268 (TRA-1250 Rule 1) — build the {@link OptionExitRiskInput}: ATR(14)
-   * of the UNDERLYING on the 5m shadow-candle cache, one entry per open
-   * option's underlying. Underlyings without enough cached bars are omitted.
-   * Multi-leg combos are skipped (they're held to expiry/manual close). Only
-   * called when `EXIT_RISK_RULES_ENABLED` is on.
+   * of the UNDERLYING, one entry per open option's underlying. Underlyings
+   * without enough cached bars are omitted. Multi-leg combos are skipped
+   * (they're held to expiry/manual close). Only called when
+   * `EXIT_RISK_RULES_ENABLED` is on.
+   *
+   * TRA-4992 — the ATR's SERIES is selected by `CHANDELIER_ATR_TIMEFRAME`:
+   * `shadow_5m` (default, today's behaviour) is the 5m shadow-candle cache;
+   * `daily` is the position-timeframe daily store, which is what
+   * `EXIT_CHANDELIER_ATR_MULT = 3.0` was specified against. On `daily` a cold
+   * store leaves the symbol out and records it inert — it does NOT fall back to
+   * the 5m series, because a fallback would make the flag's effect unobservable.
    */
   private buildOptionExitRisk(): OptionExitRiskInput | undefined {
     const underlyingAtrBySymbol = new Map<string, number>();
@@ -3836,17 +3844,51 @@ export class SignalEngine {
     // publish the series it decided on instead of leaving a reader to infer it
     // from a constant somewhere else in the tree.
     const underlyingAtrSourceBySymbol = new Map<string, OptionChandelierAtrSource>();
+    // TRA-4992 (AC3) — symbols the chandelier leg is INERT for, with the reason,
+    // so the exit pass's census can attribute them instead of folding them into
+    // `no_spot_or_atr` (which also means "no spot was served").
+    const underlyingAtrInertBySymbol = new Map<string, ChandelierAtrInertReason>();
+    // TRA-4992 (AC1) — WHICH series the trail's ATR is measured on. `process.env`
+    // on both books: this is a boot config applied by redeploy (TRA-3724), like
+    // the profit-floor VALUES and unlike the demo-overlay ARMS. Resolved ONCE per
+    // build rather than per symbol so one pass cannot straddle an env change.
+    //
+    // ⛔ `shadow_5m` (the default, and the intended shipping state) is the
+    // 3.0 x ATR(14, 5m) UNIT ERROR — see `resolveChandelierAtrTimeframe`.
+    const chandelierAtrTf = resolveChandelierAtrTimeframe();
     for (const opt of this.optionsAccount.getState().openOptions) {
       if (opt.legs && opt.legs.length > 1) continue;
       if (underlyingAtrBySymbol.has(opt.symbol)) continue;
-      const series = this.shadowCandleCache.get(opt.symbol);
-      if (!series || series.length < 15) continue;
+      // A second row on an underlying already refused must not re-walk the cold
+      // path, and must not be able to resolve differently from the first.
+      if (underlyingAtrInertBySymbol.has(opt.symbol)) continue;
+      // TRA-4992 — on `daily`, the per-symbol per-ET-day DAILY store TRA-3943
+      // already maintains and `refreshTechnicalSnapshot` warms for free. Read
+      // SYNCHRONOUSLY and uppercase-keyed, the same convention `otmDailyAtr`
+      // uses; deliberately NOT `otmDailyAtr` itself, which is async and carries an
+      // on-demand `fetchDailyCandles` fallback. This producer runs on every exit
+      // tick, so a network pull here would put a provider round-trip on the exit
+      // path — and a cold symbol is AC3's inert row, which is the behaviour we
+      // want, not an error to recover from. No new feed (AC1).
+      const series = chandelierAtrTf.timeframe === 'daily'
+        ? getSharedDailyBars(opt.symbol.toUpperCase()) ?? getSharedDailyBars(opt.symbol)
+        : this.shadowCandleCache.get(opt.symbol);
+      // ⛔ AC3 — FAIL CLOSED, and never onto the 5m series. `noteInert` is called
+      // only on the `daily` arm: on `shadow_5m` a cold cache is the long-standing
+      // `no_spot_or_atr` behaviour and must keep reading as that, so the new cell
+      // counts the FLAG's cost of admission and nothing else.
+      const noteInert = (): void => {
+        if (chandelierAtrTf.timeframe === 'daily') {
+          underlyingAtrInertBySymbol.set(opt.symbol, 'cold_daily_atr');
+        }
+      };
+      if (!series || series.length < 15) { noteInert(); continue; }
       // TRA-4991 — the period is stated EXPLICITLY (it is `atr()`'s own default,
       // so this is behaviour-neutral) because the fire publishes it. A published
       // period that is really "whatever the indicator defaults to today" is not a
       // measurement of anything.
       const a = atr(series, CHANDELIER_ATR_PERIOD);
-      if (a == null || !(a > 0)) continue;
+      if (a == null || !(a > 0)) { noteInert(); continue; }
       underlyingAtrBySymbol.set(opt.symbol, a);
       const ap = atrPct(series, CHANDELIER_ATR_PERIOD);
       if (ap != null && Number.isFinite(ap)) underlyingAtrPctBySymbol.set(opt.symbol, ap);
@@ -3856,6 +3898,10 @@ export class SignalEngine {
         // constant: a repair that re-points this cache has to move this reading.
         timeframeMs: measureCandleTimeframeMs(series),
         bars: series.length,
+        // TRA-4992 — and the SELECTED series beside the measured spacing, because
+        // a daily series' measured spacing is a range (weekends) while this is
+        // exact. Together they catch "flag flipped, input did not".
+        series: chandelierAtrTf.timeframe,
       });
     }
     // TRA-1294 — take-profit-early is premium-space only (no underlying ATR
@@ -3894,6 +3940,17 @@ export class SignalEngine {
       : undefined;
     if (
       underlyingAtrBySymbol.size === 0
+      // TRA-4992 — an inert-but-ELIGIBLE row still needs the input object to
+      // exist. Without this clause, flipping the flag on a cold daily store
+      // would return `undefined`, and the exit pass would then count the row
+      // `no_exit_risk` — i.e. "the exit-risk master is off", a STRUCTURAL zero —
+      // when the master is on and the real reason is AC3's cold cache. It would
+      // also drop `openingRangeGuardMin`, silently widening the TRA-3217
+      // suppression window for the premium trail and profit-lock legs, which are
+      // out of this ticket's scope entirely. The chandelier still cannot run:
+      // `underlyingAtrBySymbol` has no entry for the symbol, which is the
+      // fail-closed property itself.
+      && underlyingAtrInertBySymbol.size === 0
       && takeProfitEarlyCaptureFrac === undefined
       && profitFloorLadder === undefined
     ) return undefined;
@@ -3910,6 +3967,7 @@ export class SignalEngine {
       underlyingAtrBySymbol,
       underlyingAtrPctBySymbol,
       underlyingAtrSourceBySymbol,
+      underlyingAtrInertBySymbol,
       takeProfitEarlyCaptureFrac,
       openingRangeGuardMin,
       ...(profitFloorLadder !== undefined ? { profitFloorLadder } : {}),

@@ -7,7 +7,11 @@ import {
 import {
   resolveOtmSleeveExitRule,
   OTM_SLEEVE_EXIT_RULE_VALUE,
+  resolveChandelierAtrTimeframe,
+  CHANDELIER_ATR_TIMEFRAME_VALUE,
   type OtmSleeveExitRuleResolution,
+  type ChandelierAtrTimeframeName,
+  type ChandelierAtrTimeframeResolution,
 } from './exit-risk-rules-flag.js';
 
 // TRA-4991 (parent TRA-4945) — the underlying-space ATR chandelier's INPUTS, as
@@ -74,6 +78,23 @@ export const CHANDELIER_ATR_PERIOD = 14;
 export const SHADOW_CANDLE_TIMEFRAME_MS = 5 * 60_000;
 
 /**
+ * Nominal bar spacing of the DAILY series the TRA-4992 repair selects — the
+ * `market-data-daily-cache` store `refreshTechnicalSnapshot` warms for free and
+ * `otmDailyAtr` already reads for the sibling (entry-invalidation) leg.
+ *
+ * ⚠️ NOMINAL, and the one place the distinction bites. A daily series' MEASURED
+ * spacing is never this number: weekends and holidays make the median
+ * consecutive delta 86400000 only across a Mon–Fri run, and a session-boundary
+ * gap is 3x it. So with the flag on `daily` the route's configured
+ * `atrTimeframeMs` and a row's measured `chandelier.atrTimeframeMs` are EXPECTED
+ * to differ — the row is the measurement (TRA-4991's rule), and a measured
+ * ~86.4e6 ± a weekend is the positive confirmation that the daily series is what
+ * the ATR was actually taken on. ⛔ Do not "reconcile" these two by asserting
+ * equality; that assertion would fail on every correct daily read.
+ */
+export const DAILY_CANDLE_TIMEFRAME_MS = 86_400_000;
+
+/**
  * The bar spacing of a candle series, MEASURED — median of the consecutive
  * `timestamp` deltas, so one gap (a session boundary, a halt) cannot move it.
  *
@@ -110,7 +131,33 @@ export interface OptionChandelierAtrSource {
   timeframeMs: number | null;
   /** Bars in the series the ATR was computed over. */
   bars: number;
+  /**
+   * TRA-4992 — WHICH series the producer SELECTED, beside the measured spacing.
+   *
+   * Both are published because they fail differently. `timeframeMs` is the
+   * ground truth about the bars but it is a RANGE on a daily series (weekends),
+   * so it cannot be compared to a constant; `series` is exact but it is a
+   * declaration, so on its own it could lie about a mis-wired cache. Together
+   * they pin the repair: `series: 'daily'` with a measured spacing still at
+   * 300000 is the one reading that says the flag flipped and the input did not.
+   */
+  series: ChandelierAtrTimeframeName;
 }
+
+/**
+ * Why the producer served NO chandelier ATR for an otherwise-eligible symbol
+ * (TRA-4992 AC3). Carried per symbol so the exit pass's census can attribute the
+ * inert row instead of folding it into `no_spot_or_atr`, which also means "the
+ * feed served no spot" and would make the two indistinguishable.
+ *
+ * `cold_daily_atr` — the flag is `daily` and the daily-bars store held too few
+ * bars for this underlying (or they yielded no positive ATR). ⛔ THE LEG GOES
+ * INERT, it does NOT fall back to the 5m ATR: a fallback would make the flag's
+ * effect unobservable, which is the entire reason the repair is flagged. Same
+ * fail-closed direction, and the same reason, as TRA-3943's `atrLegInertRows` —
+ * a level derived from a number we did not measure is worse than no level.
+ */
+export type ChandelierAtrInertReason = 'cold_daily_atr';
 
 // ── AC3 — the high-beta branch counter ───────────────────────────────────────
 
@@ -141,6 +188,15 @@ export interface OptionChandelierAtrSource {
  * `no_spot_or_atr` — eligible, but the tick served no underlying spot or no
  * positive ATR (too few cached bars for this underlying). The nearest cell to a
  * real absence: the trail would have run if the feed had reached it.
+ * `no_daily_atr` — TRA-4992: eligible, spot served, `CHANDELIER_ATR_TIMEFRAME`
+ * is `daily`, and the daily-bars store was COLD for this underlying. The leg is
+ * inert for the row by design (AC3) — no level stamped, no fire, and NO fallback
+ * to the 5m ATR. ⛔ This cell is the flag's cost of admission and it MUST stay
+ * separate from `no_spot_or_atr`: pooled, a warm-up of the daily store would
+ * read as a feed outage, and the one question the arm decision turns on — "is the
+ * repair inert because the input is missing, or is the book just quiet?" — would
+ * be unanswerable. A non-zero here with `timeframe: shadow_5m` is impossible by
+ * construction and would mean the producer and the resolver disagree.
  *
  * ⛔ `rowsSeen` IS NOT THE OPEN-ROW COUNT. It counts rows reaching the chandelier
  * chain plus the two filters named above; the exit loop has further `continue`s
@@ -154,10 +210,11 @@ export type ChandelierSkipReason =
   | 'multi_leg'
   | 'covered_write'
   | 'no_exit_risk'
-  | 'no_spot_or_atr';
+  | 'no_spot_or_atr'
+  | 'no_daily_atr';
 
 export const CHANDELIER_SKIP_REASONS: readonly ChandelierSkipReason[] = [
-  'retired', 'multi_leg', 'covered_write', 'no_exit_risk', 'no_spot_or_atr',
+  'retired', 'multi_leg', 'covered_write', 'no_exit_risk', 'no_spot_or_atr', 'no_daily_atr',
 ];
 
 /** One book's ratchet tally. `maxAtrPct` is `null` until an `atrPct` is seen. */
@@ -213,7 +270,10 @@ function emptyTally(): ChandelierRatchetTally {
   return {
     rowsSeen: 0,
     ratchets: 0,
-    skipped: { retired: 0, multi_leg: 0, covered_write: 0, no_exit_risk: 0, no_spot_or_atr: 0 },
+    skipped: {
+      retired: 0, multi_leg: 0, covered_write: 0, no_exit_risk: 0, no_spot_or_atr: 0,
+      no_daily_atr: 0,
+    },
     highBeta: 0,
     base: 0,
     baseAtrPctAbsent: 0,
@@ -306,7 +366,10 @@ export function summarizeChandelierRatchets(): ChandelierRatchetSummary {
       + 'non-ratchet: `multi_leg` = a combo (never reaches the single-leg trail), `covered_write` = '
       + 'a CSP/covered call (inverted P&L basis), `retired` = TRA-3941 retired the family on '
       + 'single_leg_otm, `no_exit_risk` = the exit-risk master is off (structural), `no_spot_or_atr` '
-      + '= eligible but the tick served no spot or no positive ATR. ⛔ rowsSeen is NOT the open-row '
+      + '= eligible but the tick served no spot or no positive ATR, `no_daily_atr` = TRA-4992, the '
+      + 'ATR timeframe is `daily` and the daily-bars store was COLD for that underlying so the leg '
+      + 'went inert by design (no level, no fire, no 5m fallback) — kept SEPARATE from '
+      + 'no_spot_or_atr so a daily-store warm-up cannot read as a feed outage. ⛔ rowsSeen is NOT the open-row '
       + 'count: the exit loop has further skips that are not instrumented here, so read '
       + '/api/health/option-journal?rows=open for the book census. '
       + 'One count per row per exit pass, SINCE BOOT only (nothing persists these). '
@@ -340,15 +403,46 @@ export interface ChandelierTrailParams {
   atrMultHighBeta: number;
   highBetaAtrPct: number;
   /**
+   * TRA-4992 AC4 — which timeframe `highBetaAtrPct` is CALIBRATED for, stated
+   * because it does not move with the flag and the flag is what makes it
+   * meaningful.
+   *
+   * `EXIT_CHANDELIER_HIGHBETA_ATRPCT = 0.05` is a DAILY-scale number: a name
+   * whose daily ATR is >5% of spot is high-beta. `chandelierMultiplier` compares
+   * it against `atrPct = atr(series)/lastClose` on whichever series is selected
+   * (`packages/engine/src/indicators/atr.ts`). On the 5m series a 5% 70-minute
+   * range is a near-unreachable extreme, so the 3.5 multiplier was effectively
+   * dead; on `daily` the threshold means what it was calibrated to mean and 3.5
+   * becomes REACHABLE. ⛔ So flipping this flag changes the trail width through
+   * TWO paths, not one — the ATR level AND which multiplier it is scaled by.
+   */
+  highBetaAtrPctCalibratedFor: 'daily';
+  /**
    * ⚠ `compiled`: the three multipliers above have NO env override in this
    * build — they are `@trading-app/shared` literals. Published so a reader stops
    * hunting for an env key instead of concluding one was unset.
    */
   multSource: 'compiled';
   atrPeriod: number;
-  /** Configured resample width of the ATR's source series. */
+  /**
+   * Configured (NOMINAL) bar width of the ATR's source series, for the SELECTED
+   * timeframe. ⚠️ On `daily` compare this to a row's measured
+   * `chandelier.atrTimeframeMs` only as an order of magnitude — see
+   * {@link DAILY_CANDLE_TIMEFRAME_MS}.
+   */
   atrTimeframeMs: number;
-  atrSeries: 'supertrend_shadow_5m';
+  atrSeries: 'supertrend_shadow_5m' | 'daily_bars';
+  /**
+   * TRA-4992 — the ATR-series selection, resolved HERE through
+   * `resolveChandelierAtrTimeframe` (not copied), so this route and the producer
+   * can only disagree if the resolver does.
+   *
+   * ⛔ `source: 'default'` ⇒ `shadow_5m` ⇒ THE DEFECT IS STILL LIVE AND THAT IS
+   * THE INTENDED SHIPPING STATE (AC5). `source: 'env_invalid'` ⇒ somebody tried
+   * to arm the repair and misspelled it, and got the OLD behaviour — the one
+   * reading on this route that is a standing action item.
+   */
+  atrTimeframe: ChandelierAtrTimeframeResolution & { envKey: string };
   /** The TRA-3941 sleeve rule, resolved HERE (not copied) so it cannot drift. */
   otmSleeveExitRule: OtmSleeveExitRuleResolution & {
     envKey: string;
@@ -372,15 +466,19 @@ export function resolveChandelierTrailParams(
   env: NodeJS.ProcessEnv = process.env,
 ): ChandelierTrailParams {
   const rule = resolveOtmSleeveExitRule(env);
+  const atrTf = resolveChandelierAtrTimeframe(env);
+  const daily = atrTf.timeframe === 'daily';
   return {
     issue: 'TRA-4991',
     atrMult: EXIT_CHANDELIER_ATR_MULT,
     atrMultHighBeta: EXIT_CHANDELIER_ATR_MULT_HIGHBETA,
     highBetaAtrPct: EXIT_CHANDELIER_HIGHBETA_ATRPCT,
+    highBetaAtrPctCalibratedFor: 'daily',
     multSource: 'compiled',
     atrPeriod: CHANDELIER_ATR_PERIOD,
-    atrTimeframeMs: SHADOW_CANDLE_TIMEFRAME_MS,
-    atrSeries: 'supertrend_shadow_5m',
+    atrTimeframeMs: daily ? DAILY_CANDLE_TIMEFRAME_MS : SHADOW_CANDLE_TIMEFRAME_MS,
+    atrSeries: daily ? 'daily_bars' : 'supertrend_shadow_5m',
+    atrTimeframe: { ...atrTf, envKey: CHANDELIER_ATR_TIMEFRAME_VALUE },
     otmSleeveExitRule: {
       ...rule,
       envKey: OTM_SLEEVE_EXIT_RULE_VALUE,
@@ -398,6 +496,18 @@ export function resolveChandelierTrailParams(
       + 'exit_reason can be minted for an OTM row; source `default` means nothing is set in the '
       + 'env, which IS the TRA-3941 ruling, and `env_invalid` means somebody spelled the key '
       + 'wrong and got the ruling anyway. SCOPE: one sleeve — RV and directional rows keep the '
-      + 'chandelier by design.',
+      + 'chandelier by design. '
+      + 'TRA-4992: `atrTimeframe` selects the ATR SERIES — `shadow_5m` (default) is the 3.0 x '
+      + 'ATR(14, 5m) UNIT ERROR this repair exists to fix (a 3.0 multiplier specified for a DAILY '
+      + 'ATR, applied to three 70-minute ranges; pooled median hold 1.04h, shortest 1.9s), `daily` '
+      + 'is the repair. source `default` means the defect is STILL LIVE, which is the intended '
+      + 'shipping state — arming is a board call graded by QuantTrader, not a deploy. source '
+      + '`env_invalid` means somebody tried to arm it, misspelled the value, and got the OLD '
+      + 'behaviour: that is the one reading here that needs action. ⛔ On `daily` a cold daily-bars '
+      + 'store makes the leg INERT for that row (no level, no fire, NO 5m fallback) and the row '
+      + 'lands in `ratchets.skipped.no_daily_atr` — read that cell before reading `ratchets: 0`. '
+      + 'And note `highBetaAtrPctCalibratedFor: daily`: flipping to `daily` moves the trail through '
+      + 'TWO paths, the ATR level AND which multiplier scales it, because the 0.05 high-beta '
+      + 'threshold only becomes reachable on a daily-scale atrPct.',
   };
 }

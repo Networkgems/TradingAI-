@@ -44,6 +44,7 @@ import {
   noteChandelierRatchet,
   noteChandelierRowSkipped,
   type OptionChandelierAtrSource,
+  type ChandelierAtrInertReason,
 } from './option-chandelier-trail.js';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
@@ -605,7 +606,15 @@ const COMBO_BS_RISK_FREE_RATE = 0.045;
  * wait-and-hold, wiring the rules here covers demo AND live automatically.
  */
 export interface OptionExitRiskInput {
-  /** ATR(14) of the UNDERLYING on 5m bars, keyed by underlying symbol. */
+  /**
+   * ATR(14) of the UNDERLYING, keyed by underlying symbol.
+   *
+   * ⚠ TRA-4992 — the SERIES is the producer's choice, not 5m by definition any
+   * more: `CHANDELIER_ATR_TIMEFRAME` selects the 5m shadow-candle cache
+   * (default) or the position-timeframe daily store. Read
+   * {@link underlyingAtrSourceBySymbol} for what a given entry was measured on;
+   * do not assume a timeframe from this map's name.
+   */
   underlyingAtrBySymbol: Map<string, number>;
   /** Underlying ATR / price by symbol — picks the high-beta multiplier. Optional. */
   underlyingAtrPctBySymbol?: Map<string, number>;
@@ -626,6 +635,17 @@ export interface OptionExitRiskInput {
    * default and `null` respectively rather than inventing a spacing.
    */
   underlyingAtrSourceBySymbol?: Map<string, OptionChandelierAtrSource>;
+  /**
+   * TRA-4992 (AC3) — underlyings the producer deliberately served NO chandelier
+   * ATR for, with the reason. Present ⇔ the producer refused at least one.
+   *
+   * ⛔ This is the FAIL-CLOSED path, not an error channel. The row's chandelier
+   * leg is inert (no level stamped, no fire) and stays that way; the only thing
+   * this map adds is the ability to say WHY on the census, so a cold daily store
+   * cannot read as `no_spot_or_atr` (a feed outage). There is no fallback to the
+   * 5m ATR by design — see {@link ChandelierAtrInertReason}.
+   */
+  underlyingAtrInertBySymbol?: Map<string, ChandelierAtrInertReason>;
   /**
    * TRA-1294 — take-profit-early capture fraction (0.50–0.70). Present ⇔ the
    * caller armed the STANDALONE, DEMO-ONLY `TAKE_PROFIT_EARLY_ENABLED` flag
@@ -11924,7 +11944,24 @@ export class PaperOptionsAccount {
           // Eligible, but this tick served no underlying spot or no positive ATR
           // (too few cached bars for the underlying). The nearest cell to a real
           // absence: the trail WOULD have run had the feed reached it.
-          noteChandelierRowSkipped(chandelierCensusMode, 'no_spot_or_atr');
+          //
+          // TRA-4992 (AC3) — unless the producer refused the ATR on purpose
+          // because `CHANDELIER_ATR_TIMEFRAME=daily` and the daily store was
+          // cold. Then the leg is inert BY DESIGN and gets its own cell: pooled
+          // with `no_spot_or_atr`, a daily-store warm-up would read as a feed
+          // outage and the arm decision's central question ("inert because the
+          // input is missing, or just a quiet book?") would be unanswerable.
+          //
+          // Spot is checked FIRST: with no spot the trail could not have run on
+          // either series, so that is a feed absence whatever the flag says, and
+          // attributing it to the flag would overstate the repair's cost.
+          const dailyAtrInert = chandelierUnderlying != null
+            && uatr === undefined
+            && exitRisk.underlyingAtrInertBySymbol?.get(opt.symbol) === 'cold_daily_atr';
+          noteChandelierRowSkipped(
+            chandelierCensusMode,
+            dailyAtrInert ? 'no_daily_atr' : 'no_spot_or_atr',
+          );
         }
       } else {
         // Never reaches the ratchet at all: a combo (held to expiry/manual close,

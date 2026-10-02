@@ -40,6 +40,7 @@ import {
   resetChandelierRatchetLedgerForTests,
   resolveChandelierTrailParams,
   summarizeChandelierRatchets,
+  type OptionChandelierAtrSource,
 } from './option-chandelier-trail.js';
 import {
   EXIT_CHANDELIER_ATR_MULT,
@@ -56,7 +57,12 @@ const SESSION_1 = Date.parse('2024-06-04T14:00:00Z');
 const SESSION_2_OPEN = Date.parse('2024-06-05T13:34:00Z');
 
 /** Every AC3 skip cell at zero — the shape a pass that ratcheted every row has. */
-const NO_SKIPS = { retired: 0, multi_leg: 0, covered_write: 0, no_exit_risk: 0, no_spot_or_atr: 0 } as const;
+const NO_SKIPS = {
+  retired: 0, multi_leg: 0, covered_write: 0, no_exit_risk: 0, no_spot_or_atr: 0,
+  // TRA-4992's cell. Zero here for the whole of this suite, which runs on the
+  // default `shadow_5m` timeframe where the cell is unreachable by construction.
+  no_daily_atr: 0,
+} as const;
 
 const UATR = 4;
 /** base width 3.0 × 4 = 12 under the running high 210 ⇒ stop 198. */
@@ -97,9 +103,12 @@ const JOURNAL_SETUP = {
  * The ATR provenance a real `buildOptionExitRisk` attaches: period 14, spacing
  * MEASURED off the 5m shadow series, bar count.
  */
-const ATR_SOURCE = {
+const ATR_SOURCE: OptionChandelierAtrSource = {
   period: CHANDELIER_ATR_PERIOD,
   timeframeMs: SHADOW_CANDLE_TIMEFRAME_MS,
+  // TRA-4992 added the SELECTED series beside the measured spacing. `shadow_5m`
+  // keeps this suite's subject the pre-repair default it was written against.
+  series: 'shadow_5m',
   bars: 480,
 };
 
@@ -345,7 +354,7 @@ describe('TRA-4991 AC3 — the high-beta multiplier is COUNTED, not flagged', ()
     const tally = summarizeChandelierRatchets().byMode.demo;
     expect(tally.rowsSeen).toBe(1);
     expect(tally.ratchets).toBe(1);
-    expect(tally.skipped).toEqual({ retired: 0, multi_leg: 0, covered_write: 0, no_exit_risk: 0, no_spot_or_atr: 0 });
+    expect(tally.skipped).toEqual(NO_SKIPS);
     expect(tally.highBeta).toBe(0);
     expect(tally.base).toBe(0);
     // ⛔ THE DISCRIMINATION: `highBeta: 0` here is NOT a reading about
