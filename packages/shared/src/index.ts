@@ -547,6 +547,42 @@ export interface Sma200GateRejectionRecord {
 }
 
 /**
+ * TRA-4922 (AC-d + AC-e) — integrity witness for the gate-rejection ledger.
+ *
+ * {@link Sma200GateRejectionRecord} rows live in a capped FIFO ring that
+ * `forceReset` also wipes, so the AC7 count folded over the fleet is **not
+ * monotonic**: a later read can be LOWER than an earlier one. Both losses are
+ * silent on the ring alone — an evicted row and a row that never arrived are
+ * byte-identical once gone — and they have OPPOSITE remedies:
+ *
+ * - `evicted > 0` ⇒ the cap is too small for the observed burst. AC7 needs each
+ *   counted fire to accrue ~20 daily bars before it enters its cohort, so an
+ *   eviction inside that window destroys a cohort member, and arrivals are
+ *   DATE-CLUSTERED (a market-wide trend day rejects many names at once — the
+ *   reason the TRA-3688 S-1 sweep's t-stats clustered on the fire date). The
+ *   mean arrival rate is therefore NOT the binding case; one burst is.
+ * - `resets > 0` ⇒ a book was re-based and its contribution to the union was
+ *   deleted. Nothing is wrong with the cap; the denominator simply moved.
+ *
+ * Counters are cumulative over the LEDGER's durable life and persisted with it,
+ * never process-scoped: a reset followed by a redeploy must still be visible
+ * afterwards, or a restart launders the decrement this object exists to report.
+ */
+export interface Sma200RejectionLedgerMeta {
+  /**
+   * Rows dropped by the FIFO cap, cumulative. Non-zero ⇒ the AC7 cohort on
+   * THIS book is incomplete and its n is a lower bound, not a count.
+   */
+  evicted: number;
+  /** `forceReset` wipes of the whole ledger, cumulative. */
+  resets: number;
+  /** Wall-clock (ms) of the most recent wipe, or `null` if never reset. */
+  lastResetAt: number | null;
+  /** Rows discarded by the most recent wipe (0 when the ledger was empty). */
+  lastResetDropped: number;
+}
+
+/**
  * TRA-4617 (TRA-3688 S-2b) — the ruled exit model, stamped on every emitted
  * `sma200_pullback` record so the ruling travels WITH the record instead of
  * living only in a document. The defect that opened TRA-3688 was exactly a

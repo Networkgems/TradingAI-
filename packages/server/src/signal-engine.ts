@@ -17,7 +17,7 @@ import {
 import { foldHiddenBookExposure } from './hidden-book-exposure.js';
 import { roundToCent } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Sma200SignalVoidRecord, Sma200VoidReason, Sma200GateRejectionRecord, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason, HiddenBookExposure } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Sma200SignalVoidRecord, Sma200VoidReason, Sma200GateRejectionRecord, Sma200RejectionLedgerMeta, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason, HiddenBookExposure } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-3390 (impl child of TRA-2628) — the entry-path currency refusal. See
 // `quoteCurrencyEntryVerdict` below for where it is consulted.
@@ -936,6 +936,28 @@ export interface Sma200ScanStats {
   finishedAt: number;
   /** Symbols handed to the sweep. */
   considered: number;
+  /**
+   * TRA-4922 (AC-c) — the ACTUAL symbols this sweep was handed, so the fleet
+   * fold can publish a DISTINCT symbol union instead of Σ `considered`.
+   *
+   * Why the list and not the count: `considered` is a per-engine number and
+   * summing it over the fleet is a sigma, not a census — 68 engines × 100
+   * considered reads `6800` while the true union may be 100. TRA-4921's
+   * arrival-rate table was derived off "~751 names", which is a CODE COMMENT
+   * (`SMA200_DAILY_BARS` neighbourhood / `getActiveSymbols` docs), never a live
+   * census, and the per-engine universe genuinely differs: `getActiveSymbols`
+   * is cut by priority tier (held → signalled → risk inputs → watchlist →
+   * discovery tail, TRA-4830), and what a book HOLDS is per book.
+   *
+   * Snapshotted at sweep time and copied, NOT held by reference: the caller's
+   * `activeSymbols` is rebuilt per tick, so a reference would silently
+   * re-describe a later universe as the one this census graded.
+   *
+   * Optional (TRA-3913): absent on a build without it, and ABSENT ≠ EMPTY — a
+   * fold that reads a missing key as "swept nothing" re-creates this ticket's
+   * own defect. Deliberately NOT persisted (the census never is).
+   */
+  consideredSymbols?: string[];
   /** Symbols that yielded >= `SMA200_MIN_BARS` bars and were actually scored. */
   evaluated: number;
   /**
@@ -1009,6 +1031,33 @@ export interface EngineState {
    * Optional so pre-TRA-4411 fixtures still type-check (TRA-3913).
    */
   sma200GateRejections?: Sma200GateRejectionRecord[];
+  /**
+   * TRA-4922 (AC-d + AC-e) — the rejection ledger's INTEGRITY witness.
+   *
+   * `sma200GateRejections` above is a capped FIFO ring that `forceReset` also
+   * wipes, so the fleet-folded AC7 n is NOT monotonic: a re-read can be LOWER
+   * than an earlier one with no visible cause, and the two causes have opposite
+   * remedies (an eviction means the cap is too small for the burst; a reset
+   * means a book was re-based). Without this object both losses read exactly
+   * like a quiet tape — the same absent-key-as-measurement trap this ticket was
+   * filed for, one layer in.
+   *
+   * Scoped to the ledger's durable life, not the process: persisted with the
+   * ring, so a reset at 10:00 followed by a redeploy at 11:00 is still visible
+   * at 12:00. A counter that reset with the process would let a restart launder
+   * the decrement it exists to report.
+   *
+   * Optional (TRA-3913): absent on a build without it, and field presence is
+   * the deployed-bytes proof.
+   */
+  sma200RejectionLedgerMeta?: Sma200RejectionLedgerMeta;
+  /**
+   * TRA-4922 (AC-d) — the ring's capacity, published so a reader can see
+   * `sma200GateRejections.length === cap` (a ring sitting AT the cap is one
+   * arrival away from evicting a cohort member) without hard-coding the
+   * constant on the read side. Optional: deployed-bytes proof for the raise.
+   */
+  sma200RejectionCap?: number;
   /**
    * TRA-4457 — census of the most recent `runSma200Scan` sweep, or `null` if no
    * sweep has completed in this process yet.
@@ -2243,7 +2292,12 @@ const SMA200_DAILY_BARS = SMA200_MIN_BARS + 30;
 // forming bar vs the settled bar), so debouncing on the raw millisecond value
 // defeats itself; the calendar day is the stable identity of "the same daily
 // bar" for dedupe purposes.
-function sma200BarDay(ts: number): number {
+// TRA-4922 — EXPORTED so the fleet fold in `health-routes` dedupes a union of
+// rejection rows with the SAME day identity the engine debounces on. A second
+// inlined `Math.floor(ts / 86_400_000)` there would be a copy that can drift
+// from this one, and the whole point of the fleet key is that it is the engine's
+// key. (See `summarizeSma200Sweeps`.)
+export function sma200BarDay(ts: number): number {
   return Math.floor(ts / 86_400_000);
 }
 
@@ -3602,7 +3656,41 @@ export class SignalEngine {
    * for why the rejected cohort must have a durable surface at all.
    */
   private sma200GateRejections: Sma200GateRejectionRecord[] = [];
-  private static readonly SMA200_REJECTION_MAX = 50;
+  /**
+   * TRA-4922 (AC-d) — RAISED 50 → 400.
+   *
+   * AC7 requires each counted rejection to accrue ~20 daily bars before it
+   * enters its cohort, so a row must survive ~20 sessions in this ring. 50 is
+   * ample at the MEAN arrival rate (measured: this process's whole ledger sat
+   * flat at 4 rows across an 18h session, 2026-09-24 full-session census;
+   * `rejectedMaxDist: 0` on the reporting book 2026-09-25) — but the mean is not
+   * the binding case. Arrivals are DATE-CLUSTERED: a market-wide trend day
+   * rejects many names in one sweep, and a single such burst is what evicts a
+   * cohort before it matures.
+   *
+   * The ceiling is derived, not guessed. The per-name rejection debounce is
+   * {@link SMA200_DEBOUNCE_BARS} (5) bars keyed `(symbol, kind)` on its OWN
+   * ledger, so across a 20-bar cohort window ONE name can contribute at most
+   * ⌈20/5⌉ = 4 rows. 400 therefore holds a complete 20-session cohort for up to
+   * ~100 distinct names — and the live universe handed to a sweep is ~100-751
+   * names, so 400 covers a burst that refuses every name of a 100-name book and
+   * still leaves headroom. Cost: ~400 × ~150B ≈ 60KB per book, bounded, which is
+   * noise against the TRA-4158 heap envelope.
+   *
+   * 🔴 No cap is PROVABLY sufficient — the burst has never been observed, so any
+   * number here is an estimate against an unmeasured tail. That is precisely why
+   * the raise ships WITH {@link Sma200RejectionLedgerMeta}`.evicted`: the
+   * guarantee is not "we never evict", it is "an eviction is never silent".
+   * Grading the cap by its size alone would be grading a control by its flag.
+   */
+  private static readonly SMA200_REJECTION_MAX = 400;
+  /**
+   * TRA-4922 (AC-d + AC-e) — the ledger's integrity witness. See
+   * {@link Sma200RejectionLedgerMeta}; persisted with the ring.
+   */
+  private sma200RejectionLedgerMeta: Sma200RejectionLedgerMeta = {
+    evicted: 0, resets: 0, lastResetAt: null, lastResetDropped: 0,
+  };
   /**
    * TRA-787 — per-symbol 5m candle series for the SupertrendConfluence shadow
    * scan, resampled from a deeper minute-bar pull than the ORB cache. Refreshed
@@ -5029,6 +5117,14 @@ export class SignalEngine {
     this.sma200LastFired.clear();
     // TRA-4411 — a full reset drops the gate-rejection ledger and its debounce
     // with it (the evidence archive belongs to the state being reset).
+    // TRA-4922 (AC-e) — but it does NOT get to do so silently. This wipe removes
+    // this book's whole contribution to the fleet-folded AC7 union, so a re-read
+    // afterwards is LOWER than the earlier one; without the stamp below, the
+    // shrink has no cause a reader can see and is indistinguishable from a quiet
+    // tape. Stamped BEFORE the clear so `lastResetDropped` is the real loss.
+    this.sma200RejectionLedgerMeta.resets += 1;
+    this.sma200RejectionLedgerMeta.lastResetAt = Date.now();
+    this.sma200RejectionLedgerMeta.lastResetDropped = this.sma200GateRejections.length;
     this.sma200GateRejections = [];
     this.sma200LastRejected.clear();
     // TRA-335 — wipe the live equity mirror too. The Tradier-side positions
@@ -8354,6 +8450,8 @@ export class SignalEngine {
       startedAt: Date.now(),
       finishedAt: 0,
       considered: symbols.length,
+      // TRA-4922 (AC-c) — copy, never alias: `activeSymbols` is rebuilt per tick.
+      consideredSymbols: [...symbols],
       evaluated: 0,
       starvedBreakerOpen: 0,
       starvedShortHistory: 0,
@@ -8558,9 +8656,18 @@ export class SignalEngine {
               recordedAt: Date.now(),
             });
             if (this.sma200GateRejections.length > SignalEngine.SMA200_REJECTION_MAX) {
-              this.sma200GateRejections.splice(
-                0, this.sma200GateRejections.length - SignalEngine.SMA200_REJECTION_MAX,
-              );
+              const dropped = this.sma200GateRejections.length - SignalEngine.SMA200_REJECTION_MAX;
+              this.sma200GateRejections.splice(0, dropped);
+              // TRA-4922 (AC-d) — count the loss. An evicted row and a row that
+              // never arrived are byte-identical once gone, so an un-counted
+              // eviction silently truncates the AC7 cohort and reads as a quiet
+              // tape. Same discipline as `cardRingEvicted` (TRA-4936).
+              this.sma200RejectionLedgerMeta.evicted += dropped;
+              log.warn('sma200 rejection ledger evicted rows at cap', {
+                component: 'sma200-scan', issue: 'TRA-4922',
+                dropped, cap: SignalEngine.SMA200_REJECTION_MAX,
+                evictedTotal: this.sma200RejectionLedgerMeta.evicted,
+              });
             }
             this.sma200LastRejected.set(key, latestBarTs);
             stats.rejectedMaxDist = (stats.rejectedMaxDist ?? 0) + 1;
@@ -23759,6 +23866,12 @@ export class SignalEngine {
         sma200SignalVoids: this.sma200SignalVoids,
         // TRA-4411 (AC6) — the max-dist gate's rejected cohort (its only surface).
         sma200GateRejections: this.sma200GateRejections,
+        // TRA-4922 (AC-d/AC-e) — and the ring's integrity witness beside it, so a
+        // SHRINKING fleet-folded n has a named cause (eviction vs reset) instead
+        // of reading as a quiet tape. Published on BOTH getState branches: a
+        // witness visible on one branch only is unobservable for half the fleet.
+        sma200RejectionLedgerMeta: this.sma200RejectionLedgerMeta,
+        sma200RejectionCap: SignalEngine.SMA200_REJECTION_MAX,
         // TRA-4457 — the sweep census, so a reader can see the denominator that
         // makes an empty `signals` array mean something.
         sma200ScanStats: this.lastSma200ScanStats,
@@ -23832,6 +23945,9 @@ export class SignalEngine {
       sma200SignalVoids: this.sma200SignalVoids,
       // TRA-4411 (AC6) — the max-dist gate's rejected cohort (its only surface).
       sma200GateRejections: this.sma200GateRejections,
+      // TRA-4922 (AC-d/AC-e) — see the sibling getState branch above.
+      sma200RejectionLedgerMeta: this.sma200RejectionLedgerMeta,
+      sma200RejectionCap: SignalEngine.SMA200_REJECTION_MAX,
       // TRA-4457 — the sweep census, so a reader can see the denominator that
       // makes an empty `signals` array mean something.
       sma200ScanStats: this.lastSma200ScanStats,
@@ -24243,6 +24359,14 @@ export class SignalEngine {
      * Optional: absent on pre-TRA-4411 snapshots.
      */
     sma200GateRejections?: Sma200GateRejectionRecord[];
+    /**
+     * TRA-4922 (AC-e) — persisted integrity witness for the ledger above. MUST
+     * travel with the ring: a reset at 10:00 followed by a redeploy at 11:00
+     * would otherwise read `resets: 0` at 12:00, and the restart would launder
+     * the very decrement this field exists to report. Optional: absent on
+     * pre-TRA-4922 snapshots, where ABSENT means "no witness", not "no reset".
+     */
+    sma200RejectionLedgerMeta?: Sma200RejectionLedgerMeta;
     dailySignals: DailySignalRecord[];
     positionSignalType: Array<[string, SignalType]>;
     account: ReturnType<PaperAccount['exportSnapshot']>;
@@ -24276,6 +24400,7 @@ export class SignalEngine {
       recentSignals: [...this.recentSignals],
       sma200SignalVoids: [...this.sma200SignalVoids],
       sma200GateRejections: [...this.sma200GateRejections],
+      sma200RejectionLedgerMeta: { ...this.sma200RejectionLedgerMeta },
       dailySignals: [...this.dailySignals],
       positionSignalType: Array.from(this.positionSignalType.entries()),
       account: this.account.exportSnapshot(),
@@ -24405,6 +24530,28 @@ export class SignalEngine {
     this.sma200GateRejections = Array.isArray(snap.sma200GateRejections)
       ? [...snap.sma200GateRejections]
       : [];
+    // TRA-4922 (AC-e) — and its integrity witness, restored with it. A
+    // pre-TRA-4922 snapshot carries no witness; that must read as a ZEROED
+    // witness (no eviction/reset OBSERVED), never be silently invented, so the
+    // fields are copied only when actually present and numeric.
+    const restoredMeta = snap.sma200RejectionLedgerMeta;
+    this.sma200RejectionLedgerMeta = {
+      evicted: typeof restoredMeta?.evicted === 'number' ? restoredMeta.evicted : 0,
+      resets: typeof restoredMeta?.resets === 'number' ? restoredMeta.resets : 0,
+      lastResetAt: typeof restoredMeta?.lastResetAt === 'number' ? restoredMeta.lastResetAt : null,
+      lastResetDropped: typeof restoredMeta?.lastResetDropped === 'number'
+        ? restoredMeta.lastResetDropped
+        : 0,
+    };
+    // TRA-4922 (AC-d) — a snapshot written under a LARGER cap than this build
+    // runs would silently over-fill the ring and then evict on the next arrival
+    // without ever crossing the splice above. Re-apply the cap at restore and
+    // count the loss, so a cap DOWNGRADE is as visible as a runtime eviction.
+    if (this.sma200GateRejections.length > SignalEngine.SMA200_REJECTION_MAX) {
+      const dropped = this.sma200GateRejections.length - SignalEngine.SMA200_REJECTION_MAX;
+      this.sma200GateRejections.splice(0, dropped);
+      this.sma200RejectionLedgerMeta.evicted += dropped;
+    }
     this.sma200LastRejected.clear();
     for (const r of this.sma200GateRejections) {
       if (typeof r.barTimestamp !== 'number') continue;

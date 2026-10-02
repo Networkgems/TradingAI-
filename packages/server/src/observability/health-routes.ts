@@ -10,7 +10,7 @@ import { timingSafeEqual } from 'node:crypto';
 import type { Express, Response, RequestHandler } from 'express';
 import { findMissingLiveCredentials, isStockMarketOpen, DEFAULT_ACCOUNT_SETTINGS, type AccountSettings } from '@trading-app/shared';
 import type { DecoupledExitSkipReason, EngineState, ExitCadenceHealth, ExitIntervalBucket, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
-import { DECOUPLED_EXIT_SKIP_REASONS, EXIT_INTERVAL_BUCKETS, LIVE_SKIP_CATEGORIES, emptyDecoupledExitSkips, emptyExitIntervalHistogram, emptyLiveSkipBreakdown, isLiveBrokerOperator, resolveLiveBrokerOperator, isRvEngineEnabled } from '../signal-engine.js';
+import { DECOUPLED_EXIT_SKIP_REASONS, EXIT_INTERVAL_BUCKETS, LIVE_SKIP_CATEGORIES, emptyDecoupledExitSkips, emptyExitIntervalHistogram, emptyLiveSkipBreakdown, isLiveBrokerOperator, resolveLiveBrokerOperator, isRvEngineEnabled, sma200BarDay } from '../signal-engine.js';
 import {
   isTestAccount,
   unrecognisedDeskBooks,
@@ -1827,12 +1827,223 @@ export interface Sma200SweepCensusReport {
     fetchFailed: number;
     fired: number;
     voided: number;
+    /**
+     * TRA-4922 (AC-b) — pullback setups refused by the max-dist gate, Σ OVER
+     * ENGINES.
+     *
+     * 🔴 THIS IS NOT AC7's n. It is the per-engine row count AC7 explicitly
+     * forbids: 68 engines sweeping largely overlapping universes count ONE
+     * (symbol, barTimestamp) rejection up to 68 times, so this number crosses
+     * 30 on roughly one real market event. AC7's n is
+     * {@link Sma200RejectionFleetFold.distinctCount}, published beside it.
+     *
+     * It is published anyway because its ABSENCE was the filed defect: a zero on
+     * a key that does not exist is not a measurement. Both numbers present and
+     * named is the requirement — one alone, whichever it is, gets read as AC7's
+     * n. The `rejectedMaxDistIs` tag below is the on-the-wire label, since a
+     * doc comment is not served.
+     */
+    rejectedMaxDist: number;
+    /**
+     * TRA-4922 (AC-b) — graded engines whose census does NOT carry the
+     * `rejectedMaxDist` key at all (an older build). Non-zero ⇒ the sigma above
+     * is a lower bound over a partial fleet, and a `0` is not a reading.
+     * ABSENT ≠ ZERO, the same discipline as `unpublished` above.
+     */
+    rejectedMaxDistUnpublished: number;
+    /**
+     * TRA-4922 (AC-b) — the label, on the wire. A reader who lands in `totals`
+     * and reads `rejectedMaxDist` must not be able to mistake it for AC7's
+     * count, and a TypeScript doc comment never reaches them.
+     */
+    rejectedMaxDistIs: 'SIGMA_OVER_ENGINES_NOT_AC7_N';
   };
+  /**
+   * TRA-4922 (AC-a) — the AC7 count arm: the DISTINCT rejected cohort, folded
+   * across the whole fleet. See {@link Sma200RejectionFleetFold}.
+   */
+  rejections: Sma200RejectionFleetFold;
+  /**
+   * TRA-4922 (AC-c) — the fleet's DISTINCT swept symbol census. See
+   * {@link Sma200SweepUniverseFold}.
+   */
+  universe: Sma200SweepUniverseFold;
   /** ISO time the most-recent sweep in the fleet finished, or null. */
   newestSweepAt: string | null;
   /** Age of `newestSweepAt` in ms at read time — a stale census is not a live one. */
   newestSweepAgeMs: number | null;
 }
+
+/**
+ * TRA-4922 (AC-a) — one deduped rejected setup in the fleet union.
+ *
+ * Carries every field AC7's invalidation comparison needs (`distAtr` against
+ * `maxDistAtr` is the gate's own decision; `entryPrice`/`stopLoss`/`atr14` are
+ * the R-denominator) plus the provenance of the fold itself: how many engines
+ * saw this row, and whether they AGREED about it.
+ */
+export interface Sma200FleetRejectionRow {
+  symbol: string;
+  /** The AC7 key's second component, raw. */
+  barTimestamp: number;
+  /** …and rendered, so a reader does not have to convert to see the session. */
+  barAt: string;
+  /** UTC calendar day of `barTimestamp` — the engine's OWN dedupe identity. */
+  barDay: number;
+  distAtr: number;
+  atr14: number;
+  maxDistAtr: number;
+  entryPrice: number;
+  stopLoss: number;
+  /** Earliest `recordedAt` across the engines that hold this row, ISO. */
+  firstRecordedAt: string;
+  /**
+   * How many fleet engines hold this exact `(symbol, barTimestamp)`. 1 means a
+   * single book saw it — which is also the only case a `forceReset` on that one
+   * book can silently remove from the union (AC-e).
+   */
+  seenByEngines: number;
+  /**
+   * TRA-4922 — two engines reported this same key with DIFFERENT `distAtr`.
+   * The kept row is the earliest-recorded one. A union that silently picked a
+   * winner here would publish one book's measurement as the fleet's.
+   */
+  conflicting: boolean;
+}
+
+/**
+ * TRA-4922 (AC-a) — the fleet-folded rejected cohort: AC7's count arm.
+ *
+ * Why this exists at all. Before it, AC7's count had NO surface. `/api/state`
+ * carries the rows but is ONE engine's book (measured 2026-09-25: `considered`
+ * 100 against a fleet of 68 engines / 6800 considered), and the only fleet fold
+ * — `summarizeSma200Sweeps` — published no rejection key whatsoever, so a zero
+ * read there was an ABSENT KEY, not a measurement. The count arm was therefore
+ * unexecutable on the deployed build and the 6-month calendar arm won by
+ * default on n≈2 — the exact outcome the "read the fleet" instruction was
+ * written to prevent.
+ *
+ * ⚠️ WHOLE FLEET, BOTH MODES, for the reason already recorded on
+ * {@link summarizeSma200Sweeps}: `runSma200Scan` is driven from `doTick` with no
+ * mode predicate, so a `.filter(mode === 'demo')` here would silently drop
+ * engines that really do sweep and really do reject.
+ */
+export interface Sma200RejectionFleetFold {
+  /**
+   * **AC7's n**, on the key AC7 ratified: DISTINCT `(symbol, barTimestamp)`
+   * rejected setups unioned over every engine in the fleet.
+   */
+  distinctCount: number;
+  /**
+   * The SAME union keyed `(symbol, UTC bar DAY)` — the identity the engine
+   * itself debounces on (`sma200BarDay`, TRA-1926), because "Yahoo can hand back
+   * the same session with a drifting sub-day timestamp".
+   *
+   * 🔴 Read this next to `distinctCount`, never instead of it. Within ONE engine
+   * the day-key dedupe suppresses a drifting duplicate; ACROSS engines nothing
+   * does, and the fleet union is exactly where that bites. So
+   * `distinctByBarDayCount < distinctCount` ⇒ bar-timestamp drift is splitting
+   * one logical rejection into several rows and `distinctCount` — the ratified
+   * key — is INFLATED by the difference. The day-keyed number is the defensible
+   * one; the raw-keyed number is published because it is what AC7 literally
+   * says. Equal values ⇒ no drift in this population and the question is moot.
+   */
+  distinctByBarDayCount: number;
+  /** Engines contributing at least one row. */
+  contributingEngines: number;
+  /**
+   * Engines whose build does not carry `sma200GateRejections` at all. Non-zero ⇒
+   * every count here is a lower bound over a partial fleet. ABSENT ≠ EMPTY.
+   */
+  ledgerUnpublished: number;
+  /** Σ of per-engine ledger lengths — the pre-dedupe row count, for the ratio. */
+  rowsBeforeDedupe: number;
+  /** The deduped rows, oldest bar first. */
+  rows: Sma200FleetRejectionRow[];
+  /**
+   * `rows` was clipped by {@link FLEET_REJECTION_ROW_CAP}. `distinctCount` is
+   * NEVER clipped, so n stays correct even when the detail is abridged — but a
+   * `true` here means the AC7 E[R] comparison cannot be run off this read alone.
+   */
+  rowsTruncated: boolean;
+  /** Oldest / newest bar in the union, ISO, or null when empty. */
+  oldestBarAt: string | null;
+  newestBarAt: string | null;
+  /**
+   * TRA-4922 (AC-d + AC-e) — why `distinctCount` may be a LOWER bound, and why a
+   * re-read can be smaller than an earlier one.
+   */
+  integrity: {
+    /** The per-engine ring capacity, as published by the engines. */
+    cap: number | null;
+    /** Engines whose ring is sitting AT the cap — one arrival from evicting. */
+    enginesAtCap: number;
+    /** Σ rows the FIFO cap has dropped (AC-d). */
+    evicted: number;
+    /** Σ `forceReset` wipes of a rejection ledger (AC-e). */
+    resets: number;
+    /** Rows discarded by the most recent wipe in the fleet. */
+    lastResetDropped: number;
+    /** ISO time of the most recent wipe anywhere in the fleet, or null. */
+    newestResetAt: string | null;
+    /**
+     * Engines not publishing {@link Sma200RejectionLedgerMeta}. Non-zero ⇒
+     * `nonMonotonic` below is itself a lower bound: those books could have reset
+     * without saying so.
+     */
+    metaUnpublished: number;
+    /**
+     * `true` ⇒ at least one row has been evicted or one ledger wiped, so
+     * `distinctCount` is NOT a monotonic accrual and a smaller re-read has a
+     * named cause rather than being a quiet tape. `false` with
+     * `metaUnpublished: 0` is the only state in which n may be treated as an
+     * accruing count.
+     */
+    nonMonotonic: boolean;
+  };
+  /** The label, on the wire — see `totals.rejectedMaxDistIs`. */
+  note: string;
+}
+
+/**
+ * TRA-4922 (AC-c) — the fleet's DISTINCT swept symbol census.
+ *
+ * TRA-4921's arrival-rate table derives its fleet column from "~751 names",
+ * which is a CODE COMMENT, not a live census — and Σ `considered` is no
+ * substitute, because it is a sigma over engines (68 × 100 = 6800) while the
+ * true union may be 100. The per-engine universe really does differ:
+ * `getActiveSymbols` is cut by priority tier and what a book HOLDS is per book.
+ */
+export interface Sma200SweepUniverseFold {
+  /**
+   * DISTINCT symbols across the graded engines' most-recent sweep universes, or
+   * `null` when NO graded engine publishes its symbol list (absent key, not an
+   * empty fleet).
+   */
+  distinctSymbols: number | null;
+  /** Σ `considered` — the number that is NOT a census. Kept for the ratio. */
+  consideredSigma: number;
+  /**
+   * Graded engines whose census lacks `consideredSymbols`. Non-zero ⇒
+   * `distinctSymbols` is a lower bound over a partial fleet.
+   */
+  symbolsUnpublished: number;
+  /** Largest single-engine universe, or null when none published. */
+  maxEngineUniverse: number | null;
+  /** Smallest single-engine universe, or null when none published. */
+  minEngineUniverse: number | null;
+  /** The label, on the wire. */
+  note: string;
+}
+
+/**
+ * TRA-4922 — ceiling on PUBLISHED rejection rows. The structural maximum is
+ * `engines × SMA200_REJECTION_MAX` (≈ 68 × 400), so this is generous headroom
+ * rather than an expected clip; it exists so a future fleet/cap growth degrades
+ * VISIBLY (`rowsTruncated: true`) instead of quietly serving a 30MB body.
+ * `distinctCount` is computed before the clip and is never affected.
+ */
+export const FLEET_REJECTION_ROW_CAP = 5000;
 
 /**
  * Fold the fleet's sweep censuses. Pure (clock injected) so the five verdict
@@ -1852,6 +2063,10 @@ export function summarizeSma200Sweeps(
   const totals = {
     considered: 0, evaluated: 0, starvedBreakerOpen: 0,
     starvedShortHistory: 0, fetchFailed: 0, fired: 0, voided: 0,
+    // TRA-4922 (AC-b) — the per-engine sigma, explicitly labelled below.
+    rejectedMaxDist: 0,
+    rejectedMaxDistUnpublished: 0,
+    rejectedMaxDistIs: 'SIGMA_OVER_ENGINES_NOT_AC7_N' as const,
   };
   let graded = 0;
   let neverSwept = 0;
@@ -1859,8 +2074,101 @@ export function summarizeSma200Sweeps(
   let liveEngines = 0;
   let newestFinishedAt: number | null = null;
 
+  // TRA-4922 (AC-a) — the rejection union, accumulated over the SAME pass. Keyed
+  // on the AC7 key; the day-keyed set rides along so the two can be compared.
+  const byAc7Key = new Map<string, Sma200FleetRejectionRow>();
+  const byBarDayKey = new Set<string>();
+  let rowsBeforeDedupe = 0;
+  let contributingEngines = 0;
+  let ledgerUnpublished = 0;
+  // TRA-4922 (AC-c) — the universe union.
+  const universeSymbols = new Set<string>();
+  let symbolsUnpublished = 0;
+  let maxEngineUniverse: number | null = null;
+  let minEngineUniverse: number | null = null;
+  // TRA-4922 (AC-d + AC-e) — the integrity witness fold.
+  let cap: number | null = null;
+  let enginesAtCap = 0;
+  let evicted = 0;
+  let resets = 0;
+  let lastResetDropped = 0;
+  let newestResetAt: number | null = null;
+  let metaUnpublished = 0;
+
   for (const { state, mode } of engines) {
     if (mode === 'live') liveEngines++;
+
+    // ── TRA-4922 — the rejection fold runs over EVERY engine, graded or not ──
+    // Deliberately OUTSIDE the census gates below. The ledger and the census are
+    // different objects with different lifetimes: `sma200GateRejections` is
+    // snapshot-PERSISTED, `sma200ScanStats` deliberately is not, so a
+    // just-rebooted engine carries a full rejection ledger and a `null` census.
+    // Folding rejections only for `graded` engines would therefore drop real
+    // AC7 rows for exactly as long as a redeploy takes to finish its first
+    // sweep — and a redeploy is the one moment a reader checks.
+    if (!('sma200GateRejections' in state)) {
+      ledgerUnpublished++;
+    } else {
+      const ledger = state.sma200GateRejections ?? [];
+      rowsBeforeDedupe += ledger.length;
+      if (ledger.length > 0) contributingEngines++;
+      for (const r of ledger) {
+        if (typeof r.barTimestamp !== 'number' || !Number.isFinite(r.barTimestamp)) continue;
+        const key = `${r.symbol}\u0000${r.barTimestamp}`;
+        byBarDayKey.add(`${r.symbol}\u0000${sma200BarDay(r.barTimestamp)}`);
+        const seen = byAc7Key.get(key);
+        if (seen === undefined) {
+          byAc7Key.set(key, {
+            symbol: r.symbol,
+            barTimestamp: r.barTimestamp,
+            barAt: new Date(r.barTimestamp).toISOString(),
+            barDay: sma200BarDay(r.barTimestamp),
+            distAtr: r.distAtr,
+            atr14: r.atr14,
+            maxDistAtr: r.maxDistAtr,
+            entryPrice: r.entryPrice,
+            stopLoss: r.stopLoss,
+            firstRecordedAt: new Date(r.recordedAt).toISOString(),
+            seenByEngines: 1,
+            conflicting: false,
+          });
+          continue;
+        }
+        seen.seenByEngines++;
+        // Two books measuring the same setup differently is a real possibility
+        // (each pulls its own daily bars), and silently keeping one would
+        // publish one book's number as the fleet's. Flag it instead; the kept
+        // row stays the earliest-RECORDED one so the choice is deterministic.
+        if (seen.distAtr !== r.distAtr || seen.atr14 !== r.atr14) seen.conflicting = true;
+        if (r.recordedAt < Date.parse(seen.firstRecordedAt)) {
+          seen.firstRecordedAt = new Date(r.recordedAt).toISOString();
+        }
+      }
+    }
+    // AC-d/AC-e — the integrity witness, also over every engine for the same
+    // reason: a reset survives a reboot, the census does not.
+    if (!('sma200RejectionLedgerMeta' in state)) {
+      metaUnpublished++;
+    } else {
+      const meta = state.sma200RejectionLedgerMeta;
+      if (meta === undefined || meta === null) {
+        metaUnpublished++;
+      } else {
+        evicted += meta.evicted;
+        resets += meta.resets;
+        if (meta.lastResetAt !== null && (newestResetAt === null || meta.lastResetAt > newestResetAt)) {
+          newestResetAt = meta.lastResetAt;
+          lastResetDropped = meta.lastResetDropped;
+        }
+      }
+    }
+    if (typeof state.sma200RejectionCap === 'number') {
+      // A mixed-build fleet can serve two caps. Publish the SMALLEST, because it
+      // is the one that bounds how much evidence the weakest book can hold.
+      cap = cap === null ? state.sma200RejectionCap : Math.min(cap, state.sma200RejectionCap);
+      if ((state.sma200GateRejections?.length ?? 0) >= state.sma200RejectionCap) enginesAtCap++;
+    }
+
     // A build without the census carries NEITHER key. A build WITH it carries
     // both, holding `null` until the first sweep lands. Keying on the key's
     // presence (not its value) is what keeps "old build" out of "quiet fleet".
@@ -1883,6 +2191,24 @@ export function summarizeSma200Sweeps(
     totals.fetchFailed += stats.fetchFailed;
     totals.fired += stats.fired;
     totals.voided += stats.voided;
+    // TRA-4922 (AC-b) — ABSENT ≠ ZERO. `rejectedMaxDist` is optional on the
+    // census (older build), and folding `?? 0` into the sigma would publish a
+    // partial-fleet number as a whole-fleet one. Count the absence instead.
+    if (typeof stats.rejectedMaxDist === 'number') {
+      totals.rejectedMaxDist += stats.rejectedMaxDist;
+    } else {
+      totals.rejectedMaxDistUnpublished++;
+    }
+    // TRA-4922 (AC-c) — the DISTINCT universe. Same absent-key discipline: a
+    // missing list is an unmeasured engine, never an engine that swept nothing.
+    if (Array.isArray(stats.consideredSymbols)) {
+      for (const sym of stats.consideredSymbols) universeSymbols.add(sym);
+      const n = stats.consideredSymbols.length;
+      maxEngineUniverse = maxEngineUniverse === null ? n : Math.max(maxEngineUniverse, n);
+      minEngineUniverse = minEngineUniverse === null ? n : Math.min(minEngineUniverse, n);
+    } else {
+      symbolsUnpublished++;
+    }
     if (newestFinishedAt === null || stats.finishedAt > newestFinishedAt) {
       newestFinishedAt = stats.finishedAt;
     }
@@ -1895,6 +2221,12 @@ export function summarizeSma200Sweeps(
   else if (byVerdict.SWEPT > 0) verdict = 'SWEPT';
   else verdict = 'BLIND';
 
+  // TRA-4922 (AC-a) — n is counted BEFORE the row clip, so the AC7 count is
+  // never truncated even when the detail is.
+  const allRows = Array.from(byAc7Key.values()).sort((a, b) => a.barTimestamp - b.barTimestamp);
+  const distinctCount = allRows.length;
+  const rows = allRows.slice(0, FLEET_REJECTION_ROW_CAP);
+
   return {
     engines: engines.length,
     liveEngines,
@@ -1904,6 +2236,52 @@ export function summarizeSma200Sweeps(
     byVerdict,
     verdict,
     totals,
+    rejections: {
+      distinctCount,
+      distinctByBarDayCount: byBarDayKey.size,
+      contributingEngines,
+      ledgerUnpublished,
+      rowsBeforeDedupe,
+      rows,
+      rowsTruncated: distinctCount > rows.length,
+      oldestBarAt: allRows.length === 0 ? null : allRows[0]!.barAt,
+      newestBarAt: allRows.length === 0 ? null : allRows[allRows.length - 1]!.barAt,
+      integrity: {
+        cap,
+        enginesAtCap,
+        evicted,
+        resets,
+        lastResetDropped,
+        newestResetAt: newestResetAt === null ? null : new Date(newestResetAt).toISOString(),
+        metaUnpublished,
+        nonMonotonic: evicted > 0 || resets > 0,
+      },
+      note:
+        'distinctCount IS the TRA-3688 AC7 n: DISTINCT (symbol, barTimestamp) max-dist '
+        + 'rejections unioned across the WHOLE fleet, both modes. totals.rejectedMaxDist is '
+        + 'the per-engine SIGMA and is NOT this number. Read distinctByBarDayCount beside '
+        + 'distinctCount: it keys on the engine own UTC-bar-day identity (TRA-1926), so a '
+        + 'lower value means bar-timestamp drift across engines has inflated the ratified '
+        + 'key. ledgerUnpublished > 0 or integrity.metaUnpublished > 0 makes every count '
+        + 'here a LOWER BOUND, and integrity.nonMonotonic true means a later re-read may be '
+        + 'smaller than an earlier one with a named cause (eviction or reset), not a quiet tape.',
+    },
+    universe: {
+      distinctSymbols: universeSymbols.size === 0 && symbolsUnpublished === graded
+        ? null
+        : universeSymbols.size,
+      consideredSigma: totals.considered,
+      symbolsUnpublished,
+      maxEngineUniverse,
+      minEngineUniverse,
+      note:
+        'distinctSymbols is the DISTINCT symbol union of the graded engines most-recent '
+        + 'sweep universes. consideredSigma is a SIGMA OVER ENGINES and is NOT a census: '
+        + 'per-engine universes overlap heavily, so it overstates the fleet population by '
+        + 'roughly the engine count. Any arrival-rate estimate must use distinctSymbols. '
+        + 'symbolsUnpublished > 0 makes distinctSymbols a lower bound; null means NO graded '
+        + 'engine published its symbol list (an absent key, not an empty fleet).',
+    },
     newestSweepAt: newestFinishedAt === null ? null : new Date(newestFinishedAt).toISOString(),
     newestSweepAgeMs: newestFinishedAt === null ? null : now - newestFinishedAt,
   };

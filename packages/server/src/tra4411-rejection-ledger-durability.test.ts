@@ -27,13 +27,16 @@
  * slow-accruing denominator) once per redeploy. QuantTrader could not falsify it
  * live for exactly that reason (TRA-4838, 2026-09-24) and asked for this read.
  *
- * Two arms, one per literal. Neither arm can be satisfied by the in-process pair.
+ * Three arms, covering both literals. None can be satisfied by the in-process
+ * pair. TRA-4922 adds four more for the ledger's integrity witness, which crosses
+ * the SAME two literals and would be dropped by the same mistake.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import type { Sma200GateRejectionRecord } from '@trading-app/shared';
+import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
+import type { Sma200GateRejectionRecord, Sma200RejectionLedgerMeta } from '@trading-app/shared';
 import type { StocksTradeSnapshot } from './trade-store.js';
 
 // trade-store + user-context capture DATA_DIR at module-evaluation time.
@@ -85,7 +88,13 @@ function rejection(over: Partial<Sma200GateRejectionRecord> = {}): Sma200GateRej
  * own export is already covered in `sma200-capital-gate.test.ts`, so stubbing it
  * here is the point — it isolates "does what the engine exported reach disk".
  */
-function ctxFor(username: string, rejections: Sma200GateRejectionRecord[]) {
+function ctxFor(
+  username: string,
+  rejections: Sma200GateRejectionRecord[],
+  // TRA-4922 (AC-e) — the integrity witness travels through the SAME two
+  // literals as the ledger, so it is graded by the same control.
+  meta?: Sma200RejectionLedgerMeta,
+) {
   const snap = {
     account: {
       cash: 100_000, equity: 100_000, initialEquity: 100_000,
@@ -96,6 +105,7 @@ function ctxFor(username: string, rejections: Sma200GateRejectionRecord[]) {
     recentSignals: [],
     sma200SignalVoids: [],
     sma200GateRejections: rejections,
+    sma200RejectionLedgerMeta: meta,
     dailySignals: [],
     positionSignalType: [],
     options: undefined,
@@ -186,5 +196,67 @@ describe('TRA-4411 AC6 — the rejection ledger crosses the DISK seam', () => {
 
     const ctx = await ensureUserContext(USER);
     expect(ctx.engine.getState().sma200GateRejections).toEqual([]);
+  });
+});
+
+/**
+ * TRA-4922 (AC-e) — the ledger's INTEGRITY WITNESS crosses the same disk seam.
+ *
+ * `forceReset` wipes the ledger, so the fleet-folded AC7 n is not monotonic and a
+ * re-read can be LOWER than an earlier one. The witness is what gives that shrink
+ * a cause. It must survive a restart for a reason the ledger itself does not
+ * share: a reset recorded at 10:00 followed by a redeploy at 11:00 would read
+ * back `resets: 0` at 12:00, so the RESTART would launder the very decrement the
+ * witness exists to report — and the post-restart fold would call a genuinely
+ * shrunken n monotonic. Graded here, against the WRITTEN object and the real boot
+ * restore, because this is the seam that silently dropped the ledger itself.
+ */
+describe('TRA-4922 AC-e — the rejection ledger INTEGRITY WITNESS crosses the DISK seam', () => {
+  const META: Sma200RejectionLedgerMeta = {
+    evicted: 7, resets: 2, lastResetAt: Date.UTC(2026, 9, 1, 14, 30, 0), lastResetDropped: 19,
+  };
+
+  it('arm 4 — persistStocksNow writes `sma200RejectionLedgerMeta` to disk', async () => {
+    await persistStocksNow(ctxFor(USER, [rejection()], META));
+    expect(written.snap?.sma200RejectionLedgerMeta).toEqual(META);
+    const onDisk = await loadStocksTradeSnapshot(USER);
+    expect(onDisk?.sma200RejectionLedgerMeta).toEqual(META);
+  });
+
+  it('arm 5 — a booted context restores the witness, so a restart cannot launder a reset', async () => {
+    await persistStocksNow(ctxFor(USER, [rejection()], META));
+    const ctx = await ensureUserContext(USER);
+    expect(ctx.engine.getState().sma200RejectionLedgerMeta).toEqual(META);
+    // And the cap is published beside it, so a reader can see a ring at the cap
+    // without hard-coding the constant on the read side.
+    expect(ctx.engine.getState().sma200RejectionCap).toBeGreaterThan(0);
+  });
+
+  it('arm 6 — a pre-TRA-4922 snapshot restores a ZEROED witness, never undefined', async () => {
+    // ABSENT means "no witness", and the restore must coerce it to "nothing
+    // OBSERVED" rather than propagate `undefined` into the field the fleet fold
+    // reads. `metaUnpublished` on the fold is what keeps the distinction: a
+    // zeroed witness here is honest only because the fold counts the absence.
+    await persistStocksNow(ctxFor(USER, [rejection()], undefined));
+    const ctx = await ensureUserContext(USER);
+    expect(ctx.engine.getState().sma200RejectionLedgerMeta).toEqual({
+      evicted: 0, resets: 0, lastResetAt: null, lastResetDropped: 0,
+    });
+  });
+
+  it('arm 7 — a forceReset STAMPS the witness, and the stamp is the pre-wipe length', async () => {
+    await persistStocksNow(ctxFor(USER, [rejection()], undefined));
+    const ctx = await ensureUserContext(USER);
+    expect(ctx.engine.getState().sma200GateRejections).toHaveLength(1);
+
+    ctx.engine.forceReset({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' as const });
+
+    const meta = ctx.engine.getState().sma200RejectionLedgerMeta!;
+    expect(ctx.engine.getState().sma200GateRejections).toEqual([]);
+    expect(meta.resets).toBe(1);
+    // The pre-wipe length, not the post-wipe 0 — a reader needs the SIZE of the
+    // loss, which is exactly what is unrecoverable once the ring is cleared.
+    expect(meta.lastResetDropped).toBe(1);
+    expect(meta.lastResetAt).not.toBeNull();
   });
 });
