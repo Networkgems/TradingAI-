@@ -339,6 +339,8 @@ import {
   setBoundExerciseDataDir,
   summarizeBoundExercise,
 } from './tra3926-bound-exercise-store.js';
+// TRA-5061 — the durable half of the side-by-side chandelier ATR shadow.
+import { setChandelierAtrShadowDataDir } from './tra5061-chandelier-atr-shadow-store.js';
 // TRA-4476 — the durable half of the unknown-outcome state machine: a pre-submit
 // intent journal that survives a restart, and the health readout for the halt.
 import {
@@ -5118,6 +5120,17 @@ setJudgedOversoldDataDir(DATA_DIR);
 // an unset dir makes every capture a silent no-op, and the population this
 // records is the one that only ever appears on real money.
 setBoundExerciseDataDir(DATA_DIR);
+
+// TRA-5061 — and the side-by-side chandelier ATR shadow, for the same reason in
+// a different shape: the question it answers ("how often would the DAILY trail
+// have had a level at all?") is a RATE OVER SESSIONS, and a since-boot counter
+// cannot accumulate one. This process routinely boots mid-week after the prior
+// close, which is exactly why the live surface's own `sessionCoverage` reads
+// `boot_after_close` / `vacuous` (TRA-4343). Armed here, not lazily: an unset
+// dir silently degrades the instrument to the boot-scoped counter it replaces,
+// and the arming stamp written by this call is what lets a reader date a zero
+// instead of mistaking a 90-second-old store for a ten-session never.
+setChandelierAtrShadowDataDir(DATA_DIR);
 
 // TRA-3939 — ARM THE TWO CAPTURES. Both stores hang off the same resolved
 // DATA_DIR and neither is compacted (see the module docblock: they hold evidence

@@ -46,6 +46,15 @@ import {
   type OptionChandelierAtrSource,
   type ChandelierAtrInertReason,
 } from './option-chandelier-trail.js';
+// TRA-5061 — the side-by-side ATR shadow's census. Noted at the SAME five sites
+// as the TRA-4991 census above, deliberately rather than forwarded from inside
+// it (that would close an ESM cycle); the suite asserts the two `rowsSeen`
+// agree, which is what catches a future sixth site.
+import {
+  noteChandelierAtrShadow,
+  noteChandelierAtrShadowSkip,
+  type ChandelierAtrShadowPair,
+} from './tra5061-chandelier-atr-shadow.js';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
 import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
@@ -646,6 +655,23 @@ export interface OptionExitRiskInput {
    * 5m ATR by design — see {@link ChandelierAtrInertReason}.
    */
   underlyingAtrInertBySymbol?: Map<string, ChandelierAtrInertReason>;
+  /**
+   * TRA-5061 — the SIDE-BY-SIDE ATR shadow: for each underlying that produced a
+   * width, BOTH the 5m and the daily chandelier trail, resolved through one code
+   * path, with `decidedBy` naming the arm that actually set the level.
+   *
+   * ⛔ OBSERVE-ONLY. The ratchet reads `underlyingAtrBySymbol` exactly as
+   * before; this map is recorded by the census on the way past and is never
+   * consulted for a level, a fire or an order. Present ⇔ the producer attached
+   * it — a hand-built input (tests) omits it, which the census counts as
+   * `pairAbsent` rather than folding into its observation denominator.
+   *
+   * It exists because the arm decision for `CHANDELIER_ATR_TIMEFRAME` needs the
+   * counterfactual `no_daily_atr` rate and the 3.0/3.5 split on REAL rows before
+   * anything arms, and the flag itself earns no rows while the sleeve is dark.
+   * It answers MECHANISM REACHABILITY only, never P&L.
+   */
+  underlyingAtrShadowBySymbol?: Map<string, ChandelierAtrShadowPair>;
   /**
    * TRA-1294 — take-profit-early capture fraction (0.50–0.70). Present ⇔ the
    * caller armed the STANDALONE, DEMO-ONLY `TAKE_PROFIT_EARLY_ENABLED` flag
@@ -11404,6 +11430,7 @@ export class PaperOptionsAccount {
         // `bull_put` combos, and a reader could not tell that from "the trail ran
         // and never went high beta". ⛔ Observe-only.
         noteChandelierRowSkipped(opt.mode === 'live' ? 'live' : 'demo', 'multi_leg');
+        noteChandelierAtrShadowSkip(opt.mode === 'live' ? 'live' : 'demo', 'multi_leg');
         if (
           multiLegExitParams
           && mode === 'demo'
@@ -11431,6 +11458,7 @@ export class PaperOptionsAccount {
         // same reason as the combo above: a book of covered writes must not read
         // as a book whose trail ran.
         noteChandelierRowSkipped(opt.mode === 'live' ? 'live' : 'demo', 'covered_write');
+        noteChandelierAtrShadowSkip(opt.mode === 'live' ? 'live' : 'demo', 'covered_write');
         continue;
       }
       const isImported = opt.importedFromTradier === true;
@@ -11798,6 +11826,7 @@ export class PaperOptionsAccount {
       const chandelierCensusMode = opt.mode === 'live' ? 'live' : 'demo';
       if (chandelierRetired) {
         noteChandelierRowSkipped(chandelierCensusMode, 'retired');
+        noteChandelierAtrShadowSkip(chandelierCensusMode, 'retired');
         // A row that ticked on a pre-TRA-3941 build carries a PERSISTED stop, a
         // trail note and possibly a daily-close hold latch. Dropped here rather
         // than left inert: `summarizeLiveStopActionability` reads the hold latch
@@ -11900,6 +11929,14 @@ export class PaperOptionsAccount {
           // recomputes the SAME width from the same ATR and atrPct, so counting
           // it again would inflate the denominator without adding a resolution).
           noteChandelierRatchet(chandelierCensusMode, uatrPct, uatrMult);
+          // TRA-5061 — the SIDE-BY-SIDE pair for this same ratchet. Counted
+          // once per row per exit pass, in lockstep with the census above, so
+          // `observations` is the ratchet count the arm decision's
+          // `no_daily_atr` stop is written against. ⛔ Observe-only.
+          noteChandelierAtrShadow(
+            chandelierCensusMode,
+            exitRisk.underlyingAtrShadowBySymbol?.get(opt.symbol),
+          );
 
           // TRA-3217 — breach bookkeeping. While suppressed, the flag mirrors
           // the CURRENT breach state (a breach that heals mid-hold clears it,
@@ -11962,12 +11999,17 @@ export class PaperOptionsAccount {
             chandelierCensusMode,
             dailyAtrInert ? 'no_daily_atr' : 'no_spot_or_atr',
           );
+          noteChandelierAtrShadowSkip(
+            chandelierCensusMode,
+            dailyAtrInert ? 'no_daily_atr' : 'no_spot_or_atr',
+          );
         }
       } else {
         // Never reaches the ratchet at all: a combo (held to expiry/manual close,
         // the single-leg trail does not evaluate it), or no `exitRisk` attached,
         // i.e. the exit-risk master is off and the zero is STRUCTURAL.
         noteChandelierRowSkipped(chandelierCensusMode, opt.legs ? 'multi_leg' : 'no_exit_risk');
+        noteChandelierAtrShadowSkip(chandelierCensusMode, opt.legs ? 'multi_leg' : 'no_exit_risk');
       }
 
       // TRA-2820 — the unmanaged sentinel is a DECISION, and until now it existed

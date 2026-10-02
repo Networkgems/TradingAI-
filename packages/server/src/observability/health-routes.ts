@@ -367,6 +367,9 @@ import {
   resolveChandelierTrailParams,
   summarizeChandelierRatchets,
 } from '../option-chandelier-trail.js';
+// TRA-5061 — the side-by-side ATR shadow census (evidence class
+// `reachability_only`; never the forward test). ⛔ Observe-only.
+import { summarizeChandelierAtrShadow } from '../tra5061-chandelier-atr-shadow.js';
 import { summarizeOptionsBreakerLedger } from '../options-breaker-ledger.js'; // TRA-3218
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
@@ -9196,6 +9199,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // text, so quoting it verbatim in a comment counts as another copy.
     const dir = process.env.DATA_DIR;
     const demoEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
+    // TRA-5061 — hoisted so the ATR-series selection is resolved EXACTLY ONCE
+    // for this response. The shadow census publishes `decidedBy` and the spread
+    // below publishes `atrTimeframe`; resolving the flag twice is precisely how
+    // two fields on one route come to disagree, and here they would disagree
+    // about which trail is load-bearing.
+    const chandelierTrailParams = resolveChandelierTrailParams(process.env);
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
@@ -9289,13 +9298,32 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // evaluated — and not a measurement about the book. Published here beside
       // the counts rather than left to be joined from `profitFloorTrail` below.
       chandelier: {
-        ...resolveChandelierTrailParams(process.env),
+        ...chandelierTrailParams,
         requiresMaster: EXIT_RISK_RULES_FLAG,
         exitRiskMaster: {
           live: isExitRiskRulesEnabled(process.env),
           demo: isExitRiskRulesEnabled(demoEnv),
         },
         ratchets: summarizeChandelierRatchets(),
+        // TRA-5061 — the SIDE-BY-SIDE counterfactual: both the 5m and the daily
+        // trail resolved on every ratchet, only the selected one deciding.
+        //
+        // ⛔ This is the block the ARM decision reads, and `ratchets` above is
+        // not a substitute for it: while the flag is `shadow_5m` the producer
+        // refuses nothing, so `ratchets.skipped.no_daily_atr` is a STRUCTURAL 0
+        // and carries no information about whether the daily store would be warm
+        // enough to give the repair a level. `atrShadow.byBook.*.readings
+        // .dailyColdRate` is that same quantity measured as a counterfactual on
+        // the real rows, with nothing armed.
+        //
+        // ⛔ EVIDENCE CLASS `reachability_only`. It cannot produce cost-aware
+        // `crossedR` and must never be cited as the forward test — see
+        // `notEvidenceFor` on the payload, which is QuantTrader's written
+        // ratification (TRA-5061 AC5), not a caveat added here.
+        //
+        // The timeframe is resolved ONCE above and handed in, so `decidedBy`
+        // here and `atrTimeframe` on the spread cannot disagree.
+        atrShadow: summarizeChandelierAtrShadow(chandelierTrailParams.atrTimeframe.timeframe),
       },
       note: 'Hard exits (premium stop, trail, give-back cap, session stop, take-profit) are unaffected by all of the above and keep firing through the swing hold. TRA-4991: `chandelier` carries the ATR trail\'s resolved width, its ATR source timeframe and the since-boot high-beta ratchet census; per-close SPOT-space inputs are on the journal row (`/api/health/option-journal?rows=all` -> `chandelier`).',
     });

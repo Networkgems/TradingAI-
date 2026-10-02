@@ -97,6 +97,11 @@ import {
   type OptionChandelierAtrSource,
   type ChandelierAtrInertReason,
 } from './option-chandelier-trail.js';
+// TRA-5061 — the side-by-side ATR shadow. OBSERVE-ONLY; see its module docblock.
+import {
+  buildChandelierAtrShadowArm,
+  type ChandelierAtrShadowPair,
+} from './tra5061-chandelier-atr-shadow.js';
 import { trySma200ScanSlot, releaseSma200ScanSlot, fetchSma200CandlesShared } from './sma200-scan-admission.js';
 import { resolveSma200PullbackMaxDistAtr, resolveSma200PullbackTimeCapBars, sma200PullbackExitModel, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved, signalRingEvictionIndex, isSma200SignalType, type Sma200SweepVerdict } from './sma200-validity.js';
 import { getLatestReviewBlock } from './research-store.js';
@@ -3848,6 +3853,10 @@ export class SignalEngine {
     // so the exit pass's census can attribute them instead of folding them into
     // `no_spot_or_atr` (which also means "no spot was served").
     const underlyingAtrInertBySymbol = new Map<string, ChandelierAtrInertReason>();
+    // TRA-5061 — the side-by-side counterfactual, per underlying. OBSERVE-ONLY:
+    // nothing downstream reads this to set a level. See the module docblock for
+    // why it answers mechanism reachability and NOT P&L.
+    const underlyingAtrShadowBySymbol = new Map<string, ChandelierAtrShadowPair>();
     // TRA-4992 (AC1) — WHICH series the trail's ATR is measured on. `process.env`
     // on both books: this is a boot config applied by redeploy (TRA-3724), like
     // the profit-floor VALUES and unlike the demo-overlay ARMS. Resolved ONCE per
@@ -3870,9 +3879,22 @@ export class SignalEngine {
       // tick, so a network pull here would put a provider round-trip on the exit
       // path — and a cold symbol is AC3's inert row, which is the behaviour we
       // want, not an error to recover from. No new feed (AC1).
-      const series = chandelierAtrTf.timeframe === 'daily'
-        ? getSharedDailyBars(opt.symbol.toUpperCase()) ?? getSharedDailyBars(opt.symbol)
-        : this.shadowCandleCache.get(opt.symbol);
+      //
+      // TRA-5061 — BOTH series are resolved here, not just the selected one, so
+      // the side-by-side shadow can publish the counterfactual width.
+      //
+      // COST, stated honestly because this runs on every exit tick: one extra
+      // in-memory store lookup, plus (in the pair build below) `atr`, `atrPct`
+      // and `measureCandleTimeframeMs` on BOTH series rather than one — so two
+      // of each where the shipped path did one. All of it is arithmetic over
+      // already-cached bars; neither store read can fetch, so there is no new
+      // feed and no provider round-trip on the exit path (the constraint
+      // TRA-4992 set when it chose a synchronous daily read over `otmDailyAtr`).
+      // The denominator is unique OPEN single-leg underlyings, which is small.
+      const dailySeries = getSharedDailyBars(opt.symbol.toUpperCase())
+        ?? getSharedDailyBars(opt.symbol);
+      const shadow5mSeries = this.shadowCandleCache.get(opt.symbol);
+      const series = chandelierAtrTf.timeframe === 'daily' ? dailySeries : shadow5mSeries;
       // ⛔ AC3 — FAIL CLOSED, and never onto the 5m series. `noteInert` is called
       // only on the `daily` arm: on `shadow_5m` a cold cache is the long-standing
       // `no_spot_or_atr` behaviour and must keep reading as that, so the new cell
@@ -3902,6 +3924,25 @@ export class SignalEngine {
         // a daily series' measured spacing is a range (weekends) while this is
         // exact. Together they catch "flag flipped, input did not".
         series: chandelierAtrTf.timeframe,
+      });
+      // TRA-5061 — the SIDE-BY-SIDE pair: both trails resolved, only
+      // `decidedBy` load-bearing. Attached ONLY on this branch, i.e. only where
+      // the SELECTED arm produced a width, because that is exactly the set of
+      // rows that will reach the ratchet — and `observations` has to equal the
+      // ratchet count for `dailyColdRate` to be the per-ratchet rate the arm
+      // decision's stop is written against.
+      //
+      // ⚠ The selected arm is recomputed by `buildChandelierAtrShadowArm`
+      // rather than assembled from `a`/`ap` above. That is deliberate: it puts
+      // both arms through ONE code path, so the published columns are
+      // comparable by construction. It is also asserted — the suite checks the
+      // selected arm's `atrValue` is the value wired into
+      // `underlyingAtrBySymbol`, which is what makes the unselected column
+      // trustworthy.
+      underlyingAtrShadowBySymbol.set(opt.symbol, {
+        shadow5m: buildChandelierAtrShadowArm(shadow5mSeries, 'shadow_5m', measureCandleTimeframeMs),
+        daily: buildChandelierAtrShadowArm(dailySeries, 'daily', measureCandleTimeframeMs),
+        decidedBy: chandelierAtrTf.timeframe,
       });
     }
     // TRA-1294 — take-profit-early is premium-space only (no underlying ATR
@@ -3968,6 +4009,7 @@ export class SignalEngine {
       underlyingAtrPctBySymbol,
       underlyingAtrSourceBySymbol,
       underlyingAtrInertBySymbol,
+      underlyingAtrShadowBySymbol,
       takeProfitEarlyCaptureFrac,
       openingRangeGuardMin,
       ...(profitFloorLadder !== undefined ? { profitFloorLadder } : {}),
