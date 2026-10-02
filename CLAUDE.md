@@ -360,6 +360,25 @@ non-zero so it cannot read as green, separate so eighteen backlog rows cannot bu
 TRA-3536 is the live fixture (its ordered commit is the SHA already live, so obeying it is a strict
 no-op).
 
+⛔ **ABSENT IS NOT `UNGRADED`, AND THE POPULATION IS TWO ARMS** (TRA-4984, verified TRA-4994). Until
+2026-10-02 the carriers came from `lastRun.linkedIssueId` on the routines route, so **only an issue
+born from a routine fire could ever be graded**: a hand-filed train carrying a syntactically perfect
+block was outside the frame *by construction* and printed **nowhere** — not in GRADED, not in
+UN-GRADED. That fails in the expensive direction, because `UNGRADED` reads as *migration backlog*
+(the benign bucket) while the real condition is an unwatched order on the money host — and a human
+hand-files a deploy precisely when it is too consequential to automate. The arms are now
+**(1) routine-born** and **(2) hand-filed — any issue on the board, via the paged issue list**, merged
+and deduped by issue id; a row reachable both ways is graded once and **keeps its routine label**, and
+the overlap is printed, because a zero overlap means the two arms are reading different boards. Arm 2
+**fails closed three ways** — an unenumerable list route, a zero-row enumeration, and a `description`
+the list route truncated (~91% of rows are cut at ~1200 chars, and the classifier on a cut body
+returns `NOT_TRAIN` *silently*) all read **BLIND**, never CLEAN: *"0 carriers found" is not "the board
+is clean"*. Which classes are in scope and **what is still outside** them — arm 1's one-carrier-per-
+routine, arm 2's `updatedAt` recency, the `--issue-cap` ceiling — is printed under `NAMED LIMIT` on
+every run, so absence cannot be read as a graded pass. `--issue=<IDENT>` grades one named carrier and
+**must agree with the sweep** on the same order; it disagreeing is the tell that the population, not
+the predicate, is broken.
+
 `SATISFIED` means the commit is live **now**. Whether it was live **by the deadline** is a separate
 column, and it is the one this ticket is actually about — on 08-13 both orders were satisfied
 *hours late by an unrelated path*, which an ancestry-only pass calls a healthy train. That column is
