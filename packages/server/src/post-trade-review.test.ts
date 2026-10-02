@@ -13,6 +13,8 @@ import {
   summarizePostTradeReviews,
   toSetupOutcomeRecord,
   STOP_OVERRUN_VIOLATION_FRAC,
+  OPERATIONAL_EXIT_REASONS,
+  STRATEGY_EXIT_REASONS,
   type PostTradeReviewContext,
 } from './post-trade-review.js';
 import type { OptionTradeJournalRecord } from './option-trade-journal.js';
@@ -42,7 +44,11 @@ function makeRow(over: Partial<OptionTradeJournalRecord> = {}): OptionTradeJourn
     closeTs: T_CLOSE,
     realizedPnlUsd: -20,
     realizedR: -0.4,
-    exitReason: 'stop',
+    // TRA-5011 — `sl`, not `stop`: `stop` is not a value any close path emits
+    // (the TRA-2940 vocabulary says `sl`), and the exit-reason partition reads
+    // an unrecognised reason as `exit_class_unknown` by design. The fixture was
+    // wrong; the assertions around it were not.
+    exitReason: 'sl',
     contracts: 1,
     optionSymbol: 'PGY261016C00030000',
     entryBidAtOpen: 1.0,
@@ -312,7 +318,14 @@ describe('rule violations', () => {
 
 describe('toSetupOutcomeRecord', () => {
   it('a closed, fully-measured trade emits a SAMPLED-cost record', () => {
-    const row = makeRow({ entrySlippageUsd: 6, exitSlippageUsd: 9, feesUsd: 1.3 });
+    // TRA-5011 — both legs now need a NAMED basis. Without one the pair below
+    // is numerically indistinguishable from the demo book's identically-$0.00
+    // modelled entry leg; see the negative controls directly after this test.
+    const row = makeRow({
+      entrySlippageUsd: 6, entrySlippageBasis: 'broker_fill',
+      exitSlippageUsd: 9, exitSlippageBasis: 'quote_cross',
+      feesUsd: 1.3,
+    });
     const review = buildPostTradeReview(row, ctxWith());
     const { record, excludedReason } = toSetupOutcomeRecord(review);
     expect(excludedReason).toBeNull();
@@ -349,8 +362,97 @@ describe('toSetupOutcomeRecord', () => {
     );
     expect(toSetupOutcomeRecord(open).excludedReason).toBe('open_row');
 
-    const unkeyed = buildPostTradeReview(makeRow(), { auditEvents: [], nowMs: T_CLOSE });
+    // TRA-5011 — with no audit and no card the row now keys off its OWN
+    // `structure`, which is the point of the third arm: durable, present on
+    // 1,998/1,998 closed rows on live bqb1, and immune to ring eviction.
+    const noJoins = buildPostTradeReview(makeRow(), { auditEvents: [], nowMs: T_CLOSE });
+    expect(noJoins.setupKey).toBe('single_leg_rv');
+    expect(noJoins.setupKeySource).toBe('structure');
+    expect(toSetupOutcomeRecord(noJoins).excludedReason).toBeNull();
+
+    // THE NEGATIVE CONTROL the ticket pins: force `structure` to empty and the
+    // row must go back to `setup_unknown`, NOT into a default bucket.
+    const unkeyed = buildPostTradeReview(
+      makeRow({ structure: '' }), { auditEvents: [], nowMs: T_CLOSE },
+    );
+    expect(unkeyed.setupKeySource).toBeNull();
     expect(toSetupOutcomeRecord(unkeyed).excludedReason).toBe('setup_unknown');
+  });
+
+  // ── TRA-5011 ────────────────────────────────────────────────────────────
+
+  it('setup key precedence: audit > card > structure, each labelled on the wire', () => {
+    const fromAudit = buildPostTradeReview(makeRow(), ctxWith());
+    expect(fromAudit.setupKeySource).toBe('audit');
+    expect(fromAudit.setupKey).toBe('options_rv');
+
+    // Audit event present (so the card still joins) but carrying no
+    // `strategy` ⇒ the card's vocabulary, one rung down.
+    const fromCard = buildPostTradeReview(
+      makeRow(), ctxWith({ auditEvents: [makeEvent({ strategy: undefined })] }),
+    );
+    expect(fromCard.setupKeySource).toBe('card');
+    expect(fromCard.setupKey).toBe('options_rv');
+
+    // ⛔ The three sources are three vocabularies and nothing here reconciles
+    // them: the journal says `single_leg_rv` where the card says `options_rv`.
+    // That the strings differ is the measurement; asserting an equivalence
+    // would be the inference this ticket refuses to make.
+    const fromStructure = buildPostTradeReview(makeRow(), { auditEvents: [], nowMs: T_CLOSE });
+    expect(fromStructure.setupKey).not.toBe(fromCard.setupKey);
+  });
+
+  it('an entry leg with a MODELLED basis is never charged as sampled', () => {
+    // The demo book's `entrySlippageUsd` is `(premiumPaid − rawMark)` where
+    // `premiumPaid = rawMark × (1 + demoSlippagePct)` and the default pct is 0
+    // — identically $0.00, measured 0-of-1,341-nonzero on live bqb1. Charging
+    // it books the entry cross at zero and makes every demo setup look cheaper
+    // than it is. The basis, not the number, is what discriminates.
+    const modelled = buildPostTradeReview(makeRow({
+      entrySlippageUsd: 0, entrySlippageBasis: 'modelled_fill',
+      exitSlippageUsd: 9, exitSlippageBasis: 'quote_cross',
+      feesUsd: 1.3,
+    }), ctxWith());
+    expect(modelled.slippage.realizedRoundTripUsd).toBe(9);  // still published
+    expect(modelled.slippage.roundTripFullyMeasured).toBe(false);
+    const fed = toSetupOutcomeRecord(modelled);
+    expect(fed.record?.costSource).not.toBe('sampled');
+    expect(fed.costUnchargedReason).toBe('entry_leg_basis_modelled');
+
+    // A pre-stamp row carries a bare number and no basis: unrecoverable, and
+    // it must NOT be optimistically read as a broker measurement.
+    const unstamped = buildPostTradeReview(makeRow({
+      entrySlippageUsd: 6, exitSlippageUsd: 9, feesUsd: 1.3,
+    }), ctxWith());
+    expect(unstamped.slippage.roundTripFullyMeasured).toBe(false);
+    expect(toSetupOutcomeRecord(unstamped).costUnchargedReason)
+      .toBe('entry_leg_basis_unknown');
+  });
+
+  it('an operational flatten is excluded from the feed; a rule exit is not', () => {
+    for (const reason of ['book_halt_flat', 'manual', 'broker_reconcile']) {
+      const r = buildPostTradeReview(makeRow({ exitReason: reason }), ctxWith());
+      expect(r.exitClass).toBe('operational');
+      expect(toSetupOutcomeRecord(r).excludedReason).toBe('operational_exit');
+    }
+    for (const reason of ['sl', 'chandelier', 'time_stop', 'take_profit_early']) {
+      const r = buildPostTradeReview(makeRow({ exitReason: reason }), ctxWith());
+      expect(r.exitClass).toBe('strategy');
+      expect(toSetupOutcomeRecord(r).excludedReason).toBeNull();
+    }
+    // An exit reason in NEITHER table is refused and named, never folded into
+    // `strategy` — a new operational exit must not enter expectancy by being new.
+    const novel = buildPostTradeReview(makeRow({ exitReason: 'halt_v2_flatten' }), ctxWith());
+    expect(novel.exitClass).toBeNull();
+    const fed = toSetupOutcomeRecord(novel);
+    expect(fed.excludedReason).toBe('exit_class_unknown');
+    expect(fed.unclassifiedExitReason).toBe('halt_v2_flatten');
+  });
+
+  it('the two exit tables are disjoint', () => {
+    for (const r of OPERATIONAL_EXIT_REASONS) {
+      expect(STRATEGY_EXIT_REASONS.has(r)).toBe(false);
+    }
   });
 });
 
@@ -373,12 +475,16 @@ describe('buildPostTradeReviews / summary', () => {
     expect(batch.summary.joins.withAuditFill).toBe(1);
     expect(batch.summary.joins.withThesis).toBe(1);
     expect(batch.summary.joins.missingByReason['no_audit_fill_event']).toBe(2);
-    // Calibration feed: pos-1 keyed+closed ⇒ emitted; pos-2 open, pos-3 unkeyed.
-    expect(batch.summary.calibrationFeed.emitted).toBe(1);
-    expect(batch.summary.calibrationFeed.excludedByReason).toEqual({
-      open_row: 1, setup_unknown: 1,
+    // Calibration feed: pos-1 and pos-3 are both closed and both keyed —
+    // pos-3 off its own `structure` now that the TRA-5011 arm exists — so both
+    // are emitted and only the OPEN row is excluded.
+    expect(batch.summary.calibrationFeed.emitted).toBe(2);
+    expect(batch.summary.calibrationFeed.excludedByReason).toEqual({ open_row: 1 });
+    expect(batch.calibrationRecords).toHaveLength(2);
+    // TRA-5011 — the partition over CLOSED rows must be exhaustive.
+    expect(batch.summary.calibrationFeed.partition).toEqual({
+      accountedFor: 2, closedRows: 2, exhaustive: true,
     });
-    expect(batch.calibrationRecords).toHaveLength(1);
     // Newest first.
     expect(batch.reviews.map(r => r.positionId).sort()).toEqual(['pos-1', 'pos-2', 'pos-3']);
   });
@@ -398,5 +504,52 @@ describe('buildPostTradeReviews / summary', () => {
     const summary = summarizePostTradeReviews([]);
     expect(summary.total).toBe(0);
     expect(summary.slippage.meanDeltaR).toBeNull();
+  });
+
+  // ── TRA-5011 ────────────────────────────────────────────────────────────
+
+  it('the exit-class split and the uncharged census are both exhaustive', () => {
+    const rows = [
+      makeRow({ id: 'o1', exitReason: 'book_halt_flat' }),
+      makeRow({ id: 'o2', exitReason: 'manual' }),
+      makeRow({ id: 's1', exitReason: 'sl' }),
+      makeRow({ id: 's2', exitReason: 'chandelier' }),
+      makeRow({ id: 'u1', exitReason: 'some_future_reason' }),
+      makeRow({ id: 'open', outcome: 'OPEN', closeTs: undefined }),
+    ];
+    const { summary } = buildPostTradeReviews(rows, { auditEvents: [], nowMs: T_CLOSE });
+    const f = summary.calibrationFeed;
+    expect(f.byExitClass).toEqual({ strategy: 2, operational: 2, unclassified: 1 });
+    expect(f.excludedByReason).toEqual({
+      open_row: 1, operational_exit: 2, exit_class_unknown: 1,
+    });
+    expect(f.unclassifiedExitReasons).toEqual({ some_future_reason: 1 });
+    expect(f.emitted).toBe(2);
+    // Σ excludedByReason + emitted == closed, with `open_row` on the open side.
+    expect(f.partition).toEqual({ accountedFor: 5, closedRows: 5, exhaustive: true });
+    // Every emitted-but-uncharged row names WHY — `charged: 0` is a diagnosis,
+    // never a bare zero. These rows carry no cost terms at all.
+    expect(f.charged).toBe(0);
+    expect(f.unchargedByReason).toEqual({ entry_leg_not_measured: 2 });
+    const unchargedTotal = Object.values(f.unchargedByReason).reduce((a, b) => a + b, 0);
+    expect(f.charged + unchargedTotal).toBe(f.emitted);
+  });
+
+  it('a charged row is attributed to the arm that paid for it', () => {
+    const rows = [
+      makeRow({
+        id: 'sampled', exitReason: 'sl',
+        entrySlippageUsd: 6, entrySlippageBasis: 'broker_fill',
+        exitSlippageUsd: 9, exitSlippageBasis: 'quote_cross', feesUsd: 1.3,
+      }),
+      makeRow({
+        id: 'modelled', exitReason: 'sl',
+        markProvenance: { quoteAtFire: { bid: 0.9, ask: 1.0 } },
+      } as Partial<OptionTradeJournalRecord>),
+    ];
+    const { summary } = buildPostTradeReviews(rows, { auditEvents: [], nowMs: T_CLOSE });
+    expect(summary.calibrationFeed.charged).toBe(2);
+    expect(summary.calibrationFeed.chargedBySource).toEqual({ sampled: 1, modelled: 1 });
+    expect(summary.calibrationFeed.unchargedByReason).toEqual({});
   });
 });

@@ -78,12 +78,97 @@ export interface PostTradeJoin {
   missing: string[];
 }
 
+/**
+ * TRA-5011 — why a closed row's cost could not be CHARGED to the calibration
+ * fold. `setup-calibration.ts` already refuses to treat an uncharged row as a
+ * zero-cost one; this names which of the two cost arms fell over and where, so
+ * `charged: 0` is a diagnosis instead of an opaque zero.
+ *   • `entry_leg_basis_modelled`  — the entry leg exists but its basis is the
+ *     book's own modelled fill, which is identically $0.00 on demo. Charging it
+ *     books the entry cross at zero. The single largest bucket.
+ *   • `entry_leg_basis_unknown`   — a bare `entrySlippageUsd` from before the
+ *     TRA-5011 basis stamp: unrecoverable, never assumed measured.
+ *   • `entry_leg_not_measured` / `exit_leg_not_measured` — no leg at all.
+ *   • `fees_not_measured`         — demo books no commission, so an absent
+ *     `feesUsd` is "not modelled", not "$0 of fees".
+ *   • `crossed_unpriced:<reason>` — the modelled arm's own refusal, carried
+ *     through verbatim from `priceCrossedRow` rather than flattened.
+ *   • `realized_pnl_missing` / `at_risk_unusable` — the divisor/dividend.
+ */
+export type CostUnchargedReason = string;
+
+/**
+ * TRA-5011 — did the trade's OWN rule close this position, or did something
+ * outside it? An operational flatten is not a strategy exit and must not enter
+ * a setup's expectancy: on live bqb1 2026-10-01, 1,085 of 1,966 closed demo
+ * rows (55.2%) exited `book_halt_flat` or `manual`, and those exits carry
+ * +$13,762 against a +$7,232 whole-book sum — restricting to rule-driven exits
+ * flips `single_leg_otm` from +$4.89 to −$19.28 per trade on n=404.
+ */
+export type ExitClass = 'strategy' | 'operational';
+
+/**
+ * Exits the trade's own rule did NOT decide. ⛔ When a new reason is genuinely
+ * ambiguous it belongs HERE, not in the strategy set: a strategy exit misfiled
+ * as operational only shrinks n, while an operational exit misfiled as strategy
+ * contaminates the expectancy with the halt switch — which is the whole defect.
+ */
+export const OPERATIONAL_EXIT_REASONS: ReadonlySet<string> = new Set([
+  'book_halt_flat',
+  'manual',
+  'broker_reconcile',
+  'partial_drain',
+  'max_window_liquidation',
+  'reconstructed-TRA-3472',
+]);
+
+/**
+ * Exits a trade rule (or the contract's own settlement) decided. The TRA-2940
+ * `exitReason` vocabulary, enumerated rather than defaulted — see
+ * `OptionPosition.exitReason` in `@trading-app/shared` for the source list.
+ */
+export const STRATEGY_EXIT_REASONS: ReadonlySet<string> = new Set([
+  'sl', 'sl_credit', 'sl_debit', 'sl_daily_close', 'sl_otm_premium_pct',
+  'stock_stop', 'trail', 'tp1', 'tp_capture', 'take_profit_early',
+  'profit_lock', 'chandelier', 'chandelier_daily_close', 'chandelier_restarted',
+  'chandelier_spot_seeded', 'supertrend_flip', 'ma20_close_through',
+  'time_stop', 'dte_time_stop', 'expiry_settle', 'expired', 'bought_back',
+  'assigned', 'called_away',
+]);
+
+/**
+ * `null` = the reason is in NEITHER table (or absent). Deliberately not folded
+ * to `strategy`: an unrecognised reason is counted by name and excluded, so a
+ * new operational exit cannot enter expectancy by being new.
+ */
+export function classifyExitReason(reason: string | null): ExitClass | null {
+  if (reason === null) return null;
+  if (OPERATIONAL_EXIT_REASONS.has(reason)) return 'operational';
+  if (STRATEGY_EXIT_REASONS.has(reason)) return 'strategy';
+  return null;
+}
+
 export interface PostTradeSlippage {
   /** Card estimate: round-trip cost in the trade's own R units (TRA-3483 arithmetic). */
   expectedCostR: number | null;
   /** Measured mark-vs-fill legs off the journal row; null = never measured, NOT 0. */
   realizedEntryUsd: number | null;
   realizedExitUsd: number | null;
+  /**
+   * TRA-5011 — the PROVENANCE of each leg, published beside the number because
+   * the number alone cannot be read: a `modelled_fill` entry leg is identically
+   * $0.00 on the demo book (0 of 1,341 nonzero, live bqb1 2026-10-01), so it is
+   * numerically indistinguishable from a trade that crossed no spread.
+   * `null` ⇒ the leg carries no basis stamp at all — never assumed measured.
+   */
+  entryLegBasis: 'broker_fill' | 'modelled_fill' | null;
+  exitLegBasis: 'quote_cross' | 'broker_fill' | null;
+  /**
+   * TRA-5011 — true iff BOTH legs are real measurements (`broker_fill`, or the
+   * TRA-4997 `quote_cross` half-spread). The round-trip number below exists
+   * whenever both legs are present; this says whether it may be CHARGED.
+   */
+  roundTripFullyMeasured: boolean;
   /** Sum of the two legs — only when BOTH were measured. */
   realizedRoundTripUsd: number | null;
   /** realizedRoundTripUsd / atRiskUsd — same divisor as realizedR. */
@@ -123,14 +208,27 @@ export interface PostTradeReview {
   optionSymbol: string | null;
   structure: string;
   entryArchetype: string | null;
-  /** Setup identity for the TRA-4779 fold — audit fill `strategy`, else card. */
+  /**
+   * Setup identity for the TRA-4779 fold — audit fill `strategy`, else card,
+   * else (TRA-5011) the row's own `structure`, VERBATIM.
+   *
+   * ⛔ The three sources are three different vocabularies and this field does
+   * NOT reconcile them: the journal says `single_leg_rv` where a card says
+   * `relative_value`, and asserting that equivalence here would be an inference
+   * dressed as a measurement. `setupKeySource` is on the wire so a consumer can
+   * see which vocabulary a key came from and fold accordingly. Resolving the
+   * mapping is a quant ruling, not a plumbing decision, and is deliberately
+   * left open.
+   */
   setupKey: string | null;
-  setupKeySource: 'audit' | 'card' | null;
+  setupKeySource: 'audit' | 'card' | 'structure' | null;
   status: 'open' | 'closed';
   openTs: number;
   closeTs: number | null;
   holdMs: number | null;
   exitReason: string | null;
+  /** TRA-5011 — `null` on an open row AND on a closed row whose reason is in neither table. */
+  exitClass: ExitClass | null;
   contracts: number | null;
   atRiskUsd: number;
   entry: {
@@ -225,6 +323,14 @@ function resolveSlippage(
   const expected = card ? fin(card.fields.costs.data?.costR) : null;
   const entryLeg = fin(row.entrySlippageUsd);
   const exitLeg = fin(row.exitSlippageUsd);
+  // TRA-5011 — bases ride beside the legs. An absent stamp is `null`, never the
+  // optimistic guess: a pre-stamp row's basis is genuinely unrecoverable.
+  const entryLegBasis = row.entrySlippageBasis ?? null;
+  const exitLegBasis = row.exitSlippageBasis ?? null;
+  const roundTripFullyMeasured =
+    entryLeg !== null && exitLeg !== null
+    && entryLegBasis === 'broker_fill'
+    && (exitLegBasis === 'quote_cross' || exitLegBasis === 'broker_fill');
   const roundTrip =
     entryLeg !== null && exitLeg !== null ? roundCents(entryLeg + exitLeg) : null;
   const atRisk = fin(row.atRiskUsd);
@@ -247,6 +353,9 @@ function resolveSlippage(
     expectedCostR: expected,
     realizedEntryUsd: entryLeg,
     realizedExitUsd: exitLeg,
+    entryLegBasis,
+    exitLegBasis,
+    roundTripFullyMeasured,
     realizedRoundTripUsd: roundTrip,
     realizedCostR: realizedR,
     deltaR: delta,
@@ -300,10 +409,26 @@ export function buildPostTradeReview(
     }
   }
 
+  // — setup identity, three sources, highest precedence first —
+  //
+  // TRA-5011 adds the third. The first two both need an audit `fill_booked`
+  // event keyed to this row, and the audit log's oldest day on disk is
+  // 2026-09-21 while the journal spans 2026-07-07 → 2026-10-01: measured on
+  // live bqb1, {keyed} ∩ {closed} was EMPTY, so the fold had never been handed
+  // a single row. `structure` is non-null on 1,998 / 1,998 closed rows and is
+  // written at open by the row's own writer, so it cannot age out of a ring or
+  // a retention window — that durability is the whole point of the arm.
+  //
+  // It is taken VERBATIM. No mapping, no default bucket: see `setupKey`.
   const setupFromAudit = fillEvent ? str(fillEvent.strategy) : null;
-  const setupKey = setupFromAudit ?? (card ? str(card.signalType) : null);
+  const setupFromCard = card ? str(card.signalType) : null;
+  const setupFromStructure = str(row.structure);
+  const setupKey = setupFromAudit ?? setupFromCard ?? setupFromStructure;
   const setupKeySource: PostTradeReview['setupKeySource'] =
-    setupFromAudit !== null ? 'audit' : setupKey !== null ? 'card' : null;
+    setupFromAudit !== null ? 'audit'
+      : setupFromCard !== null ? 'card'
+        : setupFromStructure !== null ? 'structure'
+          : null;
 
   const exitFill = fin(row.exitFillPremium);
   const crossed = priceCrossedRow(row);
@@ -389,6 +514,7 @@ export function buildPostTradeReview(
     closeTs,
     holdMs: closeTs !== null ? closeTs - row.openTs : null,
     exitReason: closed ? str(row.exitReason) : null,
+    exitClass: closed ? classifyExitReason(str(row.exitReason)) : null,
     contracts: fin(row.contractsAtClose) ?? fin(row.contracts),
     atRiskUsd: row.atRiskUsd,
     entry: {
@@ -428,6 +554,19 @@ export interface CalibrationFeedResult {
   record: SetupOutcomeRecord | null;
   /** Why no record was emitted; null iff `record` is non-null. */
   excludedReason: string | null;
+  /**
+   * TRA-5011 — the raw `exitReason` when (and only when) `excludedReason` is
+   * `exit_class_unknown`, so a new exit vocabulary is counted BY NAME rather
+   * than disappearing into one rolled-up bucket.
+   */
+  unclassifiedExitReason: string | null;
+  /**
+   * TRA-5011 — set on an EMITTED record whose `costSource` is null: which cost
+   * arm fell over, and where. The record is still emitted (the estimator owns
+   * the uncharged-row refusal and counts it); this is what turns its
+   * `unchargedCost` tally into something actionable.
+   */
+  costUnchargedReason: CostUnchargedReason | null;
 }
 
 /**
@@ -437,19 +576,31 @@ export interface CalibrationFeedResult {
  * null = uncharged — setup-calibration excludes AND counts those itself.
  */
 export function toSetupOutcomeRecord(review: PostTradeReview): CalibrationFeedResult {
-  if (review.status !== 'closed') return { record: null, excludedReason: 'open_row' };
-  if (review.setupKey === null) return { record: null, excludedReason: 'setup_unknown' };
-  if (review.closeTs === null) return { record: null, excludedReason: 'close_ts_missing' };
+  const no = (excludedReason: string, unclassifiedExitReason: string | null = null)
+    : CalibrationFeedResult =>
+    ({ record: null, excludedReason, unclassifiedExitReason, costUnchargedReason: null });
+
+  if (review.status !== 'closed') return no('open_row');
+  if (review.setupKey === null) return no('setup_unknown');
+  if (review.closeTs === null) return no('close_ts_missing');
+  // TRA-5011 — the exit-reason partition. Both arms exclude, for opposite
+  // reasons: `operational` is a measured not-a-strategy-exit, `unknown` is a
+  // reason in neither table and is refused rather than guessed.
+  if (review.exitClass === null) return no('exit_class_unknown', review.exitReason);
+  if (review.exitClass === 'operational') return no('operational_exit');
 
   let costR: number | null = null;
   let costSource: SetupOutcomeRecord['costSource'] = null;
+  let costUnchargedReason: CostUnchargedReason | null = null;
   const fees = review.pnl.feesUsd;
+  const slip = review.slippage;
   if (
-    review.slippage.realizedRoundTripUsd !== null
+    slip.realizedRoundTripUsd !== null
+    && slip.roundTripFullyMeasured
     && fees !== null
     && review.atRiskUsd > 0
   ) {
-    costR = round4((review.slippage.realizedRoundTripUsd + fees) / review.atRiskUsd);
+    costR = round4((slip.realizedRoundTripUsd + fees) / review.atRiskUsd);
     costSource = 'sampled';
   } else if (
     review.pnl.crossedUsd !== null
@@ -459,6 +610,23 @@ export function toSetupOutcomeRecord(review: PostTradeReview): CalibrationFeedRe
     // Spread drag the mark-booked P&L never paid: booked − crossed.
     costR = round4((review.pnl.realizedUsd - review.pnl.crossedUsd) / review.atRiskUsd);
     costSource = 'modelled';
+  } else {
+    // Neither arm. Name the FIRST thing that is actually missing, walking the
+    // sampled arm's own order, then fall through to the modelled arm's refusal
+    // — a bare null here is one `?? 0` away from charging the row at zero.
+    costUnchargedReason =
+      review.atRiskUsd > 0
+        ? slip.realizedEntryUsd === null ? 'entry_leg_not_measured'
+          : slip.entryLegBasis === null ? 'entry_leg_basis_unknown'
+            : slip.entryLegBasis === 'modelled_fill' ? 'entry_leg_basis_modelled'
+              : slip.realizedExitUsd === null ? 'exit_leg_not_measured'
+                : slip.exitLegBasis === null ? 'exit_leg_basis_unknown'
+                  : fees === null ? 'fees_not_measured'
+                    : review.pnl.crossedUnpriced !== null
+                      ? `crossed_unpriced:${review.pnl.crossedUnpriced}`
+                      : review.pnl.realizedUsd === null ? 'realized_pnl_missing'
+                        : 'no_cost_arm_resolved'
+        : 'at_risk_unusable';
   }
 
   const conf = review.thesis?.confidence ?? null;
@@ -478,6 +646,8 @@ export function toSetupOutcomeRecord(review: PostTradeReview): CalibrationFeedRe
       regime: null,
     },
     excludedReason: null,
+    unclassifiedExitReason: null,
+    costUnchargedReason,
   };
 }
 
@@ -501,7 +671,26 @@ export interface PostTradeReviewSummary {
     unresolvedByReason: Record<string, number>;
   };
   violations: { rowsWithAny: number; byKind: Record<string, number> };
-  calibrationFeed: { emitted: number; charged: number; excludedByReason: Record<string, number> };
+  calibrationFeed: {
+    emitted: number;
+    charged: number;
+    excludedByReason: Record<string, number>;
+    /**
+     * TRA-5011 — `Σ excludedByReason + emitted` over CLOSED rows, and the
+     * `closed` it must equal. Published rather than only asserted in a test so
+     * a future reason that forgets to count itself is visible on the wire.
+     * `exhaustive: false` means rows vanished between the two.
+     */
+    partition: { accountedFor: number; closedRows: number; exhaustive: boolean };
+    /** TRA-5011 — the exit-reason split over every closed row. */
+    byExitClass: { strategy: number; operational: number; unclassified: number };
+    /** TRA-5011 — unrecognised `exitReason` values BY NAME, never rolled up. */
+    unclassifiedExitReasons: Record<string, number>;
+    /** TRA-5011 — of the emitted rows, why each uncharged one is uncharged. */
+    unchargedByReason: Record<string, number>;
+    /** TRA-5011 — of the charged rows, which arm paid. */
+    chargedBySource: Record<string, number>;
+  };
 }
 
 export function summarizePostTradeReviews(
@@ -519,7 +708,16 @@ export function summarizePostTradeReviews(
     excursion: { withMae: 0, withMfe: 0 },
     slippage: { comparable: 0, meanDeltaR: null, unresolvedByReason: {} },
     violations: { rowsWithAny: 0, byKind: {} },
-    calibrationFeed: { emitted: 0, charged: 0, excludedByReason: {} },
+    calibrationFeed: {
+      emitted: 0,
+      charged: 0,
+      excludedByReason: {},
+      partition: { accountedFor: 0, closedRows: 0, exhaustive: true },
+      byExitClass: { strategy: 0, operational: 0, unclassified: 0 },
+      unclassifiedExitReasons: {},
+      unchargedByReason: {},
+      chargedBySource: {},
+    },
   };
   let deltaSum = 0;
   for (const r of reviews) {
@@ -539,14 +737,44 @@ export function summarizePostTradeReviews(
     }
     if (r.ruleViolations.length > 0) summary.violations.rowsWithAny += 1;
     for (const v of r.ruleViolations) bump(summary.violations.byKind, v.kind);
+    if (r.status === 'closed') {
+      const cls = r.exitClass;
+      if (cls === 'strategy') summary.calibrationFeed.byExitClass.strategy += 1;
+      else if (cls === 'operational') summary.calibrationFeed.byExitClass.operational += 1;
+      else summary.calibrationFeed.byExitClass.unclassified += 1;
+    }
     const feed = toSetupOutcomeRecord(r);
     if (feed.record !== null) {
       summary.calibrationFeed.emitted += 1;
-      if (feed.record.costSource !== null) summary.calibrationFeed.charged += 1;
+      if (feed.record.costSource !== null) {
+        summary.calibrationFeed.charged += 1;
+        bump(summary.calibrationFeed.chargedBySource, feed.record.costSource);
+      } else {
+        // `?? ` would be a lie here — an emitted uncharged row ALWAYS carries a
+        // reason, so an absent one is a bug and must read as one by name.
+        bump(
+          summary.calibrationFeed.unchargedByReason,
+          feed.costUnchargedReason ?? 'uncharged_reason_not_set',
+        );
+      }
     } else if (feed.excludedReason !== null) {
       bump(summary.calibrationFeed.excludedByReason, feed.excludedReason);
+      if (feed.unclassifiedExitReason !== null) {
+        bump(summary.calibrationFeed.unclassifiedExitReasons, feed.unclassifiedExitReason);
+      }
     }
   }
+  // TRA-5011 — the exhaustive-partition identity. `open_row` is the one
+  // excluded reason that lands on an OPEN row, so it comes out of both sides.
+  const openRows = summary.calibrationFeed.excludedByReason['open_row'] ?? 0;
+  const excludedTotal = Object.values(summary.calibrationFeed.excludedByReason)
+    .reduce((a, b) => a + b, 0);
+  summary.calibrationFeed.partition = {
+    accountedFor: summary.calibrationFeed.emitted + excludedTotal - openRows,
+    closedRows: summary.closed,
+    exhaustive:
+      summary.calibrationFeed.emitted + excludedTotal - openRows === summary.closed,
+  };
   summary.slippage.meanDeltaR =
     summary.slippage.comparable > 0 ? round4(deltaSum / summary.slippage.comparable) : null;
   return summary;

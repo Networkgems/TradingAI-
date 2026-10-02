@@ -7164,8 +7164,13 @@ export class PaperOptionsAccount {
         : {}),
       // TRA-1600 (D) — stamp the measured entry slippage only when the caller
       // supplied a finite value, so unmeasured opens fold back as undefined.
+      // TRA-5011 — and stamp its BASIS in the same spread. Every open site reaches
+      // here with `(premiumPaid − rawMark)` off the book's own modelled fill, so
+      // the basis written at open is always `modelled_fill`; the TRA-1601
+      // `amend_entry_slippage` supersede is the only thing that can raise it to
+      // `broker_fill`. Spread together so the number can never arrive basis-less.
       ...(typeof entrySlippageUsd === 'number' && Number.isFinite(entrySlippageUsd)
-        ? { entrySlippageUsd }
+        ? { entrySlippageUsd, entrySlippageBasis: 'modelled_fill' as const }
         : {}),
       // TRA-1656 — contract identity + fill-time quote. `optionSymbol` alone fixes
       // a second gap the spread audit exposed: pre-TRA-1656 rows carried no OCC

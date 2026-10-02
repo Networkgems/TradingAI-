@@ -327,6 +327,27 @@ export interface OptionTradeJournalOpen {
    */
   entrySlippageUsd?: number;
   /**
+   * TRA-5011 — the BASIS of {@link entrySlippageUsd}, the entry-side mirror of
+   * TRA-4997's {@link OptionTradeJournalClose.exitSlippageBasis}. Without it the
+   * number above cannot be read at all, because its two meanings are numerically
+   * identical in the common case:
+   *
+   *   • `broker_fill`   — a REAL `(avg fill − mark)` measurement, written only by
+   *     the TRA-1601 `amend_entry_slippage` supersede once the live smart-open
+   *     mirror reconciles.
+   *   • `modelled_fill` — the book's OWN modelled fill minus its own mark. On the
+   *     demo book `premiumPaid = rawMark × (1 + demoSlippagePct)` and
+   *     `demoSlippagePct` defaults to **0**, so this expression is *identically
+   *     $0.00*: measured 0 of 1,341 nonzero demo rows on live bqb1, 2026-10-01.
+   *     It is the measurement equalling its own input, not a cross that cost
+   *     nothing — and charging it as a cost books the entry spread at zero.
+   *
+   * ⛔ Absent means NO measurement, never `modelled_fill` by default: every row
+   * closed before this shipped carries a bare number whose basis is unrecoverable.
+   * Readers that CHARGE this leg must require `broker_fill` explicitly.
+   */
+  entrySlippageBasis?: 'broker_fill' | 'modelled_fill';
+  /**
    * TRA-1656 (TRA-1602B) — the fill-time two-sided QUOTE, retained so the option
    * spread cross can be MEASURED instead of modeled.
    *
@@ -2221,7 +2242,14 @@ function foldLine(
     const rec = map.get(line.id);
     if (!rec) return;
     if (typeof line.entrySlippageUsd === 'number' && Number.isFinite(line.entrySlippageUsd)) {
-      map.set(line.id, { ...rec, entrySlippageUsd: line.entrySlippageUsd });
+      // TRA-5011 — this supersede IS the broker measurement, so it also stamps
+      // the basis. The open row's `modelled_fill` is overwritten in both fields
+      // together; they can never disagree.
+      map.set(line.id, {
+        ...rec,
+        entrySlippageUsd: line.entrySlippageUsd,
+        entrySlippageBasis: 'broker_fill',
+      });
     }
     return;
   }
