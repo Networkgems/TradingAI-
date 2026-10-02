@@ -36,7 +36,9 @@ import {
   WS_TICKET_TTL_MS,
 } from './ws-auth.js';
 import { cspReportRouter, initCspReportStore } from './csp-report-collector.js';
-import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
+// TRA-4998 — `stampLegacyRateBasis` is the read-time half of defect B; see
+// `stampReportOnRead` for why it lives at the response boundary.
+import { generateEodReport, wouldClobberSettledReport, stampLegacyRateBasis } from './reports/eod-report.js';
 import { decideEodReportWrite } from './reports/eod-write-gate.js';
 // TRA-2631 / TRA-3063 — read-time provenance stamp for stored top-movers rows.
 import { annotateReportProvenance } from './reports/mover-provenance.js';
@@ -1053,6 +1055,7 @@ import {
   type ResearchReport,
   type EodReport,
   type EodMover,
+  type EodSignalAccuracy, // TRA-4998 — `stampReportOnRead`'s structural constraint
   type Position,
   type OptionPosition,
   ALERT_CHANNELS,
@@ -4546,8 +4549,14 @@ async function buildLiveTodayCellReport(
     availableCash: 0,
     trades: [],
     openPositionCount: 0,
-    winRate: 0,
-    avgRR: 0,
+    // TRA-4998 residual — `null`, not 0. This intraday cell carries `trades: []` and
+    // `totalTrades: 0` by construction (it is a BALANCE delta, not a trade fold), so a
+    // `0` here is the ticket's defect verbatim: measured on prod `afe4e34a` the live
+    // 2026-10-02 cell served `totalTrades: 0, winRate: 0, avgRR: 0` while its own
+    // `signalAccuracy` block two lines below correctly said `null`. One of the two
+    // sibling stubs got fixed and this one did not.
+    winRate: null,
+    avgRR: null,
     totalTrades: 0,
     winners: 0,
     losers: 0,
@@ -15401,6 +15410,28 @@ function stampMoverProvenance<T extends { top5Movers?: EodMover[]; markdown?: st
   );
 }
 
+// TRA-4998 residual — the SAME response-boundary discipline, for the same reason.
+//
+// `stampMoverProvenance`'s header states why the movers filter lives here and not in
+// the readers: one call per serving path, so a new branch cannot quietly ship an
+// unstamped surface. The legacy rate-basis stamp has identical shape — a write-side
+// fix that cannot reach 108 archived cells — so it composes into the same boundary
+// rather than being sprinkled at the three `JSON.parse(...) as EodReport` sites, one
+// of which is the WS handshake (TRA-2631's "an unstamped socket surface beside a
+// stamped HTTP one is the partial fix that reads as complete").
+//
+// It is a strict no-op on a freshly built cell: those already carry `winRateBasis`.
+function stampReportOnRead<T extends {
+  top5Movers?: EodMover[];
+  markdown?: string;
+  totalTrades?: number;
+  winRate?: number | null;
+  avgRR?: number | null;
+  signalAccuracy?: EodSignalAccuracy;
+}>(report: T): T {
+  return stampMoverProvenance(stampLegacyRateBasis(report));
+}
+
 app.get('/api/reports/latest', requireAuth, async (req, res) => {
   const ctx = await userCtx(res);
   const mode = resolveStockReportMode(req, ctx.username);
@@ -15420,7 +15451,7 @@ app.get('/api/reports/latest', requireAuth, async (req, res) => {
       ctx, mode,
       await stampStaleBalanceAnchorAudit(ctx, mode, JSON.parse(raw) as EodReport),
     );
-    res.json(stampMoverProvenance(latest));
+    res.json(stampReportOnRead(latest));
   } catch {
     res.status(500).json({ error: 'Failed to read report' });
   }
@@ -15596,7 +15627,7 @@ app.get('/api/reports/desk/:date', requireAuth, requireAdmin, async (req, res) =
       res.status(404).json({ error: `No desk report for ${date}` });
       return;
     }
-    res.json(stampMoverProvenance(cell));
+    res.json(stampReportOnRead(cell));
   } catch (err) {
     log.warn('desk calendar day read failed', {
       date,
@@ -15637,7 +15668,7 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
     try {
       const liveToday = await buildLiveTodayCellReport(ctx, mode);
       if (liveToday) {
-        res.json(stampMoverProvenance(liveToday));
+        res.json(stampReportOnRead(liveToday));
         return;
       }
     } catch (err) {
@@ -15678,7 +15709,7 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
         // this fold (TRA-4199). `stampFirmWideDemoFoldScope` is the ONLY thing
         // this ticket changes on the fold path: it adds `cellScope`, and touches
         // neither the arithmetic above nor the gate above that.
-        res.json(stampMoverProvenance(stampFirmWideDemoFoldScope(cell)));
+        res.json(stampReportOnRead(stampFirmWideDemoFoldScope(cell)));
         return;
       }
     } catch (err) {
@@ -15700,7 +15731,7 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
   // 69 stored live cells are not, and the clobber guard means the write path can
   // never rewrite them either.
   res.json(
-    stampMoverProvenance(
+    stampReportOnRead(
       await stampBrokerSourceAudit(ctx, mode, await stampStaleBalanceAnchorAudit(ctx, mode, personal)),
     ),
   );
@@ -19507,7 +19538,7 @@ wss.on('connection', async (ws) => {
       // partial fix that reads as complete.
       ws.send(JSON.stringify({
         type: 'eod_report',
-        payload: stampMoverProvenance(JSON.parse(raw) as EodReport),
+        payload: stampReportOnRead(JSON.parse(raw) as EodReport),
       }));
     } catch { /* ignore */ }
   }
