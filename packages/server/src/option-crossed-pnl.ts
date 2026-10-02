@@ -163,8 +163,16 @@ const unpriced = (reason: CrossedUnpricedReason): CrossedRowPricing => ({
  * quote wins unconditionally, so every row that had a crossed number before
  * TRA-4997 keeps the IDENTICAL one and the fallback can only add coverage.
  * `{ quote: null, reason }` when nothing is usable.
+ *
+ * EXPORTED for TRA-5040: the real-fill arm (`option-real-fill-r.ts`) resolves
+ * its exit book through this same function rather than re-spelling the
+ * precedence and the {@link EXIT_QUOTE_MAX_AGE_MS} staleness rule. Two copies of
+ * a quote-selection rule is two rules — the second one drifts, and the drift is
+ * invisible because both produce a price.
  */
-function resolveCrossedExitQuote(row: CrossedPricingRow): {
+export function resolveCrossedExitQuote(
+  row: Pick<CrossedPricingRow, 'markProvenance' | 'exitQuote'>,
+): {
   quote: { bid: number; ask: number } | null;
   source: 'fire_tick' | 'last_known' | null;
   ageMs: number | null;
