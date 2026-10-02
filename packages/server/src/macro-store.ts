@@ -158,6 +158,80 @@ export interface MacroRefreshResult {
    * curated FOMC schedule seeded without `FRED_API_KEY` (CPI/NFP/PCE absent).
    */
   mode: 'full' | 'fomc-only';
+  /**
+   * Per-release FRED fetch failures swallowed by this refresh (vendor side of
+   * the wire). Always 0 on the `fomc-only` path — no vendor call is made there,
+   * so a 0 means "not attempted", which is why `mode` is published beside it.
+   */
+  fredReleasesFailed: number;
+}
+
+/**
+ * TRA-4430 — what the macro calendar refresh ACTUALLY DID on its last real
+ * attempt, so `/api/health/catalyst-gate` can report an outcome instead of our
+ * intent (CLAUDE.md: a health field reports the last real attempt, never the
+ * configuration). `never_attempted_this_boot` is a named state, not a pass.
+ */
+export type MacroRefreshOutcome =
+  | 'never_attempted_this_boot'
+  | 'ok_full'
+  | 'ok_fomc_only'
+  | 'failed';
+
+export interface MacroRefreshAttempt {
+  outcome: MacroRefreshOutcome;
+  /** ISO instant of the last real attempt; `null` iff nothing was attempted. */
+  attemptedAt: string | null;
+  stored: number | null;
+  fomc: number | null;
+  /** Vendor-side refusals/failures (FRED). `null` when no vendor call was made. */
+  fredReleasesFailed: number | null;
+  /**
+   * Which side of the wire the failure is on. `local` = we never called the
+   * vendor (the keyless path throws only on our own disk/parse work).
+   * `unattributed` = the keyed path threw and the client's hard failure is not
+   * separable from our persist at this boundary — never rolled into `local`.
+   */
+  failureSide: 'local' | 'unattributed' | null;
+  reason: string | null;
+}
+
+const NEVER_ATTEMPTED: MacroRefreshAttempt = {
+  outcome: 'never_attempted_this_boot',
+  attemptedAt: null,
+  stored: null,
+  fomc: null,
+  fredReleasesFailed: null,
+  failureSide: null,
+  reason: null,
+};
+
+let lastAttempt: MacroRefreshAttempt = NEVER_ATTEMPTED;
+
+/** The last real refresh attempt's outcome (see {@link MacroRefreshAttempt}). */
+export function lastMacroRefreshAttempt(): MacroRefreshAttempt {
+  return lastAttempt;
+}
+
+/**
+ * Record a refresh that threw. Called by the caller's catch — `refreshMacroCalendar`
+ * records its own successes. `side` is the caller's attribution: the keyless arm
+ * makes no vendor call, so its throw is ours (`local`).
+ */
+export function noteMacroRefreshFailure(
+  reason: string,
+  side: 'local' | 'unattributed',
+  asOf: number = Date.now(),
+): void {
+  lastAttempt = {
+    outcome: 'failed',
+    attemptedAt: new Date(asOf).toISOString(),
+    stored: null,
+    fomc: null,
+    fredReleasesFailed: null,
+    failureSide: side,
+    reason,
+  };
 }
 
 /**
@@ -193,10 +267,21 @@ export async function refreshMacroCalendar(
       fomc: fomc.length,
       keptFredRows: keptFred.length,
     });
-    return { stored: cache.length, fomc: fomc.length, mode: 'fomc-only' };
+    lastAttempt = {
+      outcome: 'ok_fomc_only',
+      attemptedAt: new Date().toISOString(),
+      stored: cache.length,
+      fomc: fomc.length,
+      fredReleasesFailed: null,
+      failureSide: null,
+      reason: null,
+    };
+    return { stored: cache.length, fomc: fomc.length, mode: 'fomc-only', fredReleasesFailed: 0 };
   }
 
+  let fredReleasesFailed = 0;
   const events = await client.getUpcomingEvents({ asOf: opts.asOf }, (releaseId, err) => {
+    fredReleasesFailed += 1;
     log.warn('macro release fetch failed — skipping', {
       releaseId,
       reason: err instanceof Error ? err.message : String(err),
@@ -205,8 +290,17 @@ export async function refreshMacroCalendar(
   cache = events;
   await persist();
   const fomc = events.filter((e) => e.type === 'FOMC').length;
-  log.info('macro calendar refreshed', { mode: 'full', stored: events.length, fomc });
-  return { stored: events.length, fomc, mode: 'full' };
+  log.info('macro calendar refreshed', { mode: 'full', stored: events.length, fomc, fredReleasesFailed });
+  lastAttempt = {
+    outcome: 'ok_full',
+    attemptedAt: new Date().toISOString(),
+    stored: events.length,
+    fomc,
+    fredReleasesFailed,
+    failureSide: null,
+    reason: null,
+  };
+  return { stored: events.length, fomc, mode: 'full', fredReleasesFailed };
 }
 
 /**
@@ -225,4 +319,5 @@ export function makeMacroClientFromEnv(): EconomicCalendarClient | null {
 export function __resetMacroStoreForTests(overridePath?: string | null): void {
   cache = null;
   storeFileOverride = overridePath ?? null;
+  lastAttempt = NEVER_ATTEMPTED;
 }

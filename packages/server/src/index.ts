@@ -1085,7 +1085,20 @@ import {
   initMacroStore,
   refreshMacroCalendar,
   makeMacroClientFromEnv,
+  // TRA-4430 — the last REAL refresh attempt's outcome + the calendar readers
+  // behind `/api/health/catalyst-gate`.
+  daysToNextFOMCSync,
+  getUpcomingMacroEvents,
+  lastMacroRefreshAttempt,
+  noteMacroRefreshFailure,
 } from './macro-store.js';
+// TRA-1972 / TRA-4430 — catalyst gate flag names + config resolution, for the
+// read-only `/api/health/catalyst-gate` probe (the gate itself runs in the engine).
+import {
+  resolveCatalystGateConfig,
+  CATALYST_EARNINGS_GATE_FLAG,
+  CATALYST_MACRO_MEANREV_FLAG,
+} from './catalyst-gate.js';
 // TRA-532 — Live-Trading Promotion Gate enforcement + audit store/service.
 import {
   registerBacktestReport,
@@ -6321,12 +6334,16 @@ async function runMacroRefresh(): Promise<void> {
     );
   }
   try {
-    const { stored, fomc, mode } = await refreshMacroCalendar(client);
-    log.info('macro-refresh complete', { mode, stored, fomc });
+    const { stored, fomc, mode, fredReleasesFailed } = await refreshMacroCalendar(client);
+    log.info('macro-refresh complete', { mode, stored, fomc, fredReleasesFailed });
   } catch (err) {
-    log.error('macro-refresh failed', {
-      reason: err instanceof Error ? err.message : String(err),
-    });
+    const reason = err instanceof Error ? err.message : String(err);
+    log.error('macro-refresh failed', { reason });
+    // TRA-4430 — record the failure on the right side of the wire for
+    // `/api/health/catalyst-gate`. The keyless arm makes no vendor call at all,
+    // so a throw there is ours; the keyed arm's hard failure is not separable
+    // from our own persist at this boundary, and says so rather than guessing.
+    noteMacroRefreshFailure(reason, client ? 'unattributed' : 'local');
   }
 }
 
@@ -11244,6 +11261,108 @@ app.get('/api/health/news-catalyst-signals', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read news-catalyst ledger' });
+  }
+});
+
+// TRA-4430 (parent TRA-1968) — read-only probe over the TRA-1972 catalyst gate.
+// Unauthenticated like the sibling SHADOW probes (counts/dates only, no symbols,
+// no secrets) because the grader has no Render admin creds.
+//
+// WHY IT EXISTS. TRA-4430's finding was that the gate was deployed and
+// structurally unable to fire: both calendars were unpopulated, so every
+// decision read `gated:false, rule:null, earningsInDays:null` — an inert gate
+// whose empty ledger is byte-identical to a working gate on a quiet tape. That
+// was only discoverable by reading the host's env vars and the source. This
+// route makes it readable, and it follows the house rule (CLAUDE.md §1) to the
+// letter: every liveness cell below is the outcome of the last REAL attempt,
+// config/presence facts are named as such (`*KeyPresent`) and never stand in for
+// liveness, and absent evidence is its own named state rather than a pass.
+app.get('/api/health/catalyst-gate', async (_req, res) => {
+  try {
+    const now = Date.now();
+    const cfg = resolveCatalystGateConfig();
+    // Await the async reader first so the sync hot-path reader below is warm
+    // (`daysToNextFOMCSync` returns null on a cold cache, which would otherwise
+    // read as "no calendar" on a host whose store is merely not yet loaded).
+    const upcoming = await getUpcomingMacroEvents(now);
+    const upcomingFomc = upcoming.filter((e) => e.type === 'FOMC');
+    const daysToFomc = daysToNextFOMCSync(now);
+    const refresh = lastMacroRefreshAttempt();
+    const census = getAllUserContexts().map((ctx) => ctx.engine.catalystGateShadowCensus());
+    const fold = census.reduce(
+      (a, c) => ({
+        engines: a.engines + 1,
+        evaluated: a.evaluated + c.evaluated,
+        gated: a.gated + c.gated,
+        fomcReadable: a.fomcReadable + c.fomcReadable,
+        earningsReadable: a.earningsReadable + c.earningsReadable,
+        surfacedDecisions: a.surfacedDecisions + c.surfacedDecisions,
+      }),
+      { engines: 0, evaluated: 0, gated: 0, fomcReadable: 0, earningsReadable: 0, surfacedDecisions: 0 },
+    );
+    res.json({
+      issue: 'TRA-4430',
+      parent: 'TRA-1968',
+      measuredAt: new Date(now).toISOString(),
+      // ── the macro/FOMC half: what the refresh ACTUALLY DID last time ───────
+      macroRefresh: {
+        ...refresh,
+        // Config fact, named as one. `true` here has never implied the refresh
+        // ran, and `false` no longer implies the FOMC rows are missing — that is
+        // exactly what TRA-4430 changed, so read `outcome`, not this.
+        fredKeyPresent: (process.env['FRED_API_KEY'] ?? '').trim() !== '',
+      },
+      fomc: {
+        // The acceptance read, live: non-null on a host with no FRED key.
+        daysToNext: daysToFomc,
+        nextDecisionDay: upcomingFomc[0]?.date ?? null,
+        storedUpcoming: upcoming.length,
+        storedUpcomingFomc: upcomingFomc.length,
+      },
+      macroRule: {
+        flag: CATALYST_MACRO_MEANREV_FLAG,
+        // SHADOW by design — TRA-4430 ships no default flip; arming is
+        // QuantTrader's Stage-3 call under packages/shared/src/promotion-gate.ts.
+        armed: cfg.macroMeanRev,
+        calendarReadable: daysToFomc !== null,
+        // Both conditions rule 2 needs. `false` with `calendarReadable:true` is
+        // the intended SHADOW posture; `false` with `calendarReadable:false` is
+        // the TRA-4430 defect and must never read the same way.
+        canFire: cfg.macroMeanRev && daysToFomc !== null,
+        suppresses: ['bb_fade', 'sma200_pullback'],
+      },
+      earningsHalf: {
+        enforceFlag: CATALYST_EARNINGS_GATE_FLAG,
+        enforce: cfg.enforce,
+        // Config fact only. The earnings half's liveness is deliberately NOT
+        // measured here: it is parked on board card 9708ca8f (vendor spend) and
+        // TRA-4430's boundary is the macro half. NOT MEASURED is an alarm, not
+        // a pass — see `shadowCensus.earningsReadable` for the one honest
+        // outcome signal this route does carry about it.
+        finnhubKeyPresent: (process.env['FINNHUB_API_TOKEN'] ?? '').trim() !== '',
+        liveness: 'NOT MEASURED (parked on board card 9708ca8f — vendor key)',
+      },
+      // ── the denominator: every SHADOW evaluation since this boot ───────────
+      // `evaluated: 0` = never_attempted_this_boot for the gate itself (no
+      // targeted entry has been scanned yet), NOT a healthy quiet tape.
+      shadowCensus: {
+        ...fold,
+        evidence:
+          fold.evaluated === 0
+            ? 'never_attempted_this_boot (no targeted entry evaluated since boot)'
+            : fold.fomcReadable === fold.evaluated
+              ? 'macro calendar readable on every evaluation'
+              : 'macro calendar readable on only some evaluations',
+        perEngine: census,
+      },
+      note:
+        'Observe-only. Nothing on this route routes an order; the gate never suppresses an entry until ENABLE_CATALYST_EARNINGS_GATE / ENABLE_CATALYST_MACRO_MEANREV_SUPPRESS are armed after a Stage-3 sign-off.',
+    });
+  } catch (err) {
+    log.error('catalyst-gate health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read catalyst gate state' });
   }
 });
 

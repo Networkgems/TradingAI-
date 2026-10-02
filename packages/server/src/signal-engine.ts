@@ -4022,12 +4022,36 @@ export class SignalEngine {
   private supertrendShadowSignals: TradeSignal[] = [];
   /**
    * TRA-1972 (D1 of TRA-1968) — ring buffer of the most recent catalyst
-   * earnings/macro proximity SHADOW decisions (both gated and clear), surfaced
-   * on EngineState.catalystGateShadowDecisions so QuantTrader can eyeball what
+   * earnings/macro proximity SHADOW decisions, surfaced on
+   * EngineState.catalystGateShadowDecisions so QuantTrader can eyeball what
    * WOULD get gated on the live path before any live suppression is armed.
    * Observe-only: appended by {@link evaluateCatalystGateShadow}; never routes.
+   *
+   * ⚠️ Only **gated** decisions land here (see {@link evaluateCatalystGateShadow}) —
+   * the docstring used to claim "both gated and clear", which it never was. So an
+   * empty buffer reads identically whether the gate evaluated nothing or evaluated
+   * thousands of entries and cleared them all. {@link catalystGateShadowCensus}
+   * is the denominator that tells those two apart (TRA-4430).
    */
   private catalystGateShadowDecisions: CatalystGateDecision[] = [];
+  /**
+   * TRA-4430 — process-local census over EVERY catalyst-gate SHADOW evaluation,
+   * gated or clear. The ring buffer above is the gated numerator only; without a
+   * denominator an inert gate and a quiet one are indistinguishable — which is
+   * the whole TRA-4430 finding. `fomcReadable`/`earningsReadable` count the
+   * evaluations whose calendar read came back non-null, i.e. the ones where the
+   * corresponding rule was *able* to fire. Resets on reboot.
+   */
+  private catalystGateShadowStats = {
+    evaluated: 0,
+    gated: 0,
+    byRule: { earnings_swing: 0, earnings_intraday: 0, macro_meanrev: 0 } as Record<string, number>,
+    fomcReadable: 0,
+    earningsReadable: 0,
+    firstEvaluatedAt: null as number | null,
+    lastEvaluatedAt: null as number | null,
+    lastDaysToFomc: null as number | null,
+  };
   /**
    * TRA-4626 — latest swing signal candidates from the fusion engine, surfaced
    * on EngineState.swingSignals. Observe-only until graduation gates pass.
@@ -7878,6 +7902,22 @@ export class SignalEngine {
       asOf,
       config: resolveCatalystGateConfig(),
     });
+    // TRA-4430 — census EVERY evaluation, not just the gated ones, so
+    // `/api/health/catalyst-gate` can report a denominator beside the ring
+    // buffer's numerator and an inert calendar cannot read as a quiet tape.
+    const st = this.catalystGateShadowStats;
+    st.evaluated += 1;
+    st.firstEvaluatedAt ??= asOf;
+    st.lastEvaluatedAt = asOf;
+    if (decision.daysToFomc !== null) {
+      st.fomcReadable += 1;
+      st.lastDaysToFomc = decision.daysToFomc;
+    }
+    if (decision.earningsInDays !== null) st.earningsReadable += 1;
+    if (decision.gated) {
+      st.gated += 1;
+      if (decision.rule) st.byRule[decision.rule] = (st.byRule[decision.rule] ?? 0) + 1;
+    }
     if (decision.gated) {
       signal.catalystGateShadowReason = decision.reason ?? undefined;
       catalystGateLog.info('catalyst gate SHADOW decision (observe-only, not routed)', {
@@ -7900,6 +7940,41 @@ export class SignalEngine {
       }
     }
     return decision;
+  }
+
+  /**
+   * TRA-4430 — redacted, per-engine census of the TRA-1972 SHADOW gate's
+   * evaluations for the unauthenticated `/api/health/catalyst-gate` probe.
+   * Counts and timestamps only: no symbols, no strategies-per-symbol, nothing
+   * position-bearing, matching the sibling open probes. Process-local — it
+   * resets on reboot, so read `evaluated: 0` as "no targeted entry has been
+   * evaluated since this boot", never as "the gate is broken".
+   */
+  catalystGateShadowCensus(): {
+    engineMode: string;
+    evaluated: number;
+    gated: number;
+    byRule: Record<string, number>;
+    fomcReadable: number;
+    earningsReadable: number;
+    firstEvaluatedAt: string | null;
+    lastEvaluatedAt: string | null;
+    lastDaysToFomc: number | null;
+    surfacedDecisions: number;
+  } {
+    const st = this.catalystGateShadowStats;
+    return {
+      engineMode: this.mode,
+      evaluated: st.evaluated,
+      gated: st.gated,
+      byRule: { ...st.byRule },
+      fomcReadable: st.fomcReadable,
+      earningsReadable: st.earningsReadable,
+      firstEvaluatedAt: st.firstEvaluatedAt === null ? null : new Date(st.firstEvaluatedAt).toISOString(),
+      lastEvaluatedAt: st.lastEvaluatedAt === null ? null : new Date(st.lastEvaluatedAt).toISOString(),
+      lastDaysToFomc: st.lastDaysToFomc,
+      surfacedDecisions: this.catalystGateShadowDecisions.length,
+    };
   }
 
   /**
