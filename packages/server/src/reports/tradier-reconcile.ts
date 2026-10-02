@@ -409,27 +409,63 @@ function fifoRealizedOptionCloses(
  * yields a realized figure that is wrong in both magnitude and sign, and it
  * looks exactly like a correct one.
  *
- * Attribution is by SYMBOL TOKEN against the tickers actually on the tape
- * (`"REVERSE SPLIT - TDIC"` → `TDIC`), never by matching the phrase: the
- * description text is the broker's, undocumented, and free to change, and a
- * phrase filter that stops matching goes silently vacuous — TRA-2864's whole
- * lesson. Tokenising and intersecting with known tickers can only ever fail in
- * the safe direction, because of what happens next:
+ * Attribution is by TOKEN against what is actually on the tape, never by
+ * matching the broker's phrase: the description text is the broker's,
+ * undocumented, and free to change, and a phrase filter that stops matching
+ * goes silently vacuous — TRA-2864's whole lesson. There are TWO token axes,
+ * and the second one is why this function exists in its current shape:
+ *
+ *  1. **Ticker.** `"REVERSE SPLIT - TDIC"` → `TDIC`. The shape this function
+ *     was written for, and the shape the board's `activity.csv` export carries.
+ *  2. **Company name** (TRA-5017). `" reverse split DREAMLAND LIMITED"` →
+ *     `TDIC`, because TDIC's own equity fills on the same tape read
+ *     `description: "DREAMLAND LIMITED"`.
+ *
+ * Axis 2 is not a nicety. Measured against the live Tradier production account
+ * on 2026-10-01 and re-read 2026-10-02: **`/accounts/{id}/history` names the
+ * COMPANY, never the ticker**, on both the action row and the equity fill rows.
+ * So the account's one real corporate action scored **0 ticker candidates** on
+ * every pass since TRA-2876 shipped, took the global arm below, and withheld
+ * this account's entire equity sleeve — for 3½ months, invisibly, and (because
+ * `monthsBack` defaults to 24) until roughly 2028-07. The docblock's own worked
+ * example was a shape this broker does not serve.
+ *
+ * Two constraints on axis 2, both load-bearing:
+ *
+ *  • **Subset containment, never any-single-token.** `IREN LIMITED` is on the
+ *    same tape as `DREAMLAND LIMITED`; a single-token rule matches both on
+ *    `LIMITED`, scores 2 candidates and (correctly, but uselessly) keeps
+ *    withholding everything. `{DREAMLAND, LIMITED} ⊆ tokens` while
+ *    `{IREN, LIMITED} ⊄ tokens`.
+ *  • **Two tokens minimum on the name axis.** A one-token "name" carries no
+ *    more information than the ticker axis already has, and if that one token
+ *    were a word the broker itself uses (`SPLIT`, `REORGANIZATION`) it would
+ *    pin the action to the WRONG symbol with exactly one candidate — the only
+ *    direction that writes a number instead of withholding one.
+ *
+ * Both axes can therefore only ever fail in the safe direction, because of what
+ * happens next:
  *
  * **An action we cannot attribute to a symbol withholds ALL equity.** Not the
  * one symbol we guessed at, not nothing at all. If a corporate action is in the
  * window and we cannot say which ticker it hit, then every equity lot book in
  * that window is suspect and none of them may be booked. That is the failure
  * direction that costs 80 cents of visible reconciliation instead of
- * manufacturing a plausible wrong number nobody can see is wrong.
+ * manufacturing a plausible wrong number nobody can see is wrong. Widening the
+ * match may only ever NARROW that withhold: 0 or ≥2 candidates still takes it.
  *
  * Returns the symbols to exclude plus the unattributable actions, so the caller
- * can SAY which it withheld and why rather than quietly reporting less.
+ * can SAY which it withheld and why rather than quietly reporting less. The
+ * per-symbol reason names the axis that matched, so a future broker-side rename
+ * shows up as an axis flip in the log rather than as silence.
  */
 export interface EquityCorporateActionScope {
   /** Equity tickers to drop from the matcher entirely. */
   excludeSymbols: Set<string>;
-  /** True when an action could not be pinned to a ticker ⇒ withhold ALL equity. */
+  /**
+   * True when an action could not be pinned to exactly one symbol — on either
+   * the ticker axis or the company-name axis (TRA-5017) ⇒ withhold ALL equity.
+   */
   withholdAllEquity: boolean;
   /** Human-readable reasons, for the report header / logs. Never empty when withholding. */
   reasons: string[];
@@ -439,32 +475,60 @@ export function equitySymbolsInvalidatedByCorporateActions(
   actions: readonly { date: string; type: string; description: string; quantity: number }[],
   fills: readonly TradierTradeHistoryFill[],
 ): EquityCorporateActionScope {
-  const tickers = new Set(
-    fills.filter(f => f.tradeType === 'equity').map(f => f.symbol.toUpperCase()),
-  );
+  const tokenize = (text: string): string[] =>
+    (text ?? '')
+      .toUpperCase()
+      .split(/[^A-Z0-9.]+/)
+      .filter(Boolean);
+
+  const equityFills = fills.filter(f => f.tradeType === 'equity');
+  const tickers = new Set(equityFills.map(f => f.symbol.toUpperCase()));
+
+  // TRA-5017 — the NAME axis, built from the tape itself so no company-name list
+  // is ever hard-coded. Tokens are UNIONED per symbol: a symbol filled under two
+  // different descriptions ends up with MORE tokens, and a match needs ALL of
+  // them, so union can only make attribution harder — the safe direction.
+  const nameTokensBySymbol = new Map<string, Set<string>>();
+  for (const fill of equityFills) {
+    const symbol = fill.symbol.toUpperCase();
+    const nameTokens = nameTokensBySymbol.get(symbol) ?? new Set<string>();
+    for (const token of tokenize(fill.description)) nameTokens.add(token);
+    nameTokensBySymbol.set(symbol, nameTokens);
+  }
+
   const excludeSymbols = new Set<string>();
   const reasons: string[] = [];
   let withholdAllEquity = false;
   for (const action of actions) {
-    const tokens = new Set(
-      (action.description ?? '')
-        .toUpperCase()
-        .split(/[^A-Z0-9.]+/)
-        .filter(Boolean),
-    );
-    const hits = [...tickers].filter(t => tokens.has(t));
+    const tokens = new Set(tokenize(action.description));
+    const byTicker = [...tickers].filter(t => tokens.has(t));
+    const byName = [...nameTokensBySymbol]
+      .filter(([, nameTokens]) => {
+        if (nameTokens.size < 2) return false; // see docblock: 2-token minimum
+        for (const token of nameTokens) if (!tokens.has(token)) return false;
+        return true;
+      })
+      .map(([symbol]) => symbol);
+    const hits = [...new Set([...byTicker, ...byName])];
     if (hits.length === 1) {
+      const axis =
+        byTicker.includes(hits[0]) && byName.includes(hits[0])
+          ? 'ticker+name'
+          : byTicker.includes(hits[0])
+            ? 'ticker'
+            : 'company name';
       excludeSymbols.add(hits[0]);
       reasons.push(
-        `${hits[0]} withheld: ${action.type} moved ${action.quantity} shares on ${action.date} with no trade row`,
+        `${hits[0]} withheld: ${action.type} moved ${action.quantity} shares on ${action.date} with no trade row (attributed by ${axis})`,
       );
       continue;
     }
-    // Zero hits (description carries no ticker we know) or several (ambiguous):
-    // either way we cannot scope the damage, so we withhold the whole sleeve.
+    // Zero hits (the description carries neither a ticker nor a company name we
+    // know) or several (ambiguous): either way we cannot scope the damage, so we
+    // withhold the whole sleeve.
     withholdAllEquity = true;
     reasons.push(
-      `all equity withheld: ${action.type} moved ${action.quantity} shares on ${action.date} and could not be attributed to a ticker (${hits.length} candidates)`,
+      `all equity withheld: ${action.type} moved ${action.quantity} shares on ${action.date} and could not be attributed to a ticker or company name (${hits.length} candidates)`,
     );
   }
   return { excludeSymbols, withholdAllEquity, reasons };

@@ -8,6 +8,21 @@
 // the fixture: a synthetic tape written by hand always has the prefix, which is
 // why every unit test passed while the live account booked nothing.
 //
+// ⛔ TRA-5017, 2026-10-02 -- the sentence above was FALSE for the 18 equity rows,
+// and the gap was load-bearing. The board's CSV prints the TICKER in the
+// description column for a stock row (`description: 'TDIC'`), while
+// `GET /accounts/{id}/history` -- the read the live pass actually performs --
+// returns the COMPANY NAME (`description: 'DREAMLAND LIMITED'`). So the one
+// column a corporate-action attributor has to match on was the one column the
+// fixture did not reproduce, and the live global equity withhold was invisible
+// to every test in this repo for 3½ months.
+//
+// The 18 equity `description` values are now the API's, re-read read-only from
+// the live production account on 2026-10-02 (251 events, 18 equity trade rows --
+// the same 18 rows, same dates, same quantities, same amounts, one column
+// corrected). The 71 option rows are untouched. If you regenerate this fixture,
+// generate it from `/accounts/{id}/history`, not from the CSV.
+//
 // The expectations below are Tradier's OWN gain/loss report (`gainloss.csv`,
 // same upload) -- an independently computed second source, not our own output
 // snapshotted back at us.
@@ -43,7 +58,7 @@ export const LIVE_TRADIER_TAPE: TradierTradeHistoryFill[] = [
   { date: '2026-06-17', symbol: 'MSFT260821C00480000', tradeType: 'option', description: 'MSFT Aug 21, 2026 $480.00 Call', price: 4.1, quantity: 1, amount: -410.11, commission: 0, transactionId: 'tx-024', orderId: null },
   { date: '2026-06-16', symbol: 'TSLA260717P00210000', tradeType: 'option', description: 'TSLA Jul 17, 2026 $210.00 Put', price: 0.2, quantity: 4, amount: 79.53, commission: 0, transactionId: 'tx-025', orderId: null },
   { date: '2026-06-16', symbol: 'PSKY260731C00010500', tradeType: 'option', description: 'PSKY Jul 31, 2026 $10.50 Call', price: 0.79, quantity: 2, amount: -158.23, commission: 0, transactionId: 'tx-026', orderId: null },
-  { date: '2026-06-16', symbol: 'MIR', tradeType: 'equity', description: 'MIR', price: 17.47, quantity: 1, amount: 17.44, commission: 0, transactionId: 'tx-027', orderId: null },
+  { date: '2026-06-16', symbol: 'MIR', tradeType: 'equity', description: 'MIRION TECHNOLOGIES INC', price: 17.47, quantity: 1, amount: 17.44, commission: 0, transactionId: 'tx-027', orderId: null },
   { date: '2026-06-16', symbol: 'SPY260617P00752000', tradeType: 'option', description: 'SPY Jun 17, 2026 $752.00 Put', price: 1.54, quantity: 1, amount: 153.87, commission: 0, transactionId: 'tx-028', orderId: null },
   { date: '2026-06-15', symbol: 'SPY260617P00752000', tradeType: 'option', description: 'SPY Jun 17, 2026 $752.00 Put', price: 2.42, quantity: 1, amount: -242.11, commission: 0, transactionId: 'tx-029', orderId: null },
   { date: '2026-06-15', symbol: 'HOOD260626C00100000', tradeType: 'option', description: 'HOOD Jun 26, 2026 $100.00 Call', price: 3.84, quantity: 1, amount: -384.11, commission: 0, transactionId: 'tx-030', orderId: null },
@@ -51,7 +66,7 @@ export const LIVE_TRADIER_TAPE: TradierTradeHistoryFill[] = [
   { date: '2026-06-15', symbol: 'HOOD260626C00100000', tradeType: 'option', description: 'HOOD Jun 26, 2026 $100.00 Call', price: 5.1, quantity: 1, amount: 509.86, commission: 0, transactionId: 'tx-032', orderId: null },
   { date: '2026-06-12', symbol: 'META260717P00450000', tradeType: 'option', description: 'META Jul 17, 2026 $450.00 Put', price: 0.96, quantity: 1, amount: 95.87, commission: 0, transactionId: 'tx-033', orderId: null },
   { date: '2026-06-12', symbol: 'AAPL260717C00310000', tradeType: 'option', description: 'AAPL Jul 17, 2026 $310.00 Call', price: 2.28, quantity: 1, amount: 227.87, commission: 0, transactionId: 'tx-034', orderId: null },
-  { date: '2026-06-12', symbol: 'MIR', tradeType: 'equity', description: 'MIR', price: 16.63, quantity: 1, amount: -16.64, commission: 0, transactionId: 'tx-035', orderId: null },
+  { date: '2026-06-12', symbol: 'MIR', tradeType: 'equity', description: 'MIRION TECHNOLOGIES INC', price: 16.63, quantity: 1, amount: -16.64, commission: 0, transactionId: 'tx-035', orderId: null },
   { date: '2026-06-12', symbol: 'RKLB260717C00210000', tradeType: 'option', description: 'RKLB Jul 17, 2026 $210.00 Call', price: 0.75, quantity: 1, amount: 74.87, commission: 0, transactionId: 'tx-036', orderId: null },
   { date: '2026-06-11', symbol: 'META260717P00450000', tradeType: 'option', description: 'META Jul 17, 2026 $450.00 Put', price: 1.28, quantity: 1, amount: -128.11, commission: 0, transactionId: 'tx-037', orderId: null },
   { date: '2026-06-11', symbol: 'GOOGL260717P00285000', tradeType: 'option', description: 'GOOGL Jul 17, 2026 $285.00 Put', price: 0.89, quantity: 1, amount: 88.87, commission: 0, transactionId: 'tx-038', orderId: null },
@@ -65,29 +80,29 @@ export const LIVE_TRADIER_TAPE: TradierTradeHistoryFill[] = [
   { date: '2026-06-10', symbol: 'TSLA260717P00245000', tradeType: 'option', description: 'TSLA Jul 17, 2026 $245.00 Put', price: 0.78, quantity: 1, amount: -78.11, commission: 0, transactionId: 'tx-046', orderId: null },
   { date: '2026-06-09', symbol: 'CHWY260612P00018500', tradeType: 'option', description: 'CHWY Jun 12, 2026 $18.50 Put', price: 0.33, quantity: 2, amount: 65.75, commission: 0, transactionId: 'tx-047', orderId: null },
   { date: '2026-06-09', symbol: 'MSFT260717C00550000', tradeType: 'option', description: 'MSFT Jul 17, 2026 $550.00 Call', price: 0.21, quantity: 2, amount: 41.75, commission: 0, transactionId: 'tx-048', orderId: null },
-  { date: '2026-06-09', symbol: 'CIFR', tradeType: 'equity', description: 'CIFR', price: 23.85, quantity: 1, amount: 23.82, commission: 0, transactionId: 'tx-049', orderId: null },
-  { date: '2026-06-09', symbol: 'IREN', tradeType: 'equity', description: 'IREN', price: 60.64, quantity: 1, amount: -60.65, commission: 0, transactionId: 'tx-050', orderId: null },
-  { date: '2026-06-09', symbol: 'CIFR', tradeType: 'equity', description: 'CIFR', price: 25.12, quantity: 1, amount: -25.13, commission: 0, transactionId: 'tx-051', orderId: null },
+  { date: '2026-06-09', symbol: 'CIFR', tradeType: 'equity', description: 'CIPHER DIGITAL INC', price: 23.85, quantity: 1, amount: 23.82, commission: 0, transactionId: 'tx-049', orderId: null },
+  { date: '2026-06-09', symbol: 'IREN', tradeType: 'equity', description: 'IREN LIMITED', price: 60.64, quantity: 1, amount: -60.65, commission: 0, transactionId: 'tx-050', orderId: null },
+  { date: '2026-06-09', symbol: 'CIFR', tradeType: 'equity', description: 'CIPHER DIGITAL INC', price: 25.12, quantity: 1, amount: -25.13, commission: 0, transactionId: 'tx-051', orderId: null },
   { date: '2026-06-09', symbol: 'RKLB260717C00210000', tradeType: 'option', description: 'RKLB Jul 17, 2026 $210.00 Call', price: 1.11, quantity: 1, amount: 110.87, commission: 0, transactionId: 'tx-052', orderId: null },
-  { date: '2026-06-09', symbol: 'INTC', tradeType: 'equity', description: 'INTC', price: 110.3, quantity: 1, amount: 110.27, commission: 0, transactionId: 'tx-053', orderId: null },
-  { date: '2026-06-09', symbol: 'TDIC', tradeType: 'equity', description: 'TDIC', price: 0.3947, quantity: 5, amount: -1.98, commission: 0, transactionId: 'tx-054', orderId: null },
+  { date: '2026-06-09', symbol: 'INTC', tradeType: 'equity', description: 'INTEL CORP', price: 110.3, quantity: 1, amount: 110.27, commission: 0, transactionId: 'tx-053', orderId: null },
+  { date: '2026-06-09', symbol: 'TDIC', tradeType: 'equity', description: 'DREAMLAND LIMITED', price: 0.3947, quantity: 5, amount: -1.98, commission: 0, transactionId: 'tx-054', orderId: null },
   { date: '2026-06-09', symbol: 'RIOT260618C00025000', tradeType: 'option', description: 'RIOT Jun 18, 2026 $25.00 Call', price: 2.7, quantity: 1, amount: 269.87, commission: 0, transactionId: 'tx-055', orderId: null },
-  { date: '2026-06-09', symbol: 'GM', tradeType: 'equity', description: 'GM', price: 83.7, quantity: 1, amount: 83.67, commission: 0, transactionId: 'tx-056', orderId: null },
+  { date: '2026-06-09', symbol: 'GM', tradeType: 'equity', description: 'GENERAL MOTORS COMPANY', price: 83.7, quantity: 1, amount: 83.67, commission: 0, transactionId: 'tx-056', orderId: null },
   { date: '2026-06-09', symbol: 'MSFT260717C00550000', tradeType: 'option', description: 'MSFT Jul 17, 2026 $550.00 Call', price: 0.24, quantity: 1, amount: 23.87, commission: 0, transactionId: 'tx-057', orderId: null },
-  { date: '2026-06-09', symbol: 'IREN', tradeType: 'equity', description: 'IREN', price: 58.28, quantity: 1, amount: 58.25, commission: 0, transactionId: 'tx-058', orderId: null },
+  { date: '2026-06-09', symbol: 'IREN', tradeType: 'equity', description: 'IREN LIMITED', price: 58.28, quantity: 1, amount: 58.25, commission: 0, transactionId: 'tx-058', orderId: null },
   { date: '2026-06-09', symbol: 'CHWY260612P00018500', tradeType: 'option', description: 'CHWY Jun 12, 2026 $18.50 Put', price: 0.22, quantity: 2, amount: 43.75, commission: 0, transactionId: 'tx-059', orderId: null },
-  { date: '2026-06-09', symbol: 'GM', tradeType: 'equity', description: 'GM', price: 84.32, quantity: 1, amount: -84.33, commission: 0, transactionId: 'tx-060', orderId: null },
-  { date: '2026-06-09', symbol: 'INTC', tradeType: 'equity', description: 'INTC', price: 112.36, quantity: 1, amount: -112.37, commission: 0, transactionId: 'tx-061', orderId: null },
-  { date: '2026-06-09', symbol: 'RKLB', tradeType: 'equity', description: 'RKLB', price: 115.61, quantity: 1, amount: -115.62, commission: 0, transactionId: 'tx-062', orderId: null },
-  { date: '2026-06-09', symbol: 'RKLB', tradeType: 'equity', description: 'RKLB', price: 111.75, quantity: 1, amount: 111.72, commission: 0, transactionId: 'tx-063', orderId: null },
+  { date: '2026-06-09', symbol: 'GM', tradeType: 'equity', description: 'GENERAL MOTORS COMPANY', price: 84.32, quantity: 1, amount: -84.33, commission: 0, transactionId: 'tx-060', orderId: null },
+  { date: '2026-06-09', symbol: 'INTC', tradeType: 'equity', description: 'INTEL CORP', price: 112.36, quantity: 1, amount: -112.37, commission: 0, transactionId: 'tx-061', orderId: null },
+  { date: '2026-06-09', symbol: 'RKLB', tradeType: 'equity', description: 'ROCKET LAB CORPORATION', price: 115.61, quantity: 1, amount: -115.62, commission: 0, transactionId: 'tx-062', orderId: null },
+  { date: '2026-06-09', symbol: 'RKLB', tradeType: 'equity', description: 'ROCKET LAB CORPORATION', price: 111.75, quantity: 1, amount: 111.72, commission: 0, transactionId: 'tx-063', orderId: null },
   { date: '2026-06-08', symbol: 'CHWY260612P00018500', tradeType: 'option', description: 'CHWY Jun 12, 2026 $18.50 Put', price: 0.36, quantity: 2, amount: -72.23, commission: 0, transactionId: 'tx-064', orderId: null },
-  { date: '2026-06-08', symbol: 'RDW', tradeType: 'equity', description: 'RDW', price: 18.65, quantity: 1, amount: 18.62, commission: 0, transactionId: 'tx-065', orderId: null },
-  { date: '2026-06-08', symbol: 'RDW', tradeType: 'equity', description: 'RDW', price: 18.77, quantity: 1, amount: -18.78, commission: 0, transactionId: 'tx-066', orderId: null },
-  { date: '2026-06-08', symbol: 'LASE', tradeType: 'equity', description: 'LASE', price: 3.3699, quantity: 2, amount: -6.75, commission: 0, transactionId: 'tx-067', orderId: null },
-  { date: '2026-06-08', symbol: 'LASE', tradeType: 'equity', description: 'LASE', price: 3.32, quantity: 2, amount: 6.61, commission: 0, transactionId: 'tx-068', orderId: null },
+  { date: '2026-06-08', symbol: 'RDW', tradeType: 'equity', description: 'REDWIRE CORPORATION', price: 18.65, quantity: 1, amount: 18.62, commission: 0, transactionId: 'tx-065', orderId: null },
+  { date: '2026-06-08', symbol: 'RDW', tradeType: 'equity', description: 'REDWIRE CORPORATION', price: 18.77, quantity: 1, amount: -18.78, commission: 0, transactionId: 'tx-066', orderId: null },
+  { date: '2026-06-08', symbol: 'LASE', tradeType: 'equity', description: 'LASER PHOTONICS CORPORATION', price: 3.3699, quantity: 2, amount: -6.75, commission: 0, transactionId: 'tx-067', orderId: null },
+  { date: '2026-06-08', symbol: 'LASE', tradeType: 'equity', description: 'LASER PHOTONICS CORPORATION', price: 3.32, quantity: 2, amount: 6.61, commission: 0, transactionId: 'tx-068', orderId: null },
   { date: '2026-06-08', symbol: 'CHWY260612P00018500', tradeType: 'option', description: 'CHWY Jun 12, 2026 $18.50 Put', price: 0.43, quantity: 2, amount: -86.23, commission: 0, transactionId: 'tx-069', orderId: null },
   { date: '2026-06-08', symbol: 'RIOT260618C00025000', tradeType: 'option', description: 'RIOT Jun 18, 2026 $25.00 Call', price: 1.51, quantity: 1, amount: -151.11, commission: 0, transactionId: 'tx-070', orderId: null },
-  { date: '2026-06-08', symbol: 'TDIC', tradeType: 'equity', description: 'TDIC', price: 0.5199, quantity: 2, amount: -1.05, commission: 0, transactionId: 'tx-071', orderId: null },
+  { date: '2026-06-08', symbol: 'TDIC', tradeType: 'equity', description: 'DREAMLAND LIMITED', price: 0.5199, quantity: 2, amount: -1.05, commission: 0, transactionId: 'tx-071', orderId: null },
   { date: '2026-06-08', symbol: 'RKLB260717C00210000', tradeType: 'option', description: 'RKLB Jul 17, 2026 $210.00 Call', price: 1.05, quantity: 1, amount: -105.11, commission: 0, transactionId: 'tx-072', orderId: null },
   { date: '2026-06-08', symbol: 'MSFT260717C00550000', tradeType: 'option', description: 'MSFT Jul 17, 2026 $550.00 Call', price: 0.43, quantity: 3, amount: -129.33, commission: 0, transactionId: 'tx-073', orderId: null },
   { date: '2026-06-04', symbol: 'NU260821C00014000', tradeType: 'option', description: 'NU Aug 21, 2026 $14.00 Call', price: 0.58, quantity: 3, amount: 173.65, commission: 0, transactionId: 'tx-074', orderId: null },
