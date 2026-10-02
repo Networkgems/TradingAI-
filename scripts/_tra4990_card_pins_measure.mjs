@@ -86,7 +86,8 @@ for (const c of cards.cards) {
     refusedByField: {},
   });
   t.total += 1;
-  pin1.total === 0;
+  // `pin1.total` is NOT counted here: it is set from `cards.cards.length` at the
+  // initializer above. (A vestigial `pin1.total === 0;` no-op sat on this line.)
   const incomplete = c.incompleteFields ?? [];
   const refused = c.refusedFields ?? [];
   for (const f of refused) t.refusedByField[f] = (t.refusedByField[f] ?? 0) + 1;

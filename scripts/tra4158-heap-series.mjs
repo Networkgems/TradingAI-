@@ -440,7 +440,9 @@ function report(rows) {
   console.log(`[tra4158] ${rows.length} rows across ${segments.length} boot(s)\n`);
   let bestPair = 0;
   for (const seg of segments) {
-    const first = seg.rows[0];
+    // No `first` here on purpose: the only thing a boot's FIRST row was used for was the
+    // whole-boot Δheap, which is deliberately refused below (a population change mid-boot
+    // makes it unquotable, TRA-4902). The per-population deltas take their own endpoints.
     const last = seg.rows[seg.rows.length - 1];
     const peakHeap = Math.max(...seg.rows.map(r => r.heapUsedMB));
     const peakRss = Math.max(...seg.rows.map(r => r.rssMB));

@@ -148,7 +148,7 @@ function gradeIndex(cwd) {
   return { verdict: 'REVERT', findings };
 }
 
-function report(result, cwd) {
+function report(result) {
   if (result.verdict === 'BLIND') blind(result.detail);
   if (result.verdict === 'CLEAN') {
     console.log(`${TAG} CLEAN — no staged path byte-matches an older ancestor of HEAD.${result.note ? ` (${result.note})` : ''}`);
@@ -276,5 +276,5 @@ if (argv.includes('--selftest')) {
   selftest();
 } else {
   const result = gradeIndex(process.cwd());
-  process.exit(report(result, process.cwd()));
+  process.exit(report(result));
 }

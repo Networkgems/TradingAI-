@@ -31,7 +31,7 @@
  */
 import { createReadStream, existsSync, readdirSync, statSync } from "node:fs";
 import { createGunzip } from "node:zlib";
-import { join, resolve, basename } from "node:path";
+import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 const PREFIX = "paperclip";
