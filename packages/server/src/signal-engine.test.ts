@@ -10703,12 +10703,15 @@ describe('TRA-4424 — the OTM setup seam reads a DAILY series, off the order pa
   // feed stall would become an entry stall on a live order path.
   //
   // ⚠️ MEASURED, NOT ASSUMED: `runOtmScan` DOES reach `fetchDailyCandles` — once
-  // per OPEN, at `OTM_DAILY_ATR_BARS = 40`, from `stampOtmAtrInvalidation`
-  // (TRA-3943). That call is POST-FILL and pre-dates this item; it is not the
-  // seam. So the assertion is not "the scan never fetches" (false, and a test
-  // written to that belief would have been a lie the first time it ran) but
-  // "no fetch happens BEFORE the taxonomy scores" — which is the property that
-  // actually keeps latency off the nomination path.
+  // per OPEN, at `MTF_DAILY_BARS = 260`, from `stampOtmAtrInvalidation`
+  // (TRA-3943; depth raised from 40 by TRA-4989, implementing the TRA-4943
+  // ruling — `atr()` smooths to the END of the series, so 40 was a contaminated
+  // read of the same 14-period average, not a shorter one). That call is
+  // POST-FILL and pre-dates this item; it is not the seam. So the assertion is
+  // not "the scan never fetches" (false, and a test written to that belief would
+  // have been a lie the first time it ran) but "no fetch happens BEFORE the
+  // taxonomy scores" — which is the property that actually keeps latency off the
+  // nomination path.
   it('the SEAM never fetches — the nominee is scored before any daily call the scan makes', async () => {
     vi.mocked(fetchDailyCandles).mockResolvedValue(bars(40, DAY_MS));
     const engine = otmEngine();
@@ -10717,11 +10720,13 @@ describe('TRA-4424 — the OTM setup seam reads a DAILY series, off the order pa
     await runOtm(engine, ['AAPL']);
 
     const calls = vi.mocked(fetchDailyCandles).mock.calls;
-    // The only daily call on this path is TRA-3943's post-fill ATR pull, at its
-    // own depth — never `OTM_DAILY_SERIES_BARS`.
-    expect(calls.every(([, n]) => n === 40)).toBe(true);
+    // The only daily call on this path is TRA-3943's post-fill ATR pull, at
+    // `MTF_DAILY_BARS` — never `OTM_DAILY_SERIES_BARS` (120), which is what the
+    // seam would request. The two depths stay distinct after TRA-4989 raised the
+    // ATR pull to 260, so this still discriminates.
+    expect(calls.every(([, n]) => n === 260)).toBe(true);
     // ⛔ AND THE VERDICT WAS COMPUTED OFF THE COLD CACHE. If the seam had
-    // fetched, this would read the 40 bars it just pulled instead.
+    // fetched, this would read the bars it just pulled instead.
     expect(lastVerdict()!.readState).toBe('absent');
     expect(lastVerdict()!.reasonCode).toBe('series_unreadable');
     expect(lastVerdict()!.bars).toBe(0);

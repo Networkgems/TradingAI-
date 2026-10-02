@@ -2373,14 +2373,6 @@ const TECHNICAL_SNAPSHOT_REFRESH_MS = 5 * 60_000;
 const TECHNICAL_COLD_SCAN_INTERVAL = 4;
 const MTF_MINUTE_BARS = 2000;
 const MTF_DAILY_BARS = 260;
-/**
- * TRA-3943 — daily bars pulled on the COLD path for the OTM sleeve's entry
- * ATR(14, daily). 40 is ATR(14)'s 15-bar floor plus a month of slack for
- * holidays and a thin provider response; deliberately far short of
- * {@link MTF_DAILY_BARS}, because this pull happens on the entry path and the
- * only thing downstream of it is a 14-period average.
- */
-const OTM_DAILY_ATR_BARS = 40;
 
 /**
  * TRA-787 — SupertrendConfluence SHADOW channel parameters.
@@ -12332,15 +12324,37 @@ export class SignalEngine {
     if (hit && hit.dayKey === dayKey) return hit.atr;
     let bars = getSharedDailyBars(sym);
     if (!bars || bars.length < 15) {
-      bars = await fetchDailyCandles(sym, OTM_DAILY_ATR_BARS).catch(() => [] as Candle[]);
+      // TRA-4989 (ruling on TRA-4943) — the cold pull is `MTF_DAILY_BARS`, the
+      // SAME depth the warm technical-snapshot path serves. This used to be its
+      // own shallower constant (40 bars, now deleted), sized on the belief
+      // that "the only thing downstream is a 14-period average". `atr()` does
+      // not slice to its period — it SEEDS on 14 true ranges and Wilder-smooths
+      // to the END of the series — so depth is a CONVERGENCE parameter, and the
+      // two paths published different ATRs for the same symbol on the same day.
+      // Measured over the live 100-symbol universe (n=99, 2026-10-02): the
+      // 40-bar read deviated a median 1.90% / max 25.76% from the converged
+      // read, 85 of 99 names TIGHTER — i.e. the cold path put the invalidation
+      // level closer to entry than the warm path on 86% of the book. At depth 40
+      // a flat 15.68% of the published ATR is still the 14-bar simple seed from
+      // 27–40 sessions back, which also makes the number irreproducible: one bar
+      // of provider-window difference moves the median read up to ~1.1pp. The
+      // latency argument for the shallower pull was about ROUND TRIPS, and it is
+      // the same ONE `yf.chart` call at either depth — the delta is ~220 extra
+      // daily rows (single-digit KB) on a path that already waits on a broker.
+      // If this sleeve ever wants a genuinely shorter-memory ATR the knob is
+      // `period`, not the pull depth.
+      bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
     }
     if (bars.length >= 15) {
-      // Deepest-or-equal-wins, so this cold `OTM_DAILY_ATR_BARS` pull cannot
-      // clobber the deeper `MTF_DAILY_BARS` series the technical-snapshot pass
-      // maintains. When the write IS refused the ATR has to be taken off the
-      // series the store kept, not off the shallower local pull — otherwise the
-      // number published here would still depend on which writer ran last, which
-      // is the write-order dependence the shared store exists to remove.
+      // Deepest-or-equal-wins. Both writers now pull at `MTF_DAILY_BARS`, so
+      // this is a plain no-op rather than a tiebreak between two legitimate
+      // depths — which is the strictly simpler invariant to keep true, and the
+      // reason the second constant was deleted instead of retargeted. The rule
+      // still has to be obeyed: when a write IS refused (a short provider
+      // response), the ATR has to be taken off the series the store kept, not
+      // off the shallower local pull — otherwise the number published here would
+      // again depend on which writer ran last, which is the write-order
+      // dependence the shared store exists to remove.
       setSharedDailyBars(sym, bars);
       bars = getSharedDailyBars(sym) ?? bars;
     }
@@ -16906,11 +16920,16 @@ export class SignalEngine {
    *     `refreshTechnicalSnapshot` (active interest, with a cold sweep every 4th
    *     cycle) and, failing that, by an ON-DEMAND fetch inside `otmDailyAtr` —
    *     which runs POST-FILL, only for symbols that already opened.
-   *  3. DEPTH. The cold path pulls `OTM_DAILY_ATR_BARS = 40`, below
-   *     `SETUP_TAXONOMY_MIN_BARS = 60`, because the only thing downstream of it
-   *     is a 14-period average. A taxonomy reading that cache would find some
-   *     symbols readable and others not for reasons having nothing to do with
-   *     the market.
+   *  3. DEPTH IS NOT GUARANTEED, AND THAT IS THE POINT. Both of its writers now
+   *     request `MTF_DAILY_BARS` (260) — the cold ATR path included, since
+   *     TRA-4989 — so depth is no longer systematically below
+   *     `SETUP_TAXONOMY_MIN_BARS = 60` the way the old 40-bar cold pull was. But
+   *     the store holds whatever the PROVIDER returned, not what was requested,
+   *     and it has no floor: a thin reply on a newly-listed or illiquid name
+   *     lands at whatever depth it lands at. A taxonomy reading that cache would
+   *     still find some symbols readable and others not for reasons having
+   *     nothing to do with the market — the difference is that the shortfall is
+   *     now per-symbol and silent rather than uniform and predictable.
    *
    * Reusing its 260-bar snapshot-path pull as a free side-fill is a real
    * optimisation and is deliberately NOT taken here: it would put a second

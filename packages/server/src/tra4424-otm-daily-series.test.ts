@@ -549,7 +549,8 @@ describe('TRA-4424 — the refresh is wired OFF the order path', () => {
   //
   // ⚠️ The claim is scoped, because the unscoped version is FALSE and was
   // measured to be: `runOtmScan` reaches `fetchDailyCandles` once per OPEN via
-  // `stampOtmAtrInvalidation` (TRA-3943, `OTM_DAILY_ATR_BARS = 40`). That call
+  // `stampOtmAtrInvalidation` (TRA-3943, at `MTF_DAILY_BARS = 260` — raised from
+  // its own 40-bar constant by TRA-4989, which deleted that constant). That call
   // is POST-FILL and pre-dates this item. What must stay true is that the
   // SETUP SEAM adds no fetch and does not trigger the refresh.
   it('the seam adds NO fetch to `runOtmScan`, and the scan never calls the refresh', () => {
