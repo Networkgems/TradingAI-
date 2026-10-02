@@ -2838,6 +2838,94 @@ export interface OptionProfitLockFire {
 }
 
 /**
+ * TRA-4991 (AC1, parent TRA-4945) — the UNDERLYING-space ATR chandelier's own
+ * inputs at the tick it chose to exit, stamped at the fire and folded onto the
+ * journal close row. Same contract as `OptionProfitLockFire`: first fire only,
+ * absent ⇔ no chandelier fire on this build, ⛔ never backfilled.
+ *
+ * ── Why this type exists ────────────────────────────────────────────────────
+ *
+ * Every published field about a chandelier close is in PREMIUM space
+ * (`peakPremium`, `entryBasisPremium`, `mae.*`, `stopBasisPremium`) and the
+ * chandelier decides in SPOT space. TRA-4945 was asked which condition stamped
+ * `exitReason: "chandelier"` on a 197-second zero-excursion close and could
+ * only answer by reading source bytes against the deployed commit, because a
+ * reader seeing `peakPremium == entryBasisPremium` and `mae.frac == 0`
+ * reasonably concludes "a trailing stop fired with no trail". The trail was
+ * real; it was in a space nothing published.
+ *
+ * ⛔ ABSENT, NEVER ZEROED, on a row the chandelier never armed. A `0` ATR reads
+ * as "no volatility" rather than "not measured", and the two license opposite
+ * conclusions about the same close.
+ */
+export interface OptionChandelierFire {
+  /** ms epoch of the tick the trail chose to exit. */
+  at: number;
+  /**
+   * The journal label this fire stamped — the TRA-3217 provenance split
+   * (`chandelier` · `chandelier_spot_seeded` · `chandelier_restarted` ·
+   * `chandelier_daily_close` · `chandelier_deferred_breach`). Carried HERE as
+   * well as on the row's `exitReason` so a supersede that relabels the row
+   * leaves the trail's own account of itself intact.
+   */
+  exitReason: string;
+  /**
+   * The side the trail ran on the UNDERLYING: `buy` for a call (trail the
+   * highest high), `sell` for a put (trail the lowest low). ⚠ Not the option
+   * side — the book is always LONG the premium.
+   */
+  side: 'buy' | 'sell';
+  /** `peakUnderlying` — the favorable extreme the stop was computed from. */
+  peakUnderlying: number;
+  /** When that extreme was last advanced by a print; `null` if it never moved off its seed. */
+  peakUnderlyingAt: number | null;
+  /** `chandelierStop` — the trail level, in SPOT terms, that the breach crossed. */
+  chandelierStop: number;
+  /** The spot compared against the stop on the firing tick. */
+  spotAtFire: number;
+  /**
+   * `underlyingEntryPrice` as the row carries it. ⚠ `0` is a ROUTINE state, not
+   * corruption: `reconcileTradierPositions` has no spot to seed it from on a
+   * `tradier_import` row, and the OTM/RV open paths fall back to `0` when the
+   * scanner's spot is missing (TRA-2893). A `0` here with
+   * `trailNote: 'spot_seeded'` is the documented pair.
+   */
+  underlyingEntryPrice: number;
+  /** The ATR value the ratchet consumed. Always > 0 — the ratchet refuses otherwise. */
+  atr: number;
+  /**
+   * ATR/price on the SAME series, the input the high-beta branch is gated on.
+   * `null` ⇒ none was served, in which case the high-beta multiplier was
+   * structurally unreachable on this row (not declined).
+   */
+  atrPct: number | null;
+  /** Period handed to `atr()`. */
+  atrPeriod: number;
+  /**
+   * Bar spacing MEASURED off the series this ATR was computed on, `null` when
+   * unmeasurable (fewer than two bars). ⛔ Never `0`. This is the measurement,
+   * not the configured constant the health route publishes — read this one.
+   */
+  atrTimeframeMs: number | null;
+  /** Bars in that series. */
+  atrBars: number;
+  /** The multiplier the ratchet resolved (base or high-beta). */
+  atrMult: number;
+  /** `true` ⇔ `atrMult` is the high-beta one, i.e. `atrPct` cleared the threshold. */
+  highBeta: boolean;
+  /** The base / high-beta multipliers and the threshold in force, for the comparison. */
+  atrMultBase: number;
+  atrMultHighBeta: number;
+  highBetaAtrPct: number;
+  /**
+   * `chandelierTrailNote` at the fire — `spot_seeded` (the anchor had to be
+   * seeded from the current spot) or `restarted_stale_breach` (TRA-3217
+   * re-anchor). Absent ⇔ an ordinary trail whose anchor was a real entry spot.
+   */
+  trailNote?: 'spot_seeded' | 'restarted_stale_breach';
+}
+
+/**
  * TRA-4759 — the take-profit-early rule's own record at the tick it chose to
  * exit, mirroring `OptionProfitLockFire` field-for-field in intent: stamped at
  * the FIRST firing tick, first-fire-only, folded onto the journal close row,
@@ -3759,6 +3847,13 @@ export interface OptionPosition {
    * ⛔ Never backfilled.
    */
   takeProfitEarlyFire?: OptionTakeProfitEarlyFire;
+  /**
+   * TRA-4991 (AC1) — the underlying-space chandelier's inputs at its firing
+   * tick, stamped beside `profitLockFire` (first fire only, same rationale) and
+   * folded onto the journal close row. Absent ⇔ no chandelier fire on this
+   * build. ⛔ Never backfilled, ⛔ never zeroed.
+   */
+  chandelierFire?: OptionChandelierFire;
   trailingActive: boolean;    // true once price is up 20% and trailing mode engaged
   trailingStopPremium: number; // current trailing stop level (peak * (1 - 0.12))
   underlyingEntryPrice: number;

@@ -89,6 +89,13 @@ import { withPhase, timeSyncPhase } from './phase-timing.js';
 import { EvalYielder, TickPacer } from './cooperative-yield.js';
 import { TickExitWorkMeter, type TickExitWorkTerms } from './tick-exit-work.js';
 import { TickExitRegionMeter, classifyExitInterval, type TickExitRegionRthTerms } from './tick-exit-region.js';
+// TRA-4991 — the chandelier ATR's shared provenance constants. ⛔ Observe-only.
+import {
+  CHANDELIER_ATR_PERIOD,
+  SHADOW_CANDLE_TIMEFRAME_MS,
+  measureCandleTimeframeMs,
+  type OptionChandelierAtrSource,
+} from './option-chandelier-trail.js';
 import { trySma200ScanSlot, releaseSma200ScanSlot, fetchSma200CandlesShared } from './sma200-scan-admission.js';
 import { resolveSma200PullbackMaxDistAtr, resolveSma200PullbackTimeCapBars, sma200PullbackExitModel, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved, signalRingEvictionIndex, isSma200SignalType, type Sma200SweepVerdict } from './sma200-validity.js';
 import { getLatestReviewBlock } from './research-store.js';
@@ -2396,7 +2403,13 @@ const MTF_DAILY_BARS = 260;
  * cache (TRA-552) de-dupes against the MTF snapshot's deeper pull. The shadow
  * EVALUATION still runs every tick off the cached 5m series (TRA-787 acceptance #1).
  */
-const SUPERTREND_SHADOW_TF_MS = 5 * 60_000;
+// TRA-4991 — ONE definition, shared with the surface that publishes it. The
+// option chandelier's ATR is computed on THIS series (`buildOptionExitRisk` reads
+// `shadowCandleCache`), so `/api/health/option-swing-exits` has to be able to
+// name its width; two constants describing one series is how a published
+// timeframe goes stale silently, and this exact width is what TRA-4992 is filed
+// to repair.
+const SUPERTREND_SHADOW_TF_MS = SHADOW_CANDLE_TIMEFRAME_MS;
 // TRA-840 — deep enough that the resampled 1h confirm clears the 30-bar guard.
 const SUPERTREND_SHADOW_MINUTE_BARS = 2400;
 const SUPERTREND_SHADOW_REFRESH_MS = 60_000;
@@ -3819,16 +3832,31 @@ export class SignalEngine {
   private buildOptionExitRisk(): OptionExitRiskInput | undefined {
     const underlyingAtrBySymbol = new Map<string, number>();
     const underlyingAtrPctBySymbol = new Map<string, number>();
+    // TRA-4991 (AC1) — the provenance of each ATR, so a chandelier fire can
+    // publish the series it decided on instead of leaving a reader to infer it
+    // from a constant somewhere else in the tree.
+    const underlyingAtrSourceBySymbol = new Map<string, OptionChandelierAtrSource>();
     for (const opt of this.optionsAccount.getState().openOptions) {
       if (opt.legs && opt.legs.length > 1) continue;
       if (underlyingAtrBySymbol.has(opt.symbol)) continue;
       const series = this.shadowCandleCache.get(opt.symbol);
       if (!series || series.length < 15) continue;
-      const a = atr(series);
+      // TRA-4991 — the period is stated EXPLICITLY (it is `atr()`'s own default,
+      // so this is behaviour-neutral) because the fire publishes it. A published
+      // period that is really "whatever the indicator defaults to today" is not a
+      // measurement of anything.
+      const a = atr(series, CHANDELIER_ATR_PERIOD);
       if (a == null || !(a > 0)) continue;
       underlyingAtrBySymbol.set(opt.symbol, a);
-      const ap = atrPct(series);
+      const ap = atrPct(series, CHANDELIER_ATR_PERIOD);
       if (ap != null && Number.isFinite(ap)) underlyingAtrPctBySymbol.set(opt.symbol, ap);
+      underlyingAtrSourceBySymbol.set(opt.symbol, {
+        period: CHANDELIER_ATR_PERIOD,
+        // MEASURED off the bars just consumed, not asserted from the resample
+        // constant: a repair that re-points this cache has to move this reading.
+        timeframeMs: measureCandleTimeframeMs(series),
+        bars: series.length,
+      });
     }
     // TRA-1294 — take-profit-early is premium-space only (no underlying ATR
     // needed); attach its capture fraction so the branch activates even for
@@ -3881,6 +3909,7 @@ export class SignalEngine {
     return {
       underlyingAtrBySymbol,
       underlyingAtrPctBySymbol,
+      underlyingAtrSourceBySymbol,
       takeProfitEarlyCaptureFrac,
       openingRangeGuardMin,
       ...(profitFloorLadder !== undefined ? { profitFloorLadder } : {}),

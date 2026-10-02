@@ -39,7 +39,23 @@ import {
   isProfitFloorTrailEnabled,
   PROFIT_FLOOR_TRAIL_FLAG,
   EXIT_RISK_RULES_FLAG,
+  OTM_SLEEVE_EXIT_RULE_VALUE,
+  isExitRiskRulesEnabled,
 } from '../exit-risk-rules-flag.js';
+// TRA-4991 (AC2 + AC3) — the chandelier trail parameterisation + ratchet census.
+import {
+  CHANDELIER_ATR_PERIOD,
+  SHADOW_CANDLE_TIMEFRAME_MS,
+  noteChandelierRatchet,
+  resetChandelierRatchetLedgerForTests,
+  resolveChandelierTrailParams,
+  summarizeChandelierRatchets,
+} from '../option-chandelier-trail.js';
+import {
+  EXIT_CHANDELIER_ATR_MULT,
+  EXIT_CHANDELIER_ATR_MULT_HIGHBETA,
+  EXIT_CHANDELIER_HIGHBETA_ATRPCT,
+} from '@trading-app/shared';
 import { resolveDemoFlagEnv, resolveDemoFlagEnvFromEnv } from '../demo-flags.js';
 // TRA-5030 — the arm predicate + its flag name, imported as SYMBOLS so the route
 // assertions below cannot drift against retyped literals.
@@ -8319,6 +8335,88 @@ describe('TRA-4510 option-swing-exits profitFloorTrail — both books', () => {
     const pft = serve();
     expect(pft.demo).toEqual({ enabled: true, exitRiskMaster: true });
     expect(pft.live).toEqual({ enabled: false, exitRiskMaster: true });
+  });
+});
+
+// ─── TRA-4991 (AC2 + AC3, parent TRA-4945) — the chandelier REACHES THE ROUTE ──
+//
+// The resolver's own cases live in `tra4991-chandelier-trail-publication.test.ts`.
+// What this pins is that the levels and the ratchet census are actually ON
+// `/api/health/option-swing-exits`, because the gap TRA-4945 hit was not a wrong
+// value — it was a route that published FLAGS ONLY. `swingTimeStop`,
+// `rvExitRetuneLive/Demo`, `takeProfitEarlyLive` and `profitFloorTrail` carried no
+// level and no ATR, `/api/health/otm-sleeve-mandate` carried no exit-rule key at
+// all, and so "what width is the trail, on what series, and is it retired on the
+// OTM sleeve" had to be answered with `git show` against the deployed commit.
+describe('TRA-4991 option-swing-exits — the chandelier trail parameterisation + ratchet census', () => {
+  const serve = (): Record<string, unknown> => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/option-swing-exits')!;
+    expect(handlers).toHaveLength(1); // unauthenticated, like its siblings
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    return (res.body as { chandelier: Record<string, unknown> }).chandelier;
+  };
+
+  it('publishes the resolved widths, the ATR source and the sleeve rule — not just flags', () => {
+    const c = serve();
+    // Identity with the resolver, not a copy: a second spelling of these numbers
+    // on the route is how a published level drifts from the one the trail uses.
+    expect(c).toMatchObject(resolveChandelierTrailParams(process.env));
+    expect(c.atrMult).toBeCloseTo(EXIT_CHANDELIER_ATR_MULT, 9);
+    expect(c.atrMultHighBeta).toBeCloseTo(EXIT_CHANDELIER_ATR_MULT_HIGHBETA, 9);
+    expect(c.highBetaAtrPct).toBeCloseTo(EXIT_CHANDELIER_HIGHBETA_ATRPCT, 9);
+    expect(c.atrTimeframeMs).toBe(SHADOW_CANDLE_TIMEFRAME_MS);
+    expect(c.atrPeriod).toBe(CHANDELIER_ATR_PERIOD);
+    // AC2's honesty field: `compiled` ⇒ there is no env key to hunt for.
+    expect(c.multSource).toBe('compiled');
+    // …and the one read that answers "is the chandelier retired on the OTM
+    // sleeve" without inferring it from a `render.yaml` absence.
+    expect(c.otmSleeveExitRule).toMatchObject({ envKey: OTM_SLEEVE_EXIT_RULE_VALUE });
+  });
+
+  it('AC3 — the ratchet census is on the wire, per book, with its three-cell partition', () => {
+    resetChandelierRatchetLedgerForTests();
+    noteChandelierRatchet('live', EXIT_CHANDELIER_HIGHBETA_ATRPCT * 2, EXIT_CHANDELIER_ATR_MULT_HIGHBETA);
+    noteChandelierRatchet('demo', undefined, EXIT_CHANDELIER_ATR_MULT);
+
+    const ratchets = serve().ratchets as ReturnType<typeof summarizeChandelierRatchets>;
+    // ⚠ NOT pooled — live and demo ratchet in one process, and a pooled count
+    // would let demo volatility answer a question asked about real money.
+    expect(ratchets.byMode.live.highBeta).toBe(1);
+    expect(ratchets.byMode.demo.highBeta).toBe(0);
+    // ⛔ The discrimination a flag cannot make: demo's base resolution came from
+    // NO atrPct at all, so the high-beta branch was unreachable there, not
+    // declined. `baseAtrPctAbsent` is what says so.
+    expect(ratchets.byMode.demo.baseAtrPctAbsent).toBe(1);
+    expect(ratchets.byMode.demo.maxAtrPct).toBeNull();
+    for (const t of [ratchets.byMode.live, ratchets.byMode.demo, ratchets.all]) {
+      expect(t.highBeta + t.base + t.baseAtrPctAbsent).toBe(t.ratchets);
+    }
+    resetChandelierRatchetLedgerForTests();
+  });
+
+  it('⛔ names the master beside the counts, so a `ratchets: 0` under a dark master is not read as a measurement', () => {
+    // The ratchet only runs while `exitRisk` is attached, i.e. while the
+    // exit-risk master is on. Without this field a structural zero ("the trail
+    // was never evaluated") is indistinguishable from "evaluated, never high
+    // beta" — the same conflation AC3's `baseAtrPctAbsent` cell removes one level
+    // down. Resolved through the engine's OWN helper over each book's own env
+    // view, so it cannot drift from the decision site.
+    const c = serve();
+    expect(c.requiresMaster).toBe(EXIT_RISK_RULES_FLAG);
+    expect(c.exitRiskMaster).toEqual({
+      live: isExitRiskRulesEnabled(process.env),
+      demo: isExitRiskRulesEnabled(
+        process.env.DATA_DIR ? resolveDemoFlagEnv(process.env.DATA_DIR) : process.env,
+      ),
+    });
   });
 });
 

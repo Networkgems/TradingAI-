@@ -361,6 +361,12 @@ import { snapshotRiskThrottleSizing } from '../risk-throttle-sizing.js';
 import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG, isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG, isBookGiveBackArmFloorEnabled, BOOK_GIVEBACK_ARM_FLOOR_FLAG, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_FLAG, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, isRvExitRetuneEnabled, RV_EXIT_RETUNE_FLAG, isTakeProfitEarlyLiveEnabled, TAKE_PROFIT_EARLY_LIVE_FLAG, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_VALUE, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, resolveOptionsHaltScope, OPTIONS_HALT_SCOPE_VAR, isOtmTp1FullExit1LotEnabled, OTM_TP1_FULL_EXIT_1LOT_FLAG, isProfitFloorTrailEnabled, PROFIT_FLOOR_TRAIL_FLAG, type OptionsHaltScopeResolution } from '../exit-risk-rules-flag.js';
 // TRA-4244 — the env-resolved OTM profit-side schedule, surfaced beside barR.
 import { describeOtmProfitSchedule } from '../otm-profit-schedule.js';
+// TRA-4991 (AC2 + AC3) — the chandelier trail's resolved parameterisation and
+// the since-boot high-beta ratchet census. ⛔ Observe-only.
+import {
+  resolveChandelierTrailParams,
+  summarizeChandelierRatchets,
+} from '../option-chandelier-trail.js';
 import { summarizeOptionsBreakerLedger } from '../options-breaker-ledger.js'; // TRA-3218
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
@@ -9241,7 +9247,44 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           exitRiskMaster: isExitRiskRulesEnabled(demoEnv),
         },
       },
-      note: 'Hard exits (premium stop, trail, give-back cap, session stop, take-profit) are unaffected by all of the above and keep firing through the swing hold.',
+      // TRA-4991 (AC2 + AC3, parent TRA-4945) — the UNDERLYING-space ATR
+      // chandelier's parameterisation and its high-beta branch census.
+      //
+      // WHY IT LANDS ON THIS ROUTE. This is already the exit-parameterisation
+      // readout, and before this it published FLAGS ONLY — no levels, no ATR.
+      // `/api/health/otm-sleeve-mandate` carries no exit-rule key at all. So the
+      // trail's width, the series it is measured on, and whether the whole family
+      // is retired on the OTM sleeve existed nowhere a reader could reach, and
+      // TRA-4945 had to answer "what fired this chandelier exit" with `git show`
+      // against the deployed commit. A levels-free exit-parameterisation route is
+      // the gap, not a property worth preserving.
+      //
+      // ⚠️ `ratchets` is a SINCE-BOOT process counter and is NOT persisted. It is
+      // split by book because live and demo ratchet in one process. AC3's question
+      // — is the high-beta multiplier (3.5) reachable when its 0.05 threshold is a
+      // daily-scale number applied to a 5m-scale `atrPct`? — is answered by
+      // `highBeta` vs `base` vs `baseAtrPctAbsent` and `maxAtrPct`, never by a
+      // flag: a flag reads identically whether the branch is live or dead.
+      //
+      // ⛔ Read `baseAtrPctAbsent` BEFORE reading `highBeta: 0`. On ratchets with
+      // no `atrPct` served the branch was UNREACHABLE, not declined, and a zero
+      // over that denominator is not a reading about volatility.
+      //
+      // ⛔ And read `exitRiskMaster` BEFORE reading `ratchets.*: 0`. The ratchet
+      // only runs while `exitRisk` is attached, i.e. while the master flag is on,
+      // so a zero under a dark master is a STRUCTURAL zero — the trail was never
+      // evaluated — and not a measurement about the book. Published here beside
+      // the counts rather than left to be joined from `profitFloorTrail` below.
+      chandelier: {
+        ...resolveChandelierTrailParams(process.env),
+        requiresMaster: EXIT_RISK_RULES_FLAG,
+        exitRiskMaster: {
+          live: isExitRiskRulesEnabled(process.env),
+          demo: isExitRiskRulesEnabled(demoEnv),
+        },
+        ratchets: summarizeChandelierRatchets(),
+      },
+      note: 'Hard exits (premium stop, trail, give-back cap, session stop, take-profit) are unaffected by all of the above and keep firing through the swing hold. TRA-4991: `chandelier` carries the ATR trail\'s resolved width, its ATR source timeframe and the since-boot high-beta ratchet census; per-close SPOT-space inputs are on the journal row (`/api/health/option-journal?rows=all` -> `chandelier`).',
     });
   });
 

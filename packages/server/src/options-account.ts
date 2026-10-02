@@ -29,6 +29,20 @@ import type {
   OptionProfitFloorPdtHold,
   OptionMarkProvenance,
 } from '@trading-app/shared';
+import {
+  EXIT_CHANDELIER_ATR_MULT,
+  EXIT_CHANDELIER_ATR_MULT_HIGHBETA,
+  EXIT_CHANDELIER_HIGHBETA_ATRPCT,
+} from '@trading-app/shared';
+import { chandelierMultiplier } from '@trading-app/engine';
+// TRA-4991 — the chandelier trail's publishable inputs + the AC3 ratchet census.
+// ⛔ Observe-only: nothing imported here is read by a level, a decision or an
+// order path.
+import {
+  CHANDELIER_ATR_PERIOD,
+  noteChandelierRatchet,
+  type OptionChandelierAtrSource,
+} from './option-chandelier-trail.js';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
 import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
@@ -593,6 +607,23 @@ export interface OptionExitRiskInput {
   underlyingAtrBySymbol: Map<string, number>;
   /** Underlying ATR / price by symbol — picks the high-beta multiplier. Optional. */
   underlyingAtrPctBySymbol?: Map<string, number>;
+  /**
+   * TRA-4991 (AC1) — the PROVENANCE of the two maps above, per symbol: the
+   * period handed to `atr()`, the bar spacing MEASURED off the series it was
+   * computed on, and the bar count. Folded onto the journal close row by a
+   * chandelier fire.
+   *
+   * ⚠ MEASURED, not declared. A constant published beside the fire can go stale
+   * the day somebody re-points the chandelier at a different series — which is
+   * exactly the repair TRA-4992 is filed to make — and a stale `5m` reading
+   * would be indistinguishable from a correct one. The producer measures the
+   * bars it actually used.
+   *
+   * Optional: a hand-built `OptionExitRiskInput` (tests) may omit it, in which
+   * case the fire publishes `atrPeriod` / `atrTimeframeMs` as the compiled
+   * default and `null` respectively rather than inventing a spacing.
+   */
+  underlyingAtrSourceBySymbol?: Map<string, OptionChandelierAtrSource>;
   /**
    * TRA-1294 — take-profit-early capture fraction (0.50–0.70). Present ⇔ the
    * caller armed the STANDALONE, DEMO-ONLY `TAKE_PROFIT_EARLY_ENABLED` flag
@@ -7950,6 +7981,15 @@ export class PaperOptionsAccount {
           ...(position.profitLockFire !== undefined
             ? { profitLockFire: { ...position.profitLockFire } }
             : {}),
+          // TRA-4991 (AC1) — the underlying-space chandelier's trigger inputs,
+          // off the row the fire stamped them on. ⛔ ABSENT stays absent, and an
+          // absent key is the verdict "the chandelier never armed on this row" —
+          // it is never zeroed, because a `0` ATR reads as "no volatility"
+          // instead of "not measured" and the two license opposite conclusions
+          // about the same close. ⛔ Never reconstructed.
+          ...(position.chandelierFire !== undefined
+            ? { chandelier: { ...position.chandelierFire } }
+            : {}),
           // TRA-4759 (AC1) — the take-profit-early decision at its firing
           // tick, beside the lock's stamp. Absent stays absent: only a
           // take-profit-early fire writes one, and ⛔ a reconstructed record
@@ -11675,6 +11715,21 @@ export class PaperOptionsAccount {
       const chandelierRetired = otmSleeveExitRule === 'trail' && isOtmSleeveRow(opt);
       let chandelierUSide: Side | null = null;
       let chandelierUnderlying: number | undefined;
+      // TRA-4991 (AC1) — the ratchet's own inputs, hoisted to the scope the FIRE
+      // can see. `uatr` and the ATR provenance live inside the ratchet block
+      // below, and the fire site is ~800 lines further on; before this they were
+      // unreachable from there, which is why the only way to establish what fired
+      // a chandelier exit was `git show` against the deployed commit.
+      // ⛔ Observe-only — no exit predicate reads this.
+      let chandelierRatchetInputs: {
+        atr: number;
+        atrPct: number | null;
+        atrPeriod: number;
+        atrTimeframeMs: number | null;
+        atrBars: number;
+        atrMult: number;
+        highBeta: boolean;
+      } | null = null;
       if (chandelierRetired) {
         // A row that ticked on a pre-TRA-3941 build carries a PERSISTED stop, a
         // trail note and possibly a daily-close hold latch. Dropped here rather
@@ -11741,14 +11796,43 @@ export class PaperOptionsAccount {
             ? Math.max(opt.peakUnderlying, chandelierUnderlying)
             : Math.min(opt.peakUnderlying, chandelierUnderlying);
           if (opt.peakUnderlying !== priorPeakUnderlying) opt.peakUnderlyingAt = Date.now();
+          const uatrPct = exitRisk.underlyingAtrPctBySymbol?.get(opt.symbol);
           opt.chandelierStop = chandelierStop({
             side: chandelierUSide,
             initialStop: chandelierUSide === 'buy' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY,
             extremeSinceEntry: opt.peakUnderlying,
             atr: uatr,
-            atrPct: exitRisk.underlyingAtrPctBySymbol?.get(opt.symbol),
+            atrPct: uatrPct,
             prevTrailStop: opt.chandelierStop,
           });
+          // TRA-4991 (AC1 + AC3) — which multiplier this ratchet resolved, and
+          // the series provenance behind the ATR it used.
+          //
+          // ⛔ `chandelierMultiplier` is the ENGINE's own comparison, called with
+          // no overrides exactly as `chandelierStop` just called it internally —
+          // NOT a re-spelling of `atrPct > 0.05` here. A second copy of the
+          // threshold would publish a count of what this file believes instead
+          // of a count of what the trail did, which is the whole failure this
+          // ticket is answering (a flag reads the same whether its branch is
+          // live or dead; so does a mis-derived counter).
+          const uatrMult = chandelierMultiplier(uatrPct);
+          const atrSource = exitRisk.underlyingAtrSourceBySymbol?.get(opt.symbol);
+          chandelierRatchetInputs = {
+            atr: uatr,
+            atrPct: uatrPct !== undefined && Number.isFinite(uatrPct) ? uatrPct : null,
+            // A hand-built `OptionExitRiskInput` with no provenance map falls
+            // back to the compiled period (which IS what `atr()` used) and to a
+            // `null` spacing — never a guessed 5m, never a `0`.
+            atrPeriod: atrSource?.period ?? CHANDELIER_ATR_PERIOD,
+            atrTimeframeMs: atrSource?.timeframeMs ?? null,
+            atrBars: atrSource?.bars ?? 0,
+            atrMult: uatrMult,
+            highBeta: uatrMult === EXIT_CHANDELIER_ATR_MULT_HIGHBETA,
+          };
+          // Counted once per row per exit pass (the TRA-3217 re-anchor below
+          // recomputes the SAME width from the same ATR and atrPct, so counting
+          // it again would inflate the denominator without adding a resolution).
+          noteChandelierRatchet(opt.mode === 'live' ? 'live' : 'demo', uatrPct, uatrMult);
 
           // TRA-3217 — breach bookkeeping. While suppressed, the flag mirrors
           // the CURRENT breach state (a breach that heals mid-hold clears it,
@@ -12582,6 +12666,57 @@ export class PaperOptionsAccount {
                 : opt.chandelierTrailNote === 'spot_seeded'
                   ? 'chandelier_spot_seeded'
                   : 'chandelier';
+          // TRA-4991 (AC1) — the trail's own inputs, in SPOT space, stamped at
+          // the FIRST firing tick (a re-staged unfilled leg keeps the original
+          // decision's record, same semantics as `profitLockFire`) and folded
+          // onto the journal close row.
+          //
+          // These six quantities are the ones a reader cannot re-derive: the
+          // close destroys the position, and every published column about it is
+          // in PREMIUM space. `peakPremium == entryBasisPremium` with
+          // `mae.frac == 0` on a `chandelier` row (TRA-4945's MARA close) reads
+          // as "a trailing stop fired with no trail" and is nothing of the kind
+          // — the trail moved, in a space nothing published.
+          //
+          // `chandelierRatchetInputs` is non-null by construction wherever this
+          // branch is reachable (`chandelierUSide` is only ever set in the same
+          // block that fills it). Guarded rather than asserted: an ABSENT
+          // `chandelier` object on a chandelier row is a readable "not measured",
+          // and ⛔ a fabricated one is not.
+          if (
+            opt.chandelierFire === undefined
+            && chandelierRatchetInputs !== null
+            // Re-stated for the type checker, not for the logic: all four are
+            // conjuncts of `chandelierBreachRaw` and so are already true here.
+            && chandelierUSide !== null
+            && chandelierUnderlying != null
+            && opt.chandelierStop !== undefined
+            && opt.peakUnderlying !== undefined
+          ) {
+            opt.chandelierFire = {
+              at: Date.now(),
+              exitReason: exitJournalReason,
+              side: chandelierUSide,
+              peakUnderlying: opt.peakUnderlying,
+              peakUnderlyingAt: opt.peakUnderlyingAt ?? null,
+              chandelierStop: opt.chandelierStop,
+              spotAtFire: chandelierUnderlying,
+              underlyingEntryPrice: opt.underlyingEntryPrice,
+              atr: chandelierRatchetInputs.atr,
+              atrPct: chandelierRatchetInputs.atrPct,
+              atrPeriod: chandelierRatchetInputs.atrPeriod,
+              atrTimeframeMs: chandelierRatchetInputs.atrTimeframeMs,
+              atrBars: chandelierRatchetInputs.atrBars,
+              atrMult: chandelierRatchetInputs.atrMult,
+              highBeta: chandelierRatchetInputs.highBeta,
+              atrMultBase: EXIT_CHANDELIER_ATR_MULT,
+              atrMultHighBeta: EXIT_CHANDELIER_ATR_MULT_HIGHBETA,
+              highBetaAtrPct: EXIT_CHANDELIER_HIGHBETA_ATRPCT,
+              ...(opt.chandelierTrailNote !== undefined
+                ? { trailNote: opt.chandelierTrailNote }
+                : {}),
+            };
+          }
         } else if (exitPremium === null) {
           // Rule 2 — trade-level profit-lock on premium-derived R (we are always
           // LONG the premium, so entry = premiumPaid, stop = stopLossPremium).
