@@ -8456,9 +8456,21 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // `mark`/`spreadPct` on every row use the scanner's (bid+ask)/2 mid — the
   // TRA-1656 entry-stamp convention — so the tape's axes match the journal's.
   //
-  // Query: `?day=YYYY-MM-DD&class=desk&rows=5000` streams raw rows (capped);
-  // omit `rows` for the summary alone. Row fields are OPTIONAL on the read
-  // side: a row written by an older build genuinely lacks newer fields.
+  // Query: `?day=YYYY-MM-DD&class=desk&kind=candidate&rows=20000&offset=0`
+  // streams raw rows; omit `rows` for the summary alone. Row fields are
+  // OPTIONAL on the read side: a row written by an older build genuinely lacks
+  // newer fields.
+  //
+  // ⚠ The row read is PAGED, and `?rows=all` does NOT lift the ceiling (it is
+  // non-numeric, so it parses to the ceiling — the sweep script reaches for
+  // `rows=all` by analogy with `/api/health/option-journal`, where it works).
+  // A (day × class) slice can exceed one response: measured 2026-10-02, desk
+  // 2026-09-24 holds 21,384 rows (12,168 candidate + 9,216 `ranked`) and the
+  // unfiltered read returned a 20,000-row PREFIX — clipping 524 candidate rows
+  // off the file tail, i.e. the day's LAST ET slots. Read `rowsTruncated` /
+  // `rowsNextOffset` and page, or pass `kind=candidate` to drop the link rows
+  // a sweep never reads. An undetected tail clip is a time-of-day bias, the
+  // exact v1-sampler defect this tape was rebuilt to escape.
   //
   // Observe-only: the trading path never reads this tape, and serving it never
   // routes an order or moves a parameter.
@@ -8470,11 +8482,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       let rows: Awaited<ReturnType<typeof readOtmAdmissionTapeRows>> | undefined;
       if (wantRows) {
         const limitRaw = Number(req.query.rows);
+        const offsetRaw = Number(req.query.offset);
         rows = await readOtmAdmissionTapeRows({
           ...(typeof req.query.day === 'string' && req.query.day !== '' ? { etDay: req.query.day } : {}),
           ...(typeof req.query.class === 'string' && req.query.class !== ''
             ? { accountClass: req.query.class }
             : {}),
+          ...(typeof req.query.kind === 'string' && req.query.kind !== ''
+            ? { kind: req.query.kind }
+            : {}),
+          ...(Number.isFinite(offsetRaw) && offsetRaw > 0 ? { offset: Math.floor(offsetRaw) } : {}),
           ...(Number.isFinite(limitRaw) && limitRaw > 0 ? { limit: Math.floor(limitRaw) } : {}),
         });
       }
@@ -8485,7 +8502,18 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         build: resolveBuildInfo(),
         etDay: etDateString(new Date(nowMs)),
         ...summary,
-        ...(rows !== undefined ? { rows: rows.rows, rowsTruncated: rows.truncated } : {}),
+        ...(rows !== undefined
+          ? {
+              rows: rows.rows,
+              rowsTruncated: rows.truncated,
+              rowsReturned: rows.rows.length,
+              rowsOffset: rows.offset,
+              rowsNextOffset: rows.nextOffset,
+              rowsNote: rows.truncated
+                ? `TRUNCATED — this is a PREFIX of the filter, not the slice. More matching rows exist; re-read with &offset=${rows.nextOffset} (file order is append-only, so paging a CLOSED session is exact) and concatenate. ${rows.rows.length} is the per-response row ceiling, and \`?rows=all\` does NOT lift it (non-numeric parses to the ceiling). Add &kind=candidate to drop the ranked/ordered link rows a sweep does not read: measured 2026-10-02, desk 2026-09-24 is 21,384 rows unfiltered (over the ceiling, clipping the day's LAST ET slots) and 12,168 filtered.`
+                : 'COMPLETE — the filter was exhausted within the per-response ceiling (rowsNextOffset null).',
+            }
+          : {}),
         note: `${summary.deskSessionsWithAdmissions}/20 desk-class ET sessions with >=1 ADMITTED candidate toward the TRA-4623 AC4 re-run bar. bindingReason = FIRST binding gate in engine evaluation order ('none' = admitted). Only sampling-policy-v2 days count; v1 rows (no samplingPolicy, 2026-09-17..18) exhausted a first-come daily budget in the opening minutes and are open-biased (legacySessions/legacyRows) - exclude them from any readout. v2 sampling is pass-level and independent of mark, spreadPct and time-of-day by construction (see policy); days[].rowsBySlotEt is the time-coverage check. TRA-4906: days[].dropsBySlotEt is the per-slot rule-3 slot-budget drop count AND the dropped passes' sizes, rebuilt from durable kind:budgetdrop rows, so it SURVIVES A BOOT — read it there, not off counters.slotBudgetPassesDropped, which is a process total zeroed by every restart; budgetdrop rows are NOT sample and are in no other count here. kind:ranked is deduped per (etDay, slot, accountClass, occSymbol) from 2026-09-25 (earlier days hold the un-deduped multiset, 4.3x-11.6x); kind:ordered stays unconditional as execution provenance. An evidence archive has no backfill: the tape starts at the deploy that armed it. durability.appendErrors > 0 means rows were counted in memory that never reached disk — treat the on-disk export as an undercount, not the counters as an overcount.`,
       });
     } catch (err: unknown) {
