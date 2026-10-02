@@ -9,6 +9,16 @@ name: CI
 # at. Now every axis runs and reports on every push; the first failure hides
 # nothing behind it.
 #
+# TRA-5029 — that guarantee was FALSE for 7d 1h 48m, because the fail-fast chain
+# reappeared one level down: the Test step ran `pnpm test`, an npm lifecycle name, so
+# root `pretest` (~30 guards chained on `&&`) ran first and a broken link at position 2
+# meant `pnpm -r test` was never reached. 73 consecutive runs reported
+# `Test -> failure` with the step lasting 0–1 seconds and ZERO tests executed. Splitting
+# jobs is not enough on its own: what matters is that nothing which can fail sits in
+# front of an axis, and that "it failed" and "it never ran" do not share a signal. The
+# Test job therefore runs `pnpm test:ci` (no pre-hook) and publishes the executed test
+# count as its own step.
+#
 # `ci-verdict` is the single REQUIRED status (branch protection on `main` names
 # it). It grades the run by its OWN /jobs step list — presence, conclusion and
 # step durations of every expected job — never by the run conclusion, and its
@@ -267,8 +277,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history: `pretest` runs the TRA-4420 arg-guard suite, whose ARM 0
-          # reconstitutes a187fc14's bytes via `git show` — unreachable at depth 1.
+          # Full history. This used to be justified by `pretest` (the TRA-4420 arg-guard
+          # ARM 0 reconstitutes `a187fc14`'s bytes via `git show`, unreachable at depth
+          # 1); as of TRA-5029 this job no longer runs `pretest` — that control now runs
+          # only where it always belonged, in `pretest` locally and in the Guards job.
+          # Kept at 0 because tests in this workspace read git history directly and a
+          # shallow clone turns those into silent skips, which is this file's own lesson.
           fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
@@ -289,8 +303,50 @@ jobs:
       - name: Build shared packages
         run: pnpm -r --filter './packages/**' build
 
+      # TRA-5029 — `pnpm test:ci`, NOT `pnpm test`.
+      #
+      # `test` is an npm lifecycle name, so `pnpm test` ran root `pretest` first — a
+      # single `&&` chain of ~30 guards and selftests — and only then `pnpm -r test`.
+      # From `c8208189` (2026-09-25T00:22:08Z) link 2 (`check-data-dir`, TRA-5030)
+      # exited 1 and the suite was never reached again until `212a5dab`
+      # (2026-10-02T03:10:38Z): 73 consecutive runs, 7d 1h 48m, this step running for
+      # 0–1 SECONDS and executing ZERO tests while reporting `Test -> failure`. That is
+      # precisely TRA-4440's fail-fast chain, re-created inside the job TRA-4477 split
+      # off to prevent it — one level down, in a package.json script the job
+      # restructuring never touched.
+      #
+      # `test:ci` carries no `pre*` hook, so no guard can suppress it. The guards did
+      # not move out of `pretest` (CLAUDE.md: the local pretest hook is load-bearing for
+      # the stale-js trap) and they keep their own job above; they simply no longer sit
+      # in front of the suite. The one exception is `check-stale-js`, which the runner
+      # executes itself — a shadowing emit makes the suite's result MEANINGLESS rather
+      # than unknown, and that reads BLIND, never "tests failed".
       - name: Test
-        run: pnpm test
+        run: pnpm test:ci
+
+      # TRA-5029 AC2 — the discriminator. `Test -> failure` cannot distinguish "the
+      # suite ran and N tests failed" from "the suite never executed"; both arrive as
+      # one bit, which is why the 7.4-day streak above read as ordinary redness. This
+      # step reports the EXECUTED TEST COUNT against a frozen floor and runs with
+      # `if: always()`, so the two modes land as two different STEP conclusions:
+      #   Test red + this step green  -> the suite executed and lost tests  (BROKEN)
+      #   Test red + this step red    -> the suite did not execute          (BLIND)
+      # `ci-verdict` grades by exactly that pair; its absence reads BLIND there rather
+      # than silently reverting to the old one-bit reading.
+      - name: Suite executed (count floor)
+        if: ${{ always() }}
+        run: pnpm test:ci:grade
+
+      # The runner is an instrument, so it ships with both-direction controls: a clean
+      # stream reads CLEAN, a 5-failure stream reads RED with the count, a package
+      # missing from the stream reads BLIND rather than RED, `--passWithNoTests`
+      # emptiness reads BLIND, a count under the floor reads BLIND, and a test job that
+      # goes back to invoking a pre-hooked script fails the structural arm. Placed after
+      # the suite, with `if: always()`, because a control that can suppress the thing it
+      # grades is the defect on this very ticket.
+      - name: Suite runner controls (TRA-5029)
+        if: ${{ always() }}
+        run: pnpm test:ci:controls
 
   # The single REQUIRED status. Grades this very run by its /jobs step list and
   # durations (TRA-4440's lesson: never the run conclusion), and proves on every
