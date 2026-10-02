@@ -178,6 +178,57 @@ describe('summarizeLiveArmCensus — TRA-3117 per-book live-arm census', () => {
     expect(r.rollup.liveBookCount).toBe(0);
   });
 
+  // TRA-5014 — `booksScanned` alone was not enough. `enock`, the demo book the
+  // whole options forward test runs in, was scanned and dropped for seven
+  // consecutive ET sessions while producing ZERO option entries, and every
+  // reader of this census saw `booksScanned: 4` / `books.length: 3` and nothing
+  // else. A count cannot name the book it dropped, nor say why.
+  it('names every scanned-but-unpublished book with a reason (TRA-5014)', () => {
+    const r = summarizeLiveArmCensus(
+      [
+        book(PIN, liveProdSettings()),
+        book('enock', { ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' }, runtime({ mode: 'demo', clientPresent: false })),
+      ],
+      env(),
+    );
+    expect(r.books.map(b => b.username)).toEqual([PIN]);
+    expect(r.booksScannedButNotPublished).toHaveLength(1);
+    const dropped = r.booksScannedButNotPublished[0]!;
+    expect(dropped.username).toBe('enock');
+    expect(dropped.mode).toBe('demo');
+    expect(dropped.runtimeMode).toBe('demo');
+    expect(dropped.reason).toBe('demo_on_both_axes');
+    // The note must hand the reader an onward surface — the whole defect was a
+    // reader with no next place to look.
+    expect(dropped.note).toContain('option-journal');
+    expect(r.rollup.booksScannedNotPublishedCount).toBe(1);
+    // The identity that makes an elision checkable from the payload itself.
+    expect(r.books.length + r.booksScannedButNotPublished.length).toBe(r.booksScanned);
+  });
+
+  it('publishing exclusions does NOT widen the armed cohort (TRA-5014 negative control)', () => {
+    // The dangerous direction of this change would be a demo book leaking into
+    // an arm rollup. Every count below must read exactly as it did before.
+    const r = summarizeLiveArmCensus(
+      [
+        book(PIN, liveProdSettings()),
+        book('enock', { ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' }, runtime({ mode: 'demo', clientPresent: false })),
+        book('demo2', { ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' }, runtime({ mode: 'demo', clientPresent: false })),
+      ],
+      env(),
+    );
+    expect(r.rollup.liveBookCount).toBe(1);
+    expect(r.rollup.armedCount).toBe(1);
+    expect(r.rollup.realMoneyArmedCount).toBe(1);
+    expect(r.rollup.nonOperatorLiveBookCount).toBe(0);
+    expect(r.rollup.booksScannedNotPublishedCount).toBe(2);
+    // And a host with no demo books must publish an EMPTY array, never omit the
+    // key — an absent key is the absence-reads-clean shape this replaces.
+    const liveOnly = summarizeLiveArmCensus([book(PIN, liveProdSettings())], env());
+    expect(liveOnly.booksScannedButNotPublished).toEqual([]);
+    expect(liveOnly.rollup.booksScannedNotPublishedCount).toBe(0);
+  });
+
   it('a book live in MEMORY but demoted on disk is still censused (TRA-2649 split-brain)', () => {
     // The engine trades off runtime state. A census keyed on the durable store
     // alone would omit exactly the book that is placing orders.

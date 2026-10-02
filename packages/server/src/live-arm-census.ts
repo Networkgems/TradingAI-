@@ -192,6 +192,32 @@ export interface LiveArmCensusRow {
   brokerOutcome: BrokerSubmitCensusRow | null;
 }
 
+/**
+ * TRA-5014 — one scanned book that produced no {@link LiveArmCensusRow}, and
+ * why. Deliberately NOT a `LiveArmCensusRow`: these books were never credential-
+ * resolved, so every arm/creds field on a row would be a fabricated zero. Mode
+ * plus a reason code is everything this census can honestly say about them.
+ */
+export interface LiveArmCensusExcludedBook {
+  username: string;
+  /** The durable (settings) mode axis, folded the same way a published row folds it. */
+  mode: 'live' | 'demo';
+  /** The engine's own runtime mode axis — the second half of the cohort union. */
+  runtimeMode: string;
+  /**
+   * Why no row was emitted. `demo_on_both_axes` is the only reason the current
+   * filter can produce; it is an enum rather than a boolean so a later cohort
+   * change has somewhere to say what it dropped instead of silently reusing it.
+   */
+  reason: 'demo_on_both_axes';
+  /**
+   * Plain-language note, so this does not need a reader who knows the enum.
+   * Names the surface that CAN answer for the book, because the whole defect
+   * was a reader with no onward pointer.
+   */
+  note: string;
+}
+
 export interface LiveArmCensusReport {
   /**
    * Every resident book considered — the DENOMINATOR. Without it an empty
@@ -203,11 +229,42 @@ export interface LiveArmCensusReport {
   /** Rows: one per book resolving live on EITHER axis. Never elided. */
   books: LiveArmCensusRow[];
   /**
+   * TRA-5014 — the books `booksScanned` counted and `books` DROPPED, each with
+   * the reason it was dropped. `booksScanned` was supposed to be the
+   * denominator that makes an elision visible, and it is not sufficient: a
+   * reader has to notice that two numbers on the same object disagree, and
+   * then has no way to learn WHICH book went missing or why.
+   *
+   * It cost seven sessions. `enock` is the demo book the whole options forward
+   * test runs in; it resolves demo on both mode axes, so the cohort filter
+   * below skips it. On 2026-09-23..2026-10-01 that book produced ZERO option
+   * entries, and every live surface read `booksScanned: 4` / `books.length: 3`
+   * / `liveBookCount: 3` — i.e. nothing wrong — for the whole drought. Only
+   * the durable option journal showed it (QuantTrader, TRA-5014).
+   *
+   * Publishing the exclusions is the narrow fix and the SAFE direction: it
+   * cannot widen the cohort the arm rollups fold over (those still read
+   * `books` only), so no `armed`/`realMoneyArmed` count moves, and the no-auth
+   * disclosure stays counts-and-mode — no creds, no account tails, no reject
+   * text. `booksScanned === books.length + booksScannedButNotPublished.length`
+   * is an identity a reader can check, which is what `booksScanned` alone
+   * was reaching for.
+   */
+  booksScannedButNotPublished: LiveArmCensusExcludedBook[];
+  /**
    * Rollups — published ALONGSIDE the rows, never instead. Each is a plain
    * count over `books`, so a reader can check it against the rows themselves.
    */
   rollup: {
     liveBookCount: number;
+    /**
+     * TRA-5014 — `booksScannedButNotPublished.length`, published as a count so
+     * the elision is visible to a reader who only folds `rollup`. Non-zero is
+     * NOT an alarm: a demo book on this host is the normal case. It is a
+     * pointer — it says "this census is not the whole host", which is the one
+     * thing it could not say for the seven sessions `enock` was dark.
+     */
+    booksScannedNotPublishedCount: number;
     /** Live books that are NOT the pinned operator — the cohort with no instrument before this. */
     nonOperatorLiveBookCount: number;
     /** Live books whose entry gate is OPEN — they can place an options order now. */
@@ -276,12 +333,30 @@ export function summarizeLiveArmCensus(
   etDay: string | null = null,
 ): LiveArmCensusReport {
   const rows: LiveArmCensusRow[] = [];
+  const excluded: LiveArmCensusExcludedBook[] = [];
   for (const book of books) {
     const mode = book.settings.mode === 'live' ? 'live' : 'demo';
     // Cohort selection is deliberately the UNION of the two mode axes, never
     // the durable one alone. A book live on either axis is a book that may
     // place an order, and this census must never be the reason one is missed.
-    if (mode !== 'live' && book.runtime.mode !== 'live') continue;
+    if (mode !== 'live' && book.runtime.mode !== 'live') {
+      // TRA-5014 — record the exclusion rather than dropping it on the floor.
+      // The `continue` is unchanged: the cohort is still live-on-either-axis,
+      // and no rollup over `rows` moves.
+      excluded.push({
+        username: book.username,
+        mode,
+        runtimeMode: book.runtime.mode,
+        reason: 'demo_on_both_axes',
+        note:
+          `paper/demo book — scanned but not published in \`books[]\`, which is live-only. ` +
+          `This census says NOTHING about whether it is entering: a paper entry drought reads ` +
+          `identically here to a healthy paper book. Grade it on the durable option journal ` +
+          `(/api/health/option-journal?rows=all, bucket by openTs -> ET day) or on ` +
+          `/api/health/rv-scan -> armByEtDay (per accountClass x mode reachability).`,
+      });
+      continue;
+    }
     const resolved = resolveLiveOptionsCreds(book.settings, book.username, env);
     // `optionsClientConfigured` mirrors buildTradierLiveClient, which gates on
     // the settings mode it is handed — not on the runtime mode.
@@ -338,12 +413,16 @@ export function summarizeLiveArmCensus(
   return {
     booksScanned: books.length,
     books: rows,
+    // TRA-5014 — `booksScanned === books.length + booksScannedButNotPublished.length`
+    // by construction: every input book either builds a row or lands here.
+    booksScannedButNotPublished: excluded,
     brokerOutcomesEtDay: brokerCensus?.etDay ?? null,
     // TRA-3937 — true when the census data was loaded from a durable snapshot
     // (post-close restart). The grader uses this to avoid FORFEIT on a durable read.
     brokerOutcomesFromSnapshot: brokerCensus?.fromSnapshot ?? false,
     rollup: {
       liveBookCount: rows.length,
+      booksScannedNotPublishedCount: excluded.length,
       nonOperatorLiveBookCount: rows.filter(r => !isLiveBrokerOperator(r.username, env)).length,
       armedCount: rows.filter(r => r.liveEntryGateOpen).length,
       realMoneyArmedCount: rows.filter(r => r.realMoneyArmed).length,
