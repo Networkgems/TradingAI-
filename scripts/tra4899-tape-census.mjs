@@ -104,6 +104,7 @@ const MANIFEST = [
     needle: ['const MAX_FILE_BYTES = 144 * 1024 * 1024;',
       "predicate: () => ({ kind: 'bytes_whole_day', maxBytes: MAX_FILE_BYTES }),"],
     bootOnly: false, compactEveryDays: 0.25, sharedSpec: 'otmAdmissionTapeSharedTapeSpec',
+    publish: { src: 'otm-admission-tape.ts', needle: 'sharedCompaction: sharedTapeCompactionState(OTM_ADMISSION_TAPE),' },
     note: 'TRA-4899 re-scope (was 192 MiB); TRA-5038 — 6h SHARED timer + boot. Cap pruned by WHOLE ET DAYS' },
   { name: 'users/**/reports/closes/', src: 'close-ledger.ts', unit: 'bytes', value: 48 * MiB,
     needle: 'export const CLOSE_LEDGER_MAX_BYTES = 48 * 1024 * 1024;', dir: true,
@@ -130,16 +131,19 @@ const MANIFEST = [
     needle: ['const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;',
       "predicate: () => ({ kind: 'age', retainMs: RETAIN_MS }),"],
     bootOnly: false, compactEveryDays: 0.25, sharedSpec: 'liveEnforceGateSharedTapeSpec',
+    publish: { src: 'observability/health-routes.ts', needle: 'sharedCompaction: summary.sharedCompaction,' },
     note: 'TRA-5038 — 6h SHARED timer + boot; premium +0.83% (was bootGap/30d boot-only)' },
   { name: 'reversal-shadow-signals.jsonl', src: 'reversal-shadow-ledger.ts', unit: 'days', value: 30,
     needle: ['const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;',
       "predicate: () => ({ kind: 'age', retainMs: RETAIN_MS }),"],
     bootOnly: false, compactEveryDays: 0.25, sharedSpec: 'reversalShadowSharedTapeSpec',
+    publish: { src: 'index.ts', needle: 'sharedCompaction: sharedTapeCompactionState(REVERSAL_SHADOW_TAPE),' },
     note: 'bounded by TRA-4883; TRA-5038 — 6h SHARED timer + boot' },
   { name: 'churn-brake-guard.jsonl', src: 'churn-brake-ledger.ts', unit: 'days', value: 30,
     needle: ['const GUARD_RETAIN_MS = 30 * 24 * 60 * 60 * 1000;',
       "predicate: () => ({ kind: 'age', retainMs: GUARD_RETAIN_MS }),"],
     bootOnly: false, compactEveryDays: 0.25, sharedSpec: 'churnBrakeGuardSharedTapeSpec',
+    publish: { src: 'churn-brake-ledger.ts', needle: 'sharedCompaction: sharedTapeCompactionState(CHURN_BRAKE_GUARD_TAPE),' },
     note: 'TRA-5038 — 6h SHARED timer + boot; premium +0.83%' },
   { name: 'rv-scan-census.jsonl', src: 'rv-scan-census-ledger.ts', unit: 'days', value: 30,
     needle: 'export const CENSUS_RETAIN_MS = 30 * 24 * 60 * 60 * 1000;', bootOnly: true },
@@ -325,6 +329,22 @@ function assertManifestMatchesSource() {
           if (!idx.includes(seam)) {
             broken.push(`${row.name}: index.ts does not contain  ${seam}  — the timer is NOT armed for this tape`);
           }
+        }
+      }
+      // TRA-5038 AC3 — and the hook must be ON THE WIRE, which is a THIRD thing,
+      // separate from being armed. Two of the four routes hand-pick fields off their
+      // summary rather than spreading it, so a `sharedCompaction` added to the summary
+      // type alone typechecks, tests green, and never reaches a reader. `publish` names
+      // the file and the literal that actually serves it.
+      if (row.publish) {
+        const pubPath = join(SRC, row.publish.src);
+        if (!existsSync(pubPath)) {
+          broken.push(`${row.name}: publish site ${row.publish.src} does not exist`);
+        } else if (!readFileSync(pubPath, 'utf8').includes(row.publish.needle)) {
+          broken.push(
+            `${row.name}: ${row.publish.src} does not contain  ${row.publish.needle}  — `
+            + 'the compaction hookState is NOT published on this tape\'s health route',
+          );
         }
       }
     }

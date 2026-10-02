@@ -8276,6 +8276,21 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           processStartedAt: liveEnforceBuild.startedAt,
         }),
       },
+      /**
+       * TRA-5038 AC3 — the shared periodic compaction hook, as this tape sees it.
+       *
+       * Published explicitly because this route hand-picks fields off `summary`
+       * rather than spreading it: a field added to `LiveEnforceSummary` alone would
+       * typecheck, test green, and never reach the wire.
+       *
+       * ⚠ READ `hookState`, NOT `timerPasses`. bqb1's uptime is routinely under one
+       * 6h interval, so 0 passes is the ordinary HEALTHY reading; `timer_not_armed`
+       * is the alarm, and it is the state in which every other field on this route
+       * still reads healthy. `span.fill` is the TRA-5038 AC1 answer — when it reads
+       * `still_filling`, this tape's bytes divided by `retained.retentionDays`
+       * UNDERSTATE its write rate.
+       */
+      sharedCompaction: summary.sharedCompaction,
       // TRA-3216 — the universe restriction is a live rejection path that is ON by
       // DEFAULT, so it has to enter this sentence. Before this ticket the
       // `!anyArmed` branch asserted the live path was "byte-for-byte ... no

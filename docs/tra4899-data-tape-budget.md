@@ -355,12 +355,25 @@ can be computed without reading every retained byte, which is the cost just remo
 and `bytesDropped` are exact (the dropped prefix is walked) and `bytesBefore/After` come off `stat`.
 **Do not "complete" the payload by adding a full-file line count back.**
 
-**AC3 surface.** Each of the four publishes `sharedCompaction` on its health route
-(`/api/health/live-enforce-gates`, `/api/health/churn-brake`, `/api/health/reversal-shadow-signals`,
-`/api/health/otm-admission-tape`) carrying the same four-state arm-derived enum as
-`/api/health/cost-aware-gate`. The key is `sharedCompaction`, not `compaction`, on all four
-deliberately: `reversal-shadow-signals` already publishes `compaction` for its **boot** outcome, and
-one consistent name across the four beats a collision on one of them.
+**AC3 surface.** Each of the four publishes `sharedCompaction` carrying the same four-state
+arm-derived enum as `/api/health/cost-aware-gate`. The key is `sharedCompaction`, not `compaction`,
+on all four deliberately: `reversal-shadow-signals` already publishes `compaction` for its **boot**
+outcome, and one consistent name across the four beats a collision on one of them. The exact paths —
+the depth differs because one route nests its whole durable fold:
+
+| route | JSON path |
+|---|---|
+| `/api/health/live-enforce-gates` | `sharedCompaction` |
+| `/api/health/churn-brake` | `retained.sharedCompaction` |
+| `/api/health/reversal-shadow-signals` | `sharedCompaction` |
+| `/api/health/otm-admission-tape` | `sharedCompaction` |
+
+⚠️ **Being armed and being ON THE WIRE are two different things**, and this bit nearly shipped
+wrong. `/api/health/live-enforce-gates` **hand-picks** fields off its summary rather than spreading
+it, so the field added to `LiveEnforceSummary` typechecked, tested green, and would not have reached
+a single reader. The census now asserts the publication literal in the file that actually serves it
+(`publish` on each manifest row) as a third seam beside the predicate and the arm — verified by
+control: blanking that literal exits **BLIND (3)** naming the route.
 
 **AC1 is answered by `sharedCompaction.span`, and it is measured at boot, not only on a fire.** A
 span published only inside a timer outcome would be unreadable on bqb1, whose uptime is routinely
@@ -376,10 +389,11 @@ reads `still_filling`, `size / retentionDays` **understates** the rate and `span
 `bootOnly: false` + `compactEveryDays: 0.25`, and the needle check now asserts three further seams:
 the owner's own `predicate:` literal, `SHARED_TAPE_COMPACTION_INTERVAL_MS = 6 * …` in the shared
 module, and that `index.ts` still references that tape's spec factory, `registerSharedTape(` and
-`noteSharedTapeCompactionArmed()`. A reverted registration leaves every other field on the health
-route reading healthy, so it exits **BLIND (3)** at desk time instead of at `minFreePct`. Both
-directions were run as controls: a row claiming a 12 h cadence and a spec factory `index.ts` never
-references each exit 3 naming the row.
+`noteSharedTapeCompactionArmed()`, plus the per-tape **publication** literal above. A reverted
+registration leaves every other field on the health route reading healthy, so it exits
+**BLIND (3)** at desk time instead of at `minFreePct`. All three directions were run as controls: a
+row claiming a 12 h cadence, a spec factory `index.ts` never references, and a blanked publication
+literal each exit 3 naming the row.
 
 ⛔ **Still open at the time of writing — these are measurements, not code:**
 
