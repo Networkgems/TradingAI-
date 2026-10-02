@@ -85,16 +85,41 @@
  * mode of a grader over other people's artefacts is to convict them. If any control
  * fails, the instrument is BLIND (exit 3) and no verdict is printed.
  *
- * POPULATION — a NAMED limitation, printed every run
- * --------------------------------------------------
- * Carriers come from `lastRun.linkedIssueId` on the routines list route, i.e. ONE
+ * POPULATION — TWO ARMS, and a NAMED limitation printed every run
+ * ---------------------------------------------------------------
+ * ARM 1, ROUTINE-BORN: `lastRun.linkedIssueId` on the routines list route, i.e. ONE
  * carrier per routine, the newest. A worked newer carrier hides an abandoned older one.
- * For THIS population that is close to complete and the reason is structural, not a
- * shrug: deploy trains are one-shots whose own prose archives them at step 1, so a
- * deploy-train routine has essentially one carrier in its life. It is still a limit and
- * it is still printed on every run. Closing it entirely means paging
+ * Deploy trains are one-shots whose own prose archives them at step 1, so a deploy-train
+ * routine has essentially one carrier in its life. Closing that entirely means paging
  * `/api/routines/{id}/runs` per routine, which is NOT implemented here — do not read the
  * printed limit as "there is a flag for that".
+ *
+ * ARM 2, HAND-FILED (TRA-4984): any issue on the board, via the PAGED issue list.
+ *
+ * ⛔ ARM 1 ALONE EXCLUDED AN ENTIRE CLASS OF CARRIER BY CONSTRUCTION, AND IT WAS THE
+ * CLASS THAT MATTERS MOST. TRA-4942 ordered a commit onto the REAL-MONEY host, by hand,
+ * with a real deadline and a syntactically perfect block — and was not a candidate, so
+ * the sweep reported nothing about it however often it ran. A human hand-files a deploy
+ * precisely when the decision is too consequential to automate. Arm 1's named limit was
+ * about WHICH routine-born carrier you see; this was a larger hole of a different kind.
+ *
+ * It survived six weeks because the sweep was exiting 3 (BLIND) on its own controls the
+ * whole time, which reads as "known-bad instrument". Generalisable: A BROKEN DETECTOR
+ * HIDES ITS OWN COVERAGE GAPS — every verdict is already untrustworthy, so nobody gets as
+ * far as asking whether the POPULATION was right. Repairing the controls is what exposed
+ * this one.
+ *
+ * ⛔ ARM 2 FAILS CLOSED IN TWO PLACES, AND BOTH REFUSALS ARE THE SAME SENTENCE: "0
+ * carriers found" IS NOT "the board is clean".
+ *   · the ENUMERATION. `GET /api/companies/{c}/issues` caps at 1000 rows and an IGNORED
+ *     `offset` returns a full page too, so exhaustiveness is proved by the deduped union
+ *     GROWING (`enumerateIssues`). Any failure is a BLIND reason string, never an empty
+ *     set.
+ *   · the DESCRIPTION. The list route truncates `description` at ~1200 chars on 2735 of
+ *     3000 rows (91.2%, measured 2026-10-02), and `classifyCarrier` on a cut body does
+ *     not fail — it returns NOT_TRAIN, which is SILENT. So every in-window carrier is
+ *     RE-READ with a full `GET /api/issues/{id}`, a still-truncated body is BLIND, and the
+ *     read cost is bounded by `--issue-cap` which goes BLIND rather than grading a prefix.
  *
  * ⛔ RECENCY IS PART OF THE SUBJECT, AND IT IS NOT A SILENT CAP
  * The subject is "is a deploy order AT RISK OF BEING STRANDED RIGHT NOW". A carrier that
@@ -114,6 +139,9 @@
  *   node scripts/check-deploy-train-window.mjs
  *   node scripts/check-deploy-train-window.mjs --since=2026-08-01T00:00:00Z
  *   node scripts/check-deploy-train-window.mjs --all      # include settled history
+ *   node scripts/check-deploy-train-window.mjs --issue-cap=400
+ *       # the ceiling on in-window carriers RE-READ in full. Above it the verdict is
+ *       # BLIND, never a silently graded prefix.
  *   node scripts/check-deploy-train-window.mjs --json
  *   node scripts/check-deploy-train-window.mjs --selftest      # controls only
  *   node scripts/check-deploy-train-window.mjs --live=<sha>    # grade a SHA you hold
@@ -162,6 +190,10 @@
 
 import { spawnSync } from 'node:child_process';
 import { gradedAncestry as libGradedAncestry, blindReason } from './lib/shallow-ancestry.mjs';
+// TRA-4984: the hand-filed arm's population. The guard it carries is the whole reason it
+// is a library — `GET /api/companies/{c}/issues` caps at 1000 rows and an IGNORED `offset`
+// returns a FULL page, so a one-shot read is 42% of the board reported as all of it.
+import { enumerateIssues } from './lib/paperclip-enumeration.mjs';
 
 export const EXIT_CLEAN = 0;
 export const EXIT_FINDINGS = 1;
@@ -304,14 +336,46 @@ export function gradeTiming({ order, deploys, knownSha, ancestryOracle = libGrad
   // "path was cut" and "genuinely not an ancestor" identically, so a bare `.ok` can
   // turn a pre-deadline deploy unknown to a shallow checkout into timing='unread'
   // instead of timing='on_time', which then lets a stranded verdict through.
+  //
+  // ⛔ THE ASK IS PER DISTINCT COMMIT, AND ONLY WHERE A VERDICT TURNS ON IT. Every ask
+  // spawns git (~400ms measured on Windows) and the history cap is 600 rows, so the naive
+  // `served.filter(carries)` cost MINUTES PER GRADED CARRIER. That was survivable only
+  // while the routine-born population yielded ~one graded carrier; once TRA-4984 widened
+  // the population to hand-filed carriers the sweep stopped reaching a verdict at all, and
+  // a detector nobody can afford to run is a detector that does not run. BOTH reductions
+  // below are ANSWER-IDENTICAL, not approximations:
+  //   · 580 served rows carry 503 DISTINCT commits (measured 2026-10-02). A re-deploy of
+  //     the same commit cannot have a different ancestry, so the answer is cached by commit.
+  //   · the full `carrying` list is read only by the two branches BELOW the on_time return,
+  //     so it is built LAZILY. A healthy on-time train never asks about one post-deadline
+  //     deploy.
+  //
+  // ⚠ AND NO TIME-BASED PRE-FILTER, THOUGH IT IS THE TEMPTING ONE. "A deploy that served
+  // before the ordered commit's own committer date cannot carry it" would cut ~500 asks to
+  // ~10 — and is REJECTED: a committer date is rewritable and skew-prone, and one forged
+  // LATE would skip the genuinely-carrying deploy and turn an ON TIME train into LATE.
+  // That is a false accusation, which this file names as the expensive direction.
+  const carryCache = new Map();
   const carries = (d) => {
     if (typeof d.commit !== 'string') return false;
+    if (carryCache.has(d.commit)) return carryCache.get(d.commit);
     const { answer } = ancestryOracle(order.commit, d.commit);
-    return answer === true; // null (blind/shallow) fails closed to false
+    const v = answer === true; // null (blind/shallow) fails closed to false
+    carryCache.set(d.commit, v);
+    return v;
   };
-  const carrying = served.filter(carries).sort((a, b) => a.finishedMs - b.finishedMs);
+  const byTime = (a, b) => a.finishedMs - b.finishedMs;
 
-  const onTime = carrying.filter((d) => d.finishedMs <= order.deadlineMs);
+  // ⛔ THIS STAYS AN ASCENDING SCAN OVER EVERY PRE-DEADLINE ROW. `onTime[0]` is the
+  // EARLIEST carrying deploy at or before the deadline, and that instant IS the evidence
+  // the verdict is quoted on. Scanning newest-first and stopping at the first hit would be
+  // ONE ask instead of hundreds, and would quote a later instant than the proof — a
+  // cheaper verdict backed by weaker evidence than the one the carrier was graded on.
+  // (Filtering by deadline BEFORE asking is free and commutes.)
+  const onTime = served
+    .filter((d) => d.finishedMs <= order.deadlineMs)
+    .filter(carries)
+    .sort(byTime);
   if (onTime.length > 0) {
     return {
       timing: 'on_time',
@@ -337,6 +401,8 @@ export function gradeTiming({ order, deploys, knownSha, ancestryOracle = libGrad
     };
   }
 
+  // Only the two branches from here down read the whole list, so this is where it is built.
+  const carrying = served.filter(carries).sort(byTime);
   if (carrying.length === 0) {
     return {
       timing: 'unread',
@@ -476,6 +542,190 @@ export function firedSince(triggeredAt, sinceMs) {
   const t = Date.parse(triggeredAt);
   if (!Number.isFinite(t)) return true;
   return t >= sinceMs;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE SECOND POPULATION ARM — HAND-FILED CARRIERS (TRA-4984)
+//
+// ⛔ A ROUTINE-BORN POPULATION CANNOT SEE THE CARRIERS THAT MATTER MOST.
+// Until this arm existed the only gradeable carriers were issues born from a routine
+// fire (`lastRun.linkedIssueId`). TRA-4942 — a deploy order on the REAL-MONEY host, with
+// a real deadline and a syntactically perfect `deploy-order` block — was filed BY HAND by
+// LeadDev off its parent, and was therefore outside the population BY CONSTRUCTION. The
+// repaired detector was re-run against it and still reported nothing, because the row was
+// never a candidate. A human hand-files a deploy when the decision is too consequential
+// to automate, so the excluded class was exactly the consequential one.
+//
+// It stayed invisible for six weeks because the sweep was exiting 3 (BLIND) on its own
+// controls the whole time. Generalisable: A BROKEN DETECTOR HIDES ITS OWN COVERAGE GAPS,
+// because every verdict it emits is already untrustworthy, so nobody gets as far as
+// asking whether the POPULATION was right.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const CLASS_ROUTINE = 'routine-born';
+export const CLASS_HAND_FILED = 'hand-filed';
+
+/**
+ * The issue arm's recency stamp. Pure so it can carry a control.
+ *
+ * ⛔ IT IS `updatedAt`, NOT `createdAt`, AND THAT IS NOT INTERCHANGEABLE. The routine arm
+ * keys on `lastRun.triggeredAt` because a routine-born carrier is born WITH its order. A
+ * hand-filed order can be EDITED INTO an old row — which is a live order on an old
+ * ticket — and keying on `createdAt` would exclude it for the age of its ticket rather
+ * than the age of its order. `updatedAt` is the inclusive key; `createdAt` is only the
+ * fallback for a row that somehow carries no update stamp; and `firedSince` INCLUDES an
+ * unreadable one, so a malformed timestamp still cannot delete a carrier from the sweep.
+ */
+export function issueRecencyStamp(row) {
+  if (row == null || typeof row !== 'object') return null;
+  if (typeof row.updatedAt === 'string' && row.updatedAt !== '') return row.updatedAt;
+  if (typeof row.createdAt === 'string' && row.createdAt !== '') return row.createdAt;
+  return null;
+}
+
+/**
+ * ⛔ THE ISSUE-LIST ROUTE TRUNCATES `description`, AND THE CARRIER PREDICATE IS A SEARCH
+ * OVER THE WHOLE BODY. A CUT BODY DOES NOT FAIL — IT CLASSIFIES `NOT_TRAIN`, SILENTLY.
+ *
+ * Measured 2026-10-02 against the live board, all 3000+ rows paged: `descriptionTruncated`
+ * is an explicit boolean on every list row, and it is `true` on **2735 of 3000 (91.2%)**,
+ * cut between 1200 and 1205 characters. So the widened arm CANNOT grade off the list rows
+ * it enumerates: it must re-read each in-window candidate with a full
+ * `GET /api/issues/{id}` and then PROVE the body it is about to grade was whole.
+ *
+ * Grading a truncated description is the SAME CLASS OF DEFECT as the population hole this
+ * ticket closes — a silent absence that reads as a clean bill of health — so it is BLIND,
+ * never `NOT_TRAIN`. (TRA-4942's own block sits at offset 359 and would have survived the
+ * cut, which is precisely why this guard needs a CONTROL and not a demonstration: the one
+ * carrier we can point at does not exercise it.)
+ *
+ * The full GET omits the flag entirely rather than returning `false`, so the test is
+ * `=== true` and an ABSENT flag is readable. A `description` that is not a string is
+ * unreadable, which is not the same as empty.
+ */
+export function readableDescription(issue) {
+  if (issue == null || typeof issue !== 'object') {
+    return { ok: false, reason: 'carrier row is not an object — and an absent body classifies NOT_TRAIN, i.e. silent' };
+  }
+  if (issue.descriptionTruncated === true) {
+    const n = typeof issue.description === 'string' ? issue.description.length : 0;
+    return {
+      ok: false,
+      reason:
+        `description TRUNCATED at ${n} chars (\`descriptionTruncated: true\`) — a \`deploy-order\` block past the ` +
+        'cut reads NOT_TRAIN, so this row is BLIND. Re-read it with a full GET /api/issues/{id}.',
+    };
+  }
+  if (typeof issue.description !== 'string') {
+    return {
+      ok: false,
+      reason: `description is ${issue.description === null ? 'null' : typeof issue.description} — unreadable, which is NOT "empty, therefore not a train"`,
+    };
+  }
+  return { ok: true, description: issue.description };
+}
+
+/**
+ * Grade one carrier from its ISSUE OBJECT rather than from a bare description string, so
+ * the truncation guard above sits on the only path a live row can take. Both arms —
+ * routine-born and hand-filed — go through this; the routine arm was reading full GETs
+ * already, and routing it here costs nothing and closes the same hole if that ever changes.
+ */
+export function gradeCarrierRow({ issue, ...rest }) {
+  const readable = readableDescription(issue);
+  if (!readable.ok) {
+    return { verdict: 'BLIND', finding: false, late: false, ungraded: false, timing: 'n/a', detail: readable.reason, span: null };
+  }
+  return gradeCarrier({ description: readable.description, ...rest });
+}
+
+/**
+ * Fold the two arms into one population, keyed on the issue id.
+ *
+ * ⛔ A ROW REACHABLE BOTH WAYS IS GRADED ONCE, AND THE ROUTINE LABEL SURVIVES. A routine
+ * fire is a stronger provenance than "it is on the board": it carries the `triggeredAt`
+ * the recency filter was designed around, and the routine id a reader needs to go find
+ * the schedule. Letting the issue arm overwrite it would turn every routine-born carrier
+ * into an anonymous hand-filed one the moment the second arm shipped — a widening that
+ * DESTROYS information is not a widening.
+ *
+ * Returns `{ carriers, counts }`. `counts.both` is the overlap and is PRINTED: if it ever
+ * reaches zero while the routine arm is non-empty, the two arms are reading disjoint
+ * boards and one of them is wrong.
+ */
+export function mergeCarriers(routineBorn, issueBorn) {
+  const byId = new Map();
+  for (const c of routineBorn || []) {
+    if (!c || !c.issueId) continue;
+    byId.set(c.issueId, { ...c, carrierClass: CLASS_ROUTINE });
+  }
+  const routineOnly = byId.size;
+  let both = 0;
+  for (const c of issueBorn || []) {
+    if (!c || !c.issueId) continue;
+    const prior = byId.get(c.issueId);
+    if (prior) {
+      both += 1;
+      byId.set(c.issueId, { ...prior, bothArms: true });
+      continue;
+    }
+    byId.set(c.issueId, { ...c, carrierClass: CLASS_HAND_FILED });
+  }
+  const carriers = [...byId.values()];
+  return {
+    carriers,
+    counts: {
+      routine: routineOnly,
+      handFiled: carriers.filter((c) => c.carrierClass === CLASS_HAND_FILED).length,
+      both,
+      total: carriers.length,
+    },
+  };
+}
+
+/**
+ * ⛔ THE GIT ORACLE IS MEMOISED FOR THE RUN. THIS IS A WALL-CLOCK FIX, NOT A SEMANTIC ONE,
+ * AND WITHOUT IT THE WIDENED SWEEP DOES NOT FINISH.
+ *
+ * `gradeTiming` asks the ancestry oracle once per SERVED DEPLOY — the history cap is 600 —
+ * for EVERY graded carrier, and every ask spawns `git`. At the ~200ms a spawn costs on
+ * Windows that is 2-4 MINUTES PER GRADED CARRIER. It was survivable only because the
+ * routine-born population yielded about one graded carrier; the widened population
+ * (TRA-4984) runs the same loop over the hand-filed carriers too, and the first live run
+ * of this change ran >15 minutes without printing a verdict. A detector nobody can afford
+ * to run is a detector that does not run.
+ *
+ * Memoising is SOUND, not a shortcut: git ancestry between two FIXED objects cannot change
+ * inside one process. Nothing in this file fetches, and `git fetch --unshallow` — the
+ * remedy the BLIND text prints — happens BETWEEN runs, so a cached `null` can never
+ * outlive the checkout state that produced it.
+ *
+ * ⚠ IT IS A CACHE OVER `libGradedAncestry` AND MUST NEVER BECOME A SECOND ORACLE. The
+ * whole TRA-3740 fix was that a bare `merge-base --is-ancestor .ok` collapses "path was
+ * grafted away" into "not an ancestor"; a hand-rolled fast path here would re-open that
+ * by the back door. The control below pins both halves: the answer is the library's,
+ * byte-for-byte, and the library is asked ONCE per pair.
+ */
+export function memoizeOracle(oracle) {
+  const cache = new Map();
+  return (a, b) => {
+    const k = `${a}\u0000${b}`;
+    if (cache.has(k)) return cache.get(k);
+    const v = oracle(a, b);
+    cache.set(k, v);
+    return v;
+  };
+}
+
+/** Same reasoning for `knownSha`, which `gradeTiming` also asks per served deploy. */
+export function memoizePredicate(fn) {
+  const cache = new Map();
+  return (s) => {
+    if (cache.has(s)) return cache.get(s);
+    const v = fn(s);
+    cache.set(s, v);
+    return v;
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -734,6 +984,146 @@ const CONTROLS = [
         (r) => r.verdict === 'NOT_TRAIN' && r.finding === false,
       ),
   },
+
+  // ── the widened population: HAND-FILED carriers (TRA-4984) ────────────────
+  // Both directions, because the whole failure being fixed is that an entire class of
+  // carrier was SILENT. A widening proved only in the positive direction would be half
+  // proved: it would say the arm can SEE a hand-filed strand and nothing about whether it
+  // stays QUIET on a hand-filed order that was obeyed — and over other people's artefacts
+  // the expensive direction is the false accusation.
+  {
+    name: 'POPULATION WIDENED POSITIVE — a HAND-FILED carrier (no routine) with a passed deadline and an ABSENT commit grades STRANDED',
+    run: () =>
+      expect(
+        gradeCarrierRow({
+          issue: {
+            identifier: 'TRA-HAND-1',
+            description: `Deploy to bqb1 before the open.\n\n${orderBlock(NOT_IN_LIVE, '2026-08-13T11:00:00Z')}`,
+            descriptionTruncated: false,
+          },
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
+        }),
+        (r) => r.verdict === 'STRANDED' && r.finding === true,
+      ),
+  },
+  {
+    name: 'POPULATION WIDENED NEGATIVE — the same HAND-FILED carrier whose commit IS live is SATISFIED and silent',
+    run: () =>
+      expect(
+        gradeCarrierRow({
+          issue: {
+            identifier: 'TRA-HAND-2',
+            description: `Deploy to bqb1 before the open.\n\n${orderBlock(IN_LIVE, '2026-08-13T11:00:00Z')}`,
+            descriptionTruncated: false,
+          },
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
+        }),
+        (r) => r.verdict === 'SATISFIED' && r.finding === false && r.late === false && r.ungraded === false,
+      ),
+  },
+  {
+    name: 'POPULATION FAILS CLOSED — a TRUNCATED description is BLIND, never NOT_TRAIN (the list route cuts 91% of rows at ~1200 chars)',
+    run: () => {
+      // The block is pushed past the cut, exactly as the list route delivers it: the
+      // visible prefix contains no deploy mention at all, so the UNGUARDED reading of
+      // this row is `NOT_TRAIN` — silent, and indistinguishable from a clean board.
+      const whole = `${'Background. '.repeat(120)}\n\n${orderBlock(NOT_IN_LIVE, '2026-08-13T11:00:00Z')}`;
+      const cut = whole.slice(0, 1200);
+      const unguarded = gradeCarrier({ description: cut, nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle });
+      const guarded = gradeCarrierRow({
+        issue: { identifier: 'TRA-HAND-3', description: cut, descriptionTruncated: true },
+        nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
+      });
+      return expect(
+        { cutHidesTheBlock: !cut.includes('```deploy-order'), unguarded: unguarded.verdict, guarded: guarded.verdict, guardedFinding: guarded.finding },
+        (r) => r.cutHidesTheBlock === true && r.unguarded === 'NOT_TRAIN' && r.guarded === 'BLIND' && r.guardedFinding === false,
+      );
+    },
+  },
+  {
+    name: 'POPULATION FAILS CLOSED — an ABSENT truncation flag (the full GET omits it) is READABLE, not BLIND',
+    run: () =>
+      expect(
+        [
+          readableDescription({ description: 'no deploys here' }),
+          readableDescription({ description: null, descriptionTruncated: false }),
+          readableDescription(null),
+        ],
+        (r) => r[0].ok === true && r[1].ok === false && r[2].ok === false,
+      ),
+  },
+  {
+    name: 'POPULATION MERGE — a carrier reachable BOTH ways is graded ONCE and keeps its routine label',
+    run: () =>
+      expect(
+        mergeCarriers(
+          [{ routine: 'aaaaaaaa', issueId: 'i1', firedAt: '2026-08-13T06:30:00Z' }],
+          [{ issueId: 'i1', firedAt: '2026-08-12T00:00:00Z' }, { issueId: 'i2', firedAt: '2026-08-13T09:00:00Z' }],
+        ),
+        (r) =>
+          r.carriers.length === 2 &&
+          r.counts.both === 1 &&
+          r.counts.handFiled === 1 &&
+          r.carriers.find((c) => c.issueId === 'i1').carrierClass === CLASS_ROUTINE &&
+          r.carriers.find((c) => c.issueId === 'i1').routine === 'aaaaaaaa' &&
+          r.carriers.find((c) => c.issueId === 'i1').firedAt === '2026-08-13T06:30:00Z' &&
+          r.carriers.find((c) => c.issueId === 'i2').carrierClass === CLASS_HAND_FILED,
+      ),
+  },
+  {
+    name: 'POPULATION MERGE — the issue arm can CONTRIBUTE a carrier the routine arm cannot reach at all (the TRA-4942 shape)',
+    run: () =>
+      expect(mergeCarriers([], [{ issueId: 'hand', firedAt: '2026-08-13T09:00:00Z' }]), (r) => r.counts.total === 1 && r.counts.handFiled === 1 && r.counts.both === 0),
+  },
+  {
+    name: 'MEMO — the memoised oracle returns the UNDERLYING answer unchanged (incl. a blind `null`) and asks it ONCE per pair',
+    run: () => {
+      let calls = 0;
+      const counted = (a, b) => {
+        calls += 1;
+        return stubOracle(a, b);
+      };
+      const memo = memoizeOracle(counted);
+      const pairs = [[IN_LIVE, LIVE], [NOT_IN_LIVE, LIVE], ['unknown-sha', LIVE]];
+      const first = pairs.map(([a, b]) => memo(a, b));
+      const second = pairs.map(([a, b]) => memo(a, b));
+      const third = pairs.map(([a, b]) => stubOracle(a, b));
+      let predCalls = 0;
+      const memoPred = memoizePredicate((s) => {
+        predCalls += 1;
+        return stubKnown(s);
+      });
+      const preds = [memoPred(LIVE), memoPred(LIVE), memoPred('nope'), memoPred('nope')];
+      return expect(
+        { calls, answers: first.map((r) => r.answer), stable: JSON.stringify(first) === JSON.stringify(second), matchesRaw: JSON.stringify(first) === JSON.stringify(third), predCalls, preds },
+        (r) =>
+          r.calls === 3 &&
+          r.answers[0] === true &&
+          r.answers[1] === false &&
+          r.answers[2] === null &&
+          r.stable === true &&
+          r.matchesRaw === true &&
+          r.predCalls === 2 &&
+          JSON.stringify(r.preds) === JSON.stringify([true, true, false, false]),
+      );
+    },
+  },
+  {
+    name: 'POPULATION RECENCY — the issue arm keys on `updatedAt`, falls back to `createdAt`, and an unreadable stamp is INCLUDED',
+    run: () =>
+      expect(
+        [
+          issueRecencyStamp({ updatedAt: '2026-08-13T06:30:00Z', createdAt: '2026-07-01T00:00:00Z' }),
+          issueRecencyStamp({ createdAt: '2026-07-01T00:00:00Z' }),
+          issueRecencyStamp({}),
+          firedSince(issueRecencyStamp({}), T0),
+          // An order EDITED INTO an old ticket: created long before the window, updated
+          // inside it. `createdAt` keying would drop it; `updatedAt` keeps it.
+          firedSince(issueRecencyStamp({ createdAt: '2026-06-01T00:00:00Z', updatedAt: '2026-08-13T06:30:00Z' }), T0 - 864e5),
+        ],
+        (r) => r[0] === '2026-08-13T06:30:00Z' && r[1] === '2026-07-01T00:00:00Z' && r[2] === null && r[3] === true && r[4] === true,
+      ),
+  },
 ];
 
 function expect(actual, pred) {
@@ -776,7 +1166,61 @@ const timingTag = (r) => {
   return '';
 };
 
-const knownSha = (s) => git(['cat-file', '-e', `${s}^{commit}`]).ok;
+// ⛔ BOTH ARE MEMOISED PER PROCESS, and the memo is a CACHE over the real thing — see
+// `memoizeOracle`. `gradeTiming` asks each of these once per served deploy (cap 600) for
+// every graded carrier; un-memoised, the widened sweep spends minutes per carrier inside
+// `git` spawns and never reaches a verdict. Ancestry between two fixed objects cannot
+// change inside one process, and `--unshallow` is a BETWEEN-runs remedy.
+const knownShaCache = new Map();
+const knownSha = (s) => {
+  if (knownShaCache.has(s)) return knownShaCache.get(s);
+  const v = git(['cat-file', '-e', `${s}^{commit}`]).ok;
+  knownShaCache.set(s, v);
+  return v;
+};
+const liveOracle = memoizeOracle(libGradedAncestry);
+
+/**
+ * Seed `knownShaCache` for MANY commits in ONE git spawn.
+ *
+ * `gradeTiming` asks `knownSha` once per pre-deadline served deploy — up to 600 — and a
+ * spawn is the whole cost, so one-at-a-time is ~500 process creations for a question
+ * `cat-file --batch-check` answers in a single pipe.
+ *
+ * ⛔ IT IS A PREWARM, NOT A REPLACEMENT, AND A FAILURE HERE CHANGES NO VERDICT. Anything
+ * the batch cannot answer is simply left out of the cache and falls through to the
+ * per-commit `cat-file -e` above, which is the path all the controls pin. A batch that
+ * errors out, times out, or returns a short/garbled stream therefore costs latency and
+ * nothing else — the one thing an optimisation on a fail-closed instrument must not do is
+ * become a second source of truth.
+ */
+function prewarmKnownSha(shas) {
+  const want = [...new Set(shas.filter((s) => typeof s === 'string' && /^[0-9a-f]{7,40}$/i.test(s)))].filter((s) => !knownShaCache.has(s));
+  if (want.length === 0) return { asked: 0, seeded: 0 };
+  const r = spawnSync('git', ['cat-file', '--batch-check'], {
+    input: want.map((s) => `${s}^{commit}`).join('\n') + '\n',
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: 60_000,
+  });
+  if (r.status !== 0 || typeof r.stdout !== 'string') return { asked: want.length, seeded: 0 };
+  const out = r.stdout.split('\n');
+  let seeded = 0;
+  for (let i = 0; i < want.length && i < out.length; i += 1) {
+    const fields = out[i].trim().split(/\s+/);
+    // `<sha> commit <size>` on a hit; `<name> missing` / `… ambiguous` otherwise. Anything
+    // that is not an unambiguous `commit` is left UNSEEDED rather than cached as false, so
+    // the authoritative per-commit probe still gets to answer it.
+    if (fields[1] === 'commit') {
+      knownShaCache.set(want[i], true);
+      seeded += 1;
+    } else if (fields[1] === 'missing') {
+      knownShaCache.set(want[i], false);
+      seeded += 1;
+    }
+  }
+  return { asked: want.length, seeded };
+}
 // ⛔ There is deliberately NO `isAncestor` here. A bare `merge-base --is-ancestor .ok` is the
 // graft hole TRA-3740 closed, and leaving one defined invites a call site to pass it as the
 // oracle. The production graders take the default `ancestryOracle` — the shallow-aware
@@ -786,6 +1230,48 @@ async function getJson(url, headers) {
   const res = await fetch(url, { headers });
   if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
   return res.json();
+}
+
+/** Counts rows that needed a retry, so transport flakiness is PRINTED, not smoothed away. */
+const retryTally = { retried: 0, attempts: 0 };
+
+/**
+ * ⛔ A TRANSIENT READ FAILURE MUST NOT SPEND THE WHOLE RUN'S VERDICT.
+ *
+ * The widened population (TRA-4984) turned one issue read into ~215 of them, and at that
+ * volume a bare `fetch failed` — a dropped keep-alive, not a refusal — showed up on 4 of
+ * 215 rows on the first live run. Fail-closed is right, so each of those became a BLIND
+ * row and `BLIND` outranks everything: ONE flaky socket discarded a sweep in which five
+ * real orders had just been graded.
+ *
+ * That is precisely how this detector got into the state the ticket describes. It exited 3
+ * for six weeks, BLIND came to read as "known-bad instrument", and nobody looked past it to
+ * notice the population was wrong. An instrument that cries BLIND on ordinary transport
+ * noise trains its readers to ignore it, and then its real refusals are worth nothing.
+ *
+ * So the read is RETRIED a bounded number of times and the retries are COUNTED AND
+ * PRINTED. A row that fails every attempt is still BLIND — the guarantee is unchanged;
+ * what changes is that BLIND now means "this row could not be read", not "a packet was
+ * dropped once".
+ */
+async function getJsonRetrying(url, headers, { attempts = 3, baseDelayMs = 250 } = {}) {
+  let lastErr;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      const v = await getJson(url, headers);
+      if (i > 0) retryTally.retried += 1;
+      return v;
+    } catch (err) {
+      lastErr = err;
+      retryTally.attempts += 1;
+      // A 4xx is a REFUSAL and will refuse identically next time; only retry transport
+      // faults and 5xx. Retrying an auth failure would just triple the latency of a
+      // verdict that is already decided.
+      if (/^HTTP 4\d\d /.test(String(err?.message))) break;
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, baseDelayMs * (i + 1)));
+    }
+  }
+  throw lastErr;
 }
 
 const RENDER_API = 'https://api.render.com/v1';
@@ -918,10 +1404,12 @@ async function main() {
         console.log(`[train] timing arm OFF — ${bound.reason}`);
       } else {
         deploys = bound.rows;
+        const warm = prewarmKnownSha(bound.rows.map((d) => d.commit));
         console.log(
           `[train] timing arm ON — ${bound.rows.length} deploy records over ${bound.pages} page(s), back to ${bound.oldest};` +
             ` history bound to live ${short(liveSha)} by its newest \`live\` deploy.`,
         );
+        console.log(`[train]   object-existence prewarm: ${warm.seeded}/${warm.asked} distinct deploy commits resolved in ONE \`cat-file --batch-check\`.`);
         if (bound.cappedAt) {
           console.log(`[train]   ⛔ page cap ${RENDER_MAX_PAGES} hit — history may be truncated. An order whose deadline`);
           console.log('[train]   predates the oldest record above is reported UNREAD, never on-time and never LATE.');
@@ -948,7 +1436,7 @@ async function main() {
       console.error(`[train] ERROR reading ${ident}: ${err.message}`);
       return EXIT_ERROR;
     }
-    const g = gradeCarrier({ description: issue?.description, nowMs: Date.now(), liveSha, knownSha, deploys, historyHost: ORDER_HOST });
+    const g = gradeCarrierRow({ issue, nowMs: Date.now(), liveSha, knownSha, ancestryOracle: liveOracle, deploys, historyHost: ORDER_HOST });
     console.log(`[train] single issue ${issue?.identifier || ident} — ${issue?.title || ''}`);
     console.log(`[train]   VERDICT = ${g.verdict}${timingTag(g)}`);
     console.log(`[train]   ${g.detail}`);
@@ -993,22 +1481,77 @@ async function main() {
     sinceLabel = new Date(sinceMs).toISOString();
   }
 
-  const allCarriers = [];
+  // Kept separate from `nowMs`: that one is the instant every DEADLINE is graded against
+  // and must not drift, this one is only the stopwatch for the printed cost.
+  const populationStartedMs = Date.now();
+
+  // ── ARM 1: routine-born carriers ───────────────────────────────────────────
+  const routineCarriers = [];
   for (const r of routines) {
     const id = r?.lastRun?.linkedIssueId;
     if (id) {
-      allCarriers.push({ routine: String(r.id).slice(0, 8), issueId: id, firedAt: r?.lastRun?.triggeredAt ?? null });
+      routineCarriers.push({ routine: String(r.id).slice(0, 8), issueId: id, firedAt: r?.lastRun?.triggeredAt ?? null });
     }
   }
-  if (allCarriers.length === 0) {
-    console.log('[train] VERDICT = BLIND — 0 carriers across ' + routines.length + ' routines.');
-    console.log('[train] A population that cannot be non-empty cannot license a clean verdict.');
+  if (routineCarriers.length === 0) {
+    console.log('[train] VERDICT = BLIND — 0 routine-born carriers across ' + routines.length + ' routines.');
+    console.log('[train] A population arm that cannot be non-empty cannot license a clean verdict.');
     return EXIT_BLIND;
+  }
+
+  // ── ARM 2: HAND-FILED carriers — the whole board (TRA-4984) ────────────────
+  // ⛔ THIS ARM FAILS CLOSED, AND "0 CARRIERS FOUND" IS THE READING IT MUST REFUSE. An
+  // issue-list read that silently returns an empty or truncated set is THE SAME DEFECT
+  // this arm exists to fix: a population that cannot contain the carrier, reported as a
+  // clean board. `enumerateIssues` returns a `blind` REASON STRING rather than a boolean
+  // for exactly that — the route caps at 1000 rows and an IGNORED `offset` returns a full
+  // page too, so exhaustiveness is proved by the deduped union GROWING, never by page 2
+  // being non-empty.
+  const getIssuesPage = ({ limit, offset }) => getJsonRetrying(`${base}/api/companies/${company}/issues?limit=${limit}&offset=${offset}`, auth);
+  let boardRows;
+  let enumPages;
+  try {
+    const en = await enumerateIssues(getIssuesPage);
+    if (en.blind) {
+      console.log(`[train] VERDICT = BLIND — the issue-side population could not be enumerated: ${en.blind}`);
+      console.log('[train] A population read that returns an empty set is not "no hand-filed carriers".');
+      return EXIT_BLIND;
+    }
+    boardRows = en.issues;
+    enumPages = en.pages;
+  } catch (err) {
+    console.log(`[train] VERDICT = BLIND — the issue-side population is unreadable: ${err.message}`);
+    console.log('[train] An unreachable list route is not an empty finding list.');
+    return EXIT_BLIND;
+  }
+  if (!Array.isArray(boardRows) || boardRows.length === 0) {
+    console.log('[train] VERDICT = BLIND — the issue list enumerated to 0 rows. A board with no issues and');
+    console.log('[train] an unread route are the same reading, and the empty one hides every hand-filed carrier.');
+    return EXIT_BLIND;
+  }
+
+  const issueCarriers = boardRows
+    .filter((r) => r && r.id)
+    .map((r) => ({ issueId: r.id, identifier: r.identifier, firedAt: issueRecencyStamp(r), listTruncated: r.descriptionTruncated === true }));
+
+  console.log(
+    `[train] issue arm: ${boardRows.length} board rows enumerated over ${enumPages.length} page(s)` +
+      ` (offset proved honoured: ${enumPages.map((p) => `+${p.added}`).join(' ')}).`,
+  );
+
+  const { carriers: allCarriers, counts } = mergeCarriers(routineCarriers, issueCarriers);
+  console.log(
+    `[train] population arms MERGED: ${counts.routine} routine-born, ${counts.handFiled} reachable ONLY via the` +
+      ` issue list (hand-filed), ${counts.both} reachable BOTH ways and graded ONCE.`,
+  );
+  if (counts.both === 0) {
+    console.log('[train]   ⛔ the two arms OVERLAP IN NOTHING — a routine-born carrier is by definition an issue');
+    console.log('[train]   on this board, so a zero overlap means one arm is reading a different board. Suspect it.');
   }
 
   const carrierIds = allCarriers.filter((c) => firedSince(c.firedAt, sinceMs));
   const excluded = allCarriers.length - carrierIds.length;
-  console.log(`[train] population: ${carrierIds.length} carriers fired since ${sinceLabel}; ${excluded} older EXCLUDED.`);
+  console.log(`[train] population: ${carrierIds.length} carriers stamped since ${sinceLabel}; ${excluded} older EXCLUDED.`);
   if (excluded > 0) {
     console.log('[train]   (not a silent cap — settled history predates the `deploy-order` rule and cannot');
     console.log('[train]    strand anything now. Re-run with --all to grade the backlog anyway.)');
@@ -1019,17 +1562,68 @@ async function main() {
     return EXIT_BLIND;
   }
 
+  // ⛔ THE CAP IS PRINTED AND IT IS BLIND, NEVER A TRUNCATION. The widened arm costs one
+  // full `GET /api/issues/{id}` per in-window carrier, because the list route's
+  // description is cut at ~1200 chars on 91% of rows (see `readableDescription`) and the
+  // carrier predicate searches the whole body. Silently grading the first N would
+  // re-introduce, one layer down, the exact silent-absence defect being fixed here.
+  const capRaw = flag('issue-cap');
+  const cap = typeof capRaw === 'string' && capRaw !== '' ? Number(capRaw) : 1500;
+  if (!Number.isFinite(cap) || cap <= 0) {
+    console.error(`[train] ERROR — unusable --issue-cap=${capRaw}`);
+    return EXIT_ERROR;
+  }
+  if (carrierIds.length > cap) {
+    console.log(`[train] VERDICT = BLIND — ${carrierIds.length} in-window carriers exceeds the full-read cap of ${cap}.`);
+    console.log('[train] Grading a prefix would be a silent partial population, which is the defect this arm closed.');
+    console.log('[train] Narrow with --since=…, or raise --issue-cap deliberately.');
+    return EXIT_BLIND;
+  }
+
   const rows = [];
-  for (const c of carrierIds) {
+  const READ_CONCURRENCY = 6;
+  const queue = [...carrierIds];
+  const readOne = async (c) => {
     let issue;
     try {
-      issue = await getJson(`${base}/api/issues/${c.issueId}`, auth);
+      issue = await getJsonRetrying(`${base}/api/issues/${c.issueId}`, auth);
     } catch (err) {
-      rows.push({ ...c, identifier: c.issueId, verdict: 'BLIND', finding: false, detail: `carrier unreadable: ${err.message}` });
-      continue;
+      rows.push({ ...c, identifier: c.identifier || c.issueId, verdict: 'BLIND', finding: false, late: false, ungraded: false, detail: `carrier unreadable: ${err.message}` });
+      return;
     }
-    const g = gradeCarrier({ description: issue?.description, nowMs, liveSha, knownSha, deploys, historyHost: ORDER_HOST });
-    rows.push({ ...c, identifier: issue?.identifier || c.issueId, status: issue?.status, startedAt: issue?.startedAt ?? null, ...g });
+    const g = gradeCarrierRow({ issue, nowMs, liveSha, knownSha, ancestryOracle: liveOracle, deploys, historyHost: ORDER_HOST });
+    rows.push({ ...c, identifier: issue?.identifier || c.identifier || c.issueId, status: issue?.status, startedAt: issue?.startedAt ?? null, ...g });
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(READ_CONCURRENCY, queue.length) }, async () => {
+      for (;;) {
+        const c = queue.shift();
+        if (!c) return;
+        await readOne(c);
+      }
+    }),
+  );
+  // The reads are concurrent, so `rows` arrives in completion order. Sort it, or two runs
+  // over an unchanged board print the same findings in a different order and cannot be
+  // diffed against each other — which is how a reader checks whether anything MOVED.
+  rows.sort((a, b) => String(b.firedAt ?? '').localeCompare(String(a.firedAt ?? '')) || String(a.identifier).localeCompare(String(b.identifier)));
+
+  const reReads = carrierIds.filter((c) => c.listTruncated).length;
+  console.log(
+    `[train] ${rows.length} carriers RE-READ in full (${reReads} of them came back TRUNCATED on the list route,` +
+      ' so the list description could not have been graded).',
+  );
+  // The grade's own cost, PRINTED. It is dominated by git spawns inside the timing arm —
+  // one ancestry ask per distinct served deploy commit per GRADED carrier — so it scales
+  // with the widened population, and an operator who sees a multi-minute run should be
+  // able to read why rather than suspect a hang. Narrowing `--since` reduces the carriers;
+  // it does not reduce the per-carrier history the timing arm walks.
+  console.log(`[train] population+grade cost: ${((Date.now() - populationStartedMs) / 1000).toFixed(1)}s wall, ${knownShaCache.size} distinct commits probed for existence.`);
+  if (retryTally.attempts > 0) {
+    console.log(
+      `[train]   transport: ${retryTally.attempts} failed read(s) retried, ${retryTally.retried} of them recovered.` +
+        ' A row that never read is BLIND below; a retried one was read and graded normally.',
+    );
   }
 
   // ── report ─────────────────────────────────────────────────────────────────
@@ -1041,11 +1635,24 @@ async function main() {
   const blind = rows.filter((r) => r.verdict === 'BLIND');
 
   if (flag('json')) {
-    console.log(JSON.stringify({ liveSha, timingArm: deploys != null, carriers: rows.length, trains: trains.length, stranded, late, ungraded, blind }, null, 2));
+    console.log(
+      JSON.stringify(
+        { liveSha, timingArm: deploys != null, population: counts, carriers: rows.length, trains: trains.length, stranded, late, ungraded, blind },
+        null,
+        2,
+      ),
+    );
   }
 
+  // The provenance is PRINTED per row, not just counted: "which carriers can this check
+  // see" is the subject of TRA-4984, and a reader who cannot tell a routine-born row from
+  // a hand-filed one cannot tell whether the widened arm contributed anything.
+  const provenance = (r) =>
+    r.carrierClass === CLASS_HAND_FILED
+      ? 'HAND-FILED        '
+      : `routine ${r.routine}${r.bothArms ? '*' : ' '}`;
   const line = (r) => {
-    console.log(`[train]   ${r.verdict.padEnd(11)} ${String(r.identifier).padEnd(10)} routine ${r.routine}  fired ${r.firedAt ?? 'unknown'}`);
+    console.log(`[train]   ${r.verdict.padEnd(11)} ${String(r.identifier).padEnd(10)} ${provenance(r)}  stamped ${r.firedAt ?? 'unknown'}`);
     console.log(`[train]       ${r.detail}${timingTag(r)}`);
     if (r.timingDetail) console.log(`[train]       timing: ${r.timingDetail}`);
     if (r.span && r.verdict !== 'SATISFIED') console.log(`[train]       span: ${r.span}`);
@@ -1069,11 +1676,37 @@ async function main() {
   console.log('[train]   IS a train, or the `<!-- deploy-order: none -->` marker if it is not.');
   for (const r of ungraded) line(r);
 
+  // ⛔ A BLIND ROW MUST BE NAMED, NOT COUNTED. Before TRA-4984 the final verdict said
+  // "N carrier(s) could not be read at all" and printed nothing further, so the one thing
+  // a BLIND exit cannot tell you was WHICH carrier it could not see — i.e. the reader has
+  // to re-run the sweep by hand to learn what the sweep already knew. That is the same
+  // shape as the population hole: information the instrument holds and does not publish.
+  if (blind.length > 0) {
+    console.log('');
+    console.log(`[train] ── BLIND (${blind.length}) — carriers this run could NOT read, named so they can be chased ──`);
+    for (const r of blind) line(r);
+  }
+
   console.log('');
-  console.log('[train] ⛔ NAMED LIMIT, printed every run: carriers come from `lastRun` on the routines');
-  console.log('[train]    list route, i.e. ONE per routine, the newest. A worked newer carrier hides an');
-  console.log('[train]    abandoned older one. Deploy trains are one-shots that archive themselves at');
-  console.log('[train]    step 1, so they have ~one carrier each — close to complete here, still a limit.');
+  console.log('[train] ⛔ NAMED LIMIT, printed every run — WHICH CARRIER CLASSES ARE IN SCOPE (TRA-4984):');
+  console.log('[train]    IN SCOPE, two arms, merged and deduped by issue id:');
+  console.log('[train]      1. ROUTINE-BORN — `lastRun.linkedIssueId` on the routines list route.');
+  console.log('[train]      2. HAND-FILED — ANY issue on the board, via the paged issue list. This is the');
+  console.log('[train]         class a human reaches for when a deploy is too consequential to automate,');
+  console.log('[train]         and before TRA-4984 it was outside the population BY CONSTRUCTION: the');
+  console.log('[train]         real-money order on TRA-4942 could not be graded by this check at all.');
+  console.log('[train]    WHAT IS STILL A LIMIT:');
+  console.log('[train]      · arm 1 still reads ONE carrier per routine, the newest, so a worked newer');
+  console.log('[train]        carrier hides an abandoned older one. It now matters less, because arm 2');
+  console.log('[train]        reaches that older carrier anyway whenever it is inside the window.');
+  console.log('[train]      · arm 2 is bounded by RECENCY, keyed on the issue\'s own `updatedAt`. An order');
+  console.log('[train]        edited into an old ticket IS in scope (the edit moves the stamp); a carrier');
+  console.log('[train]        untouched since before the window is not. `--all` grades the whole board.');
+  console.log('[train]      · the list route CUTS `description` at ~1200 chars on ~91% of rows, so every');
+  console.log('[train]        in-window carrier is RE-READ in full and a still-truncated body is BLIND,');
+  console.log('[train]        never NOT_TRAIN. That costs one GET per carrier and is capped at');
+  console.log('[train]        --issue-cap (BLIND above it, never a silently graded prefix).');
+  console.log('[train]      · a `*` after a routine id means the row is reachable by BOTH arms.');
   console.log('[train] ⛔ SATISFIED means the commit is live NOW. Whether it was live BY THE DEADLINE is the');
   if (deploys == null) {
     console.log('[train]    separate `timing` column, and on this run the arm was OFF — every timing is UNREAD,');
