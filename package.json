@@ -18,6 +18,8 @@
     "render:status": "node scripts/render-deploy-status.mjs",
     "typecheck": "pnpm -r --filter \"@trading-app/*\" build && pnpm -r typecheck",
     "lint": "eslint . --max-warnings 0",
+    "tra4954:grade": "node scripts/tra4954-ac-grade.mjs",
+    "tra4954:grade:controls": "node scripts/tra4954-ac-grade.mjs --selftest",
     "check:stale-js": "node scripts/check-stale-js.mjs",
     "check:cycles": "node scripts/check-cycles.mjs",
     "check:push-auth": "node scripts/check-git-push-auth.mjs",
