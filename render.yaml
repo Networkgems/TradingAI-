@@ -152,14 +152,53 @@ services:
       # `standard` box: "1536 heap + ~512 native = 2 GB". That premise is dead —
       # the box is `pro` (4 GB). The VALUE IS DELIBERATELY RETAINED ANYWAY, and
       # that is a decision, not neglect:
-      #   - Measured RTH heap peaks at ~475 MB against this 1536 MB cap (~31%).
-      #     There is no observed heap pressure, so there is nothing to fix.
       #   - RAISING it would be counter-productive: a bigger old space means GC
       #     runs later, which INCREASES RSS — and RSS is the binding constraint
       #     on this box (it is what the cgroup OOM-killer and the watchdog both
       #     watch). The cap currently helps bound the very metric under scrutiny.
+      #
+      # TRA-4158 (2026-10-01) — THE "~475 MB RTH PEAK (~31%), no observed heap
+      # pressure" PREMISE THAT STOOD HERE WAS STALE BY 3x, and it is replaced,
+      # not patched. What it missed: heap reached 1605 MB on 2026-08-27, and on
+      # 2026-09-23T19:21:13Z the watchdog TRIPPED on `heap` at 1582/1812 MB
+      # after **2.36h** of uptime. (The trip threshold is `heapPct 0.85`, not
+      # the 0.92 that ticket was filed against — also understated.)
+      #
+      # Cause, measured not assumed: 68 per-user copies of USER-INDEPENDENT
+      # daily candle data. Hoisted to one process-global store (`7aa50d12`,
+      # live in `faae9388`): owners 68 -> 1, entries 6793 -> 449 and
+      # 6789 -> 447, **-330.7 MB (-41.2%)** on a matched-quiescent A/B.
+      #
+      # POST-FIX MEASUREMENT — `/api/health/heap-census?deep=true` +
+      # `/api/health/watchdog` at 2026-10-01T16:24:47Z, boot `faae9388`,
+      # uptime 87.03h spanning THREE full RTH sessions, 288-sample ring:
+      #   - heapUsed: peak **691.6 MB**, in-session mean 497.9, quiescent mean
+      #     471.6 (n=204). QUOTE THE DENOMINATOR: that peak is 45.0% of the
+      #     1536 knob, 40.0% of the effective V8 limit (1728 MiB = 1536 + 3*64
+      #     semi-spaces), and 38.2% of the 1811.9 MB decimal figure the trip
+      #     detail prints. The same number three ways, 6.8pp apart.
+      #   - `peakRssSinceBoot` 2496.1 MB, against WATCHDOG_RSS_MAX_MB 3400 and
+      #     the 4096 MB cgroup — bracketed, 26.6% headroom above peak.
+      #   - major-GC `maxMs` 113.7 ms (at heapUsed 448 MB), and 104.9 ms at the
+      #     1582 MB trip: there is no multi-second mark-compact at EITHER heap
+      #     level, so a big old space is not by itself a pause hazard here.
+      # => **HOLD 1536 and HOLD 3400.** Raising the heap cap is forbidden by
+      # this ticket's AC3; LOWERING it is also refused — the 09-23 trip is live
+      # proof >1 GB of old space is reachable on a bad day, and a smaller cap
+      # buys more frequent major GCs, which is the opposite of the goal.
+      #
+      # ⛔ ROSTER-SENSITIVITY, and this is the part a future reader will get
+      # wrong: every figure above was measured at **68 registered user
+      # contexts**. TRA-4902 deregistered 64 dead QA books at
+      # 2026-10-01T19:53Z (-> 4 contexts), and ANY of them comes back with one
+      # call (`POST /api/admin/users {adoptExistingBook:true}`). So do NOT
+      # re-derive these constants against the roster you happen to find: a cap
+      # fitted to 4 contexts reads green and turns PERMISSIVE the moment QA
+      # re-registers. The 68-context figures are the conservative basis and
+      # remain the basis until a measurement at a HIGHER roster exists.
       # Re-derive only with evidence of actual heap pressure (heap approaching
-      # the cap), not merely because the box got bigger.
+      # the cap) AT A STATED ROSTER SIZE — never merely because the box got
+      # bigger, and never because the roster got smaller.
       - key: NODE_OPTIONS
         value: --max-old-space-size=1536 --max-semi-space-size=64
       # TRA-1463 — cap glibc malloc arenas to bound native RSS fragmentation.

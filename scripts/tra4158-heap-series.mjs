@@ -213,6 +213,14 @@ async function readOnce(base) {
     // the difference is visible in the tape rather than silently absent.
     censusTopName: null,
     censusTopEntries: null,
+    // TRA-4902 (2026-10-01T19:53Z) deregistered 64 dead QA accounts, which tore
+    // down 64 per-user contexts ON THE LIVE PROCESS with no restart. Every
+    // retention claim this tape makes is per-boot, so the fold was structurally
+    // blind to it: rows either side of that instant share a `startedAt` and get
+    // averaged into one delta. The population is therefore a COLUMN, and
+    // `report` treats a change in it exactly like a restart.
+    contexts: null,
+    contextsSource: null,
   };
 
   // Best-effort: the census route does not exist on builds before this ticket.
@@ -226,10 +234,46 @@ async function readOnce(base) {
       row.censusTopEntries = top.entries;
       row.censusSamples = hc.census.samples ?? null;
     }
+    const ctx = contextCount(hc?.census?.live);
+    row.contexts = ctx.contexts;
+    row.contextsSource = ctx.source;
   } catch {
     /* route absent on this build */
   }
   return row;
+}
+
+/**
+ * How many per-user contexts this process is holding, read off the census.
+ *
+ * `/api/health/storage/detail` publishes `userContextCount` directly and is the
+ * authoritative surface — but it is admin-authenticated, and this tape is an
+ * unauthenticated poller by design (it has to keep working from anywhere, and a
+ * credential it does not need is a credential it can leak). The census row for
+ * a per-user container carries `owners` = one per live engine, which is the
+ * same count by construction.
+ *
+ * Keyed on `signalEngine.*` deliberately, and NOT on a max over all rows: the
+ * `marketData.*` rows are the TRA-4158 hoist's process-global store and read
+ * `owners: 1` forever BY DESIGN. Folding them into a min would report 1 context
+ * on a 68-context box; folding them into a max is harmless today but becomes
+ * wrong the first time some other global row appears. Name the class you mean.
+ *
+ * Returns `{ contexts: null }` on a build with no census, which is a DIFFERENT
+ * fact from "zero contexts" and must stay distinguishable in the tape.
+ */
+function contextCount(liveRows) {
+  if (!Array.isArray(liveRows)) return { contexts: null, source: null };
+  const perUser = liveRows.filter(
+    r => typeof r?.name === 'string' && r.name.startsWith('signalEngine.') && typeof r.owners === 'number',
+  );
+  if (perUser.length === 0) return { contexts: null, source: null };
+  // Every per-user row should agree; take the max so a container created lazily
+  // on first use (owners below the engine count) cannot understate the roster.
+  let best = perUser[0];
+  for (const r of perUser) if (r.owners > best.owners) best = r;
+  const disagree = perUser.some(r => r.owners !== best.owners);
+  return { contexts: best.owners, source: disagree ? `${best.name} (MAX of ${perUser.length} rows, which DISAGREE)` : best.name };
 }
 
 async function loadTape(path) {
@@ -348,11 +392,38 @@ function ac1Eligibility(segRows) {
 }
 
 /**
+ * Split one boot's reads into runs of CONSTANT per-user population.
+ *
+ * A restart is not the only way the subject can change under a tape. On
+ * 2026-10-01T19:53Z, 64 per-user contexts were destroyed on a live process with
+ * no restart (TRA-4902), so rows either side of that instant carry the same
+ * `startedAt` and would be differenced as if they measured the same box. They
+ * do not: a drop across that instant is 64 contexts going away, which is
+ * exactly the "indistinguishable from a release" failure that boot segmentation
+ * exists to prevent — one layer down.
+ *
+ * `null` (a build with no census) is its own population value, never merged with
+ * a number: "I could not read the roster" must not silently join a run that has.
+ */
+function populationRuns(segRows) {
+  const runs = [];
+  for (const r of segRows) {
+    const ctx = r.contexts ?? null;
+    const last = runs[runs.length - 1];
+    if (last && last.contexts === ctx) last.rows.push(r);
+    else runs.push({ contexts: ctx, rows: [r] });
+  }
+  return runs;
+}
+
+/**
  * Fold the tape into one block per BOOT.
  *
  * Segmenting on `startedAt` is the whole point: the defect is "climbs through
  * the session, does not release overnight", and a restart produces a drop that
- * is indistinguishable from a release unless the boundary is respected.
+ * is indistinguishable from a release unless the boundary is respected. Within
+ * a boot the same rule is applied to the per-user population (see
+ * `populationRuns`).
  */
 function report(rows) {
   if (rows.length === 0) {
@@ -374,7 +445,7 @@ function report(rows) {
     const peakHeap = Math.max(...seg.rows.map(r => r.heapUsedMB));
     const peakRss = Math.max(...seg.rows.map(r => r.rssMB));
     console.log(`boot ${seg.startedAt} pid ${seg.pid} commit ${seg.commit} — ${seg.rows.length} read(s)`);
-    console.log('  atIso                     uptimeH   rthH  heapMB  heapPct   rssMB  peakRssMB  gcMajor  gcMajorMaxMs');
+    console.log('  atIso                     uptimeH   rthH  heapMB  heapPct   rssMB  peakRssMB  gcMajor  gcMajorMaxMs  ctx');
     for (const r of seg.rows) {
       const upH = r.uptimeSec === null ? '   ?  ' : (r.uptimeSec / 3600).toFixed(2).padStart(6);
       // RTH exposure of this BOOT at the moment of the read — the ruler that
@@ -386,21 +457,40 @@ function report(rows) {
       console.log(
         `  ${r.atIso}  ${upH}  ${rthH}  ${String(r.heapUsedMB).padStart(6)}  ${String(r.heapPct ?? '?').padStart(6)}` +
           `  ${String(r.rssMB).padStart(6)}  ${String(r.peakRssMB).padStart(9)}` +
-          `  ${String(r.gcMajorCount ?? '?').padStart(7)}  ${String(r.gcMajorMaxMs === null ? '?' : round1(r.gcMajorMaxMs)).padStart(12)}`,
+          `  ${String(r.gcMajorCount ?? '?').padStart(7)}  ${String(r.gcMajorMaxMs === null ? '?' : round1(r.gcMajorMaxMs)).padStart(12)}` +
+          `  ${String(r.contexts ?? '?').padStart(3)}`,
       );
     }
-    if (seg.rows.length >= 2) {
-      const hours = (Date.parse(last.atIso) - Date.parse(first.atIso)) / 3_600_000;
-      const ac1 = ac1Eligibility(seg.rows);
+    console.log(
+      `  peak heap ${peakHeap}MB (${round1((peakHeap / (last.heapLimitMB || 1812)) * 100)}% of cap)` +
+        ` · peak rss ${peakRss}MB`,
+    );
+    const runs = populationRuns(seg.rows);
+    if (runs.length > 1) {
+      // The whole-boot delta is deliberately NOT printed here. Printing it with
+      // a caveat beside it is how it gets quoted without the caveat.
       console.log(
-        `  Δheap ${round1(last.heapUsedMB - first.heapUsedMB)}MB over ${round1(hours)}h` +
-          ` · peak heap ${peakHeap}MB (${round1((peakHeap / (last.heapLimitMB || 1812)) * 100)}% of cap)` +
-          ` · peak rss ${peakRss}MB`,
+        `  ⛔ POPULATION CHANGED MID-BOOT: ${runs.map(r => r.contexts ?? '?').join(' -> ')} contexts` +
+          ' — the whole-boot Δheap is REFUSED, same rule as a restart boundary.' +
+          ' Per-user contexts can be destroyed on a live process (TRA-4902).',
       );
-      console.log(`  AC1 pair: ${ac1.eligible ? 'ELIGIBLE' : 'NOT ELIGIBLE'} — ${ac1.reason}`);
-      bestPair = Math.max(bestPair, ac1.rthHours);
-    } else {
-      console.log('  (single read in this boot — a delta needs two, and one across a restart is not one)');
+    }
+    for (const run of runs) {
+      const label = runs.length > 1 ? `  [${run.contexts ?? '?'} contexts] ` : '  ';
+      if (run.rows.length >= 2) {
+        const rf = run.rows[0];
+        const rl = run.rows[run.rows.length - 1];
+        const hours = (Date.parse(rl.atIso) - Date.parse(rf.atIso)) / 3_600_000;
+        const ac1 = ac1Eligibility(run.rows);
+        console.log(`${label}Δheap ${round1(rl.heapUsedMB - rf.heapUsedMB)}MB over ${round1(hours)}h`);
+        console.log(`${label}AC1 pair: ${ac1.eligible ? 'ELIGIBLE' : 'NOT ELIGIBLE'} — ${ac1.reason}`);
+        bestPair = Math.max(bestPair, ac1.rthHours);
+      } else {
+        console.log(
+          `${label}(single read at this population — a delta needs two, and one across a restart` +
+            ' or a context teardown is not one)',
+        );
+      }
     }
     console.log('');
   }
@@ -849,6 +939,71 @@ function selftest() {
     'unit-mix-is-material',
     Math.abs(1080.3 / 1728 - 1080.3 / 1812) > 0.02,
     `mixing them moves a percentage-of-cap by ${(((1080.3 / 1728 - 1080.3 / 1812) * 100)).toFixed(1)}pp (62.5% vs the 59.6% published on 09-24)`,
+  );
+
+  // --- population runs (TRA-4902 cut, 2026-10-01) ---
+  // 64 per-user contexts were destroyed on a LIVE process at 19:53Z. These
+  // controls exist because the tape's own segmentation was blind to it: the
+  // rows either side share a `startedAt`.
+  const pr = (iso, contexts) => ({ atIso: iso, contexts, heapUsedMB: 0 });
+  const cut = populationRuns([
+    pr('2026-10-01T18:00:00Z', 68),
+    pr('2026-10-01T19:00:00Z', 68),
+    pr('2026-10-01T20:00:00Z', 4),
+  ]);
+  check(
+    'mid-boot-teardown-splits',
+    cut.length === 2 && cut[0].rows.length === 2 && cut[1].contexts === 4,
+    'the 19:53Z 68 -> 4 cut splits one boot into 2 runs — the cross-cut Δheap is never computed',
+  );
+
+  const steady = populationRuns([pr('2026-10-01T18:00:00Z', 4), pr('2026-10-01T19:00:00Z', 4)]);
+  check(
+    'steady-population-is-one-run',
+    steady.length === 1 && steady[0].rows.length === 2,
+    'an unchanged roster stays ONE run — this must not shatter every tape into singletons',
+  );
+
+  // The pre-census tape (24 rows, no `contexts` key) must fold as it always did.
+  const legacy = populationRuns([{ atIso: 'a' }, { atIso: 'b' }, { atIso: 'c' }]);
+  check(
+    'legacy-rows-one-run',
+    legacy.length === 1 && legacy[0].contexts === null,
+    'rows from a build with no census fold as a single unknown-population run (no retroactive refusals)',
+  );
+
+  const appeared = populationRuns([pr('2026-10-01T18:00:00Z', null), pr('2026-10-01T19:00:00Z', 4)]);
+  check(
+    'unknown-does-not-join-known',
+    appeared.length === 2,
+    'null -> 4 is a BOUNDARY: "could not read the roster" must not be differenced against a read one',
+  );
+
+  // contextCount: the hoisted global store is owners:1 BY DESIGN, so a fold that
+  // includes it reports the wrong roster in the permissive direction.
+  const ctxRows = [
+    { name: 'marketData.dailyCloses', owners: 1, entries: 449 },
+    { name: 'signalEngine.dailySignals', owners: 68, entries: 6000 },
+    { name: 'signalEngine.newsCache', owners: 68, entries: 35 },
+  ];
+  check(
+    'global-row-excluded',
+    contextCount(ctxRows).contexts === 68,
+    'owners is read off signalEngine.* — the process-global marketData row (owners 1) cannot drag it to 1',
+  );
+  check(
+    'no-census-is-null-not-zero',
+    contextCount(undefined).contexts === null && contextCount([{ name: 'marketData.dailyCloses', owners: 1 }]).contexts === null,
+    'a build with no per-user rows reports null, never 0 — "unreadable" and "nobody registered" differ',
+  );
+  const disagreeing = contextCount([
+    { name: 'signalEngine.dcaTranches', owners: 2 },
+    { name: 'signalEngine.dailySignals', owners: 4 },
+  ]);
+  check(
+    'lazy-container-does-not-understate',
+    disagreeing.contexts === 4 && /DISAGREE/.test(disagreeing.source),
+    'a lazily-created container (owners 2 of 4) takes the MAX and SAYS the rows disagreed',
   );
 
   const failed = results.filter(r => !r.ok);
