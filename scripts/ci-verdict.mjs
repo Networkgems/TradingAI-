@@ -187,9 +187,15 @@ async function fetchAllJobs(repo, runId, token) {
 // selftest — mutation controls. Each arm plants a defect and requires the gate
 // to refuse it with the exact code; the all-green arm requires it to pass. Both
 // directions, because a gate hardwired to refuse passes every one-sided control.
-export function selftest() {
-  const green = Object.fromEntries(Object.keys(EXPECTED_JOBS).map((k) => [k, { result: 'success' }]));
-  const jobsGreen = {
+// A /jobs payload that `gradeJobs` must call CLEAN. EXPORTED on purpose, and the only
+// copy: `require-green-ci.mjs` imports `gradeJobs`, so it needs the same notion of "a
+// complete run" and used to hand-roll its own. TRA-5029 grew the required step set (the
+// test job must also publish the count-floor step) and that stale second copy went red
+// in CI — `Verdict gate mutation controls` failing on a change that touched neither the
+// gate's behaviour nor that file. A grader and its fixture are one artefact; a second
+// hand-written fixture is a silent drift waiting for the next required field.
+export function greenJobsFixture() {
+  return {
     jobs: Object.entries(EXPECTED_JOBS).map(([id, name]) => ({
       name,
       status: 'completed',
@@ -203,6 +209,11 @@ export function selftest() {
           : [{ name: id, status: 'completed', conclusion: 'success', started_at: '2026-09-09T00:00:00Z', completed_at: '2026-09-09T00:01:00Z' }],
     })),
   };
+}
+
+export function selftest() {
+  const green = Object.fromEntries(Object.keys(EXPECTED_JOBS).map((k) => [k, { result: 'success' }]));
+  const jobsGreen = greenJobsFixture();
   const clone = (o) => JSON.parse(JSON.stringify(o));
   const testSteps = (p) => p.jobs.find((j) => j.name === TEST_JOB_NAME).steps;
   const testStep = (p, name) => testSteps(p).find((s) => s.name === name);

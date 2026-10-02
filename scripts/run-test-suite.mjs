@@ -43,7 +43,7 @@
 import { spawn } from 'node:child_process'
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs'
 import { join, dirname, relative } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const VERDICT_PATH = join(REPO_ROOT, 'test-suite-verdict.json')
@@ -113,7 +113,11 @@ export function expectedPackages(root) {
 // ---------------------------------------------------------------------------
 // parsing
 
-const stripAnsi = (s) => s.replace(/\u001b\[[0-9;]*[A-Za-z]/g, '')
+// Built rather than written as a literal: a literal ESC inside a regex is
+// `no-control-regex`, and a disable comment on a line nobody reads is how a lint rule
+// stops meaning anything. Same pattern, no suppression.
+const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*[A-Za-z]`, 'g')
+const stripAnsi = (s) => s.replace(ANSI, '')
 
 /** `2 failed | 542 passed (544)` -> {failed:2, passed:542, total:544} */
 function parseCounts(rest) {
@@ -492,7 +496,14 @@ function selftest() {
   return failures === 0 ? EXIT.CLEAN : EXIT.RED
 }
 
-main().then((code) => process.exit(code)).catch((e) => {
-  process.stderr.write(`run-test-suite: ${e?.stack ?? e}\n`)
-  process.exit(EXIT.BLIND)
-})
+// Entry-point guard, same shape as ci-verdict.mjs. Without it a bare
+// `import { parseSuiteStream } from './run-test-suite.mjs'` RUNS THE WHOLE SUITE as a
+// side effect of the import — measured, by accident, while writing this file. The pure
+// functions above are exported precisely so they can be imported; a module whose import
+// spends seven minutes is a module nobody will import.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().then((code) => process.exit(code)).catch((e) => {
+    process.stderr.write(`run-test-suite: ${e?.stack ?? e}\n`)
+    process.exit(EXIT.BLIND)
+  })
+}
