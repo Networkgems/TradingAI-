@@ -305,7 +305,7 @@ to be falsified. It does not change what gets built: still **one shared periodic
 `live-enforce-gate`, `churn-brake-guard`, `reversal-shadow-signals` and `otm-admission-tape`, whose
 first job is to measure which keying above is true. Successor: **TRA-5038**.
 
-#### TRA-5038 — the shared hook, built 2026-10-02 (code landed; live readings pending deploy)
+#### TRA-5038 — the shared hook, built 2026-10-02; live on bqb1 since 2026-10-03 (build `a0344981`)
 
 `packages/server/src/shared-tape-compaction.ts` is **one** registry and **one** `setInterval`, armed
 once in `index.ts`, covering all four tapes. Each owner contributes only its path and its
@@ -395,25 +395,62 @@ registration leaves every other field on the health route reading healthy, so it
 row claiming a 12 h cadence, a spec factory `index.ts` never references, and a blanked publication
 literal each exit 3 naming the row.
 
-⛔ **Still open at the time of writing — these are measurements, not code:**
+#### Verified live 2026-10-03T18:2xZ — AC1 settled, AC5 re-measured; AC3b still pending
 
-1. **AC1's live answer.** The keying (steady state vs still filling) for `live-enforce-gate` and
-   `churn-brake-guard` is settled by reading `sharedCompaction.span` off the deployed build. Until
-   then the ranking in this document is provisional, exactly as the ticket says. What is already
-   visible from the *existing* routes is suggestive but not conclusive: `live-enforce-gate`'s
-   `retained.etDays` starts **2026-09-02** against a 09-02T12:51Z cutoff (consistent with steady
-   state) while `churn-brake-guard`'s starts **2026-09-04**, two days inside its cutoff (consistent
-   with still filling) — but an ET-day bucket cannot settle it, because a 09-02 row written before
-   08:51 ET would have been dropped by that same cutoff. That is precisely why AC1 asks for the
-   oldest retained `ts` and not a day list.
-2. **AC3b — the prototype's timer has still never been observed firing.** Read at
-   2026-10-02T14:50Z: build `104bc8ed322c`, uptime **7133 s (1.98 h)**, `hookState`
-   `armed_not_yet_due`, `nextFireDueAt` **18:52:07Z**. Under 6 h, so the read AC3b asks for is not
-   yet available on this host. It must be taken **before** the next deploy, because a deploy resets
-   uptime and the window closes for another 6 h.
-3. **AC5's live re-run** of the census (`/data` growth rate and days-to-`minFreePct`) is only
-   meaningful against the deployed build; the offline run is CLEAN and the four rows now read
-   `30 d +6h timer` / `144 MiB +6h timer`.
+The hook reached the host without a deliberate deploy: live build `a0344981` (boot
+2026-10-03T17:42:22Z) carries both `4f127915` and `f48d0340` as ancestors. All four routes publish
+`sharedCompaction` with `hookState: armed_not_yet_due`, `timerArmedAt` 17:42:42Z,
+`nextFireDueAt` 23:42:42Z — the arm is on the wire on every tape, including the hand-picked
+`live-enforce-gates` payload `f48d0340` repaired.
+
+**AC1 — both contested tapes are AT STEADY STATE. The "still filling toward 141 MiB" branch is
+ruled out.** `sharedCompaction.span` off the live build (boot measure-only pass, 17:42:42Z):
+
+| tape | oldest retained `ts` | span | cutoff headroom | fill | size/span rate |
+|---|---|---|---|---|---|
+| `live-enforce-gate` | 2026-09-03T17:46:33Z | **29.09 d** | 0.003 d | **at_steady_state** | 3.52 MiB/d |
+| `churn-brake-guard` | 2026-09-04T13:53:22Z | **28.25 d** | 0.84 d (≤1 d session-gap tol) | **at_steady_state** | 2.40 MiB/d |
+| `reversal-shadow-signals` | 2026-09-03T17:45:00Z | 29.09 d | 0.002 d | at_steady_state | 1.43 MiB/d |
+| `otm-admission-tape` | 2026-09-18T13:30:24Z | 14.27 d | n/a (byte cap) | under cap (59.2 of 144.0 MiB) | 4.15 MiB/d |
+
+So the pooled trio rate is the **lower** keying, ~**7.35 MiB/d** at today's sizes (the 09-25→10-02
+growth was the tail of the fill plus boot-gap overshoot, not a rate change), and the ranking above
+stands — `live-enforce-gate` tops out near its observed 102.3 MiB, not 141–164.
+
+**AC5 — census re-run against the live build: CLEAN (exit 0).**
+
+```
+node scripts/tra4899-tape-census.mjs        # 2026-10-03T18:2xZ, host build a03449814210
+  144.0  HARD     144.0 MiB          59.2   otm-admission-tape.jsonl      ← cap now timer-enforced
+  103.1  DERIVED  30 d +6h timer    102.3   live-enforce-gate.jsonl       ← was 110.2 boot-only
+   68.4  DERIVED  30 d +6h timer     67.8   churn-brake-guard.jsonl       ← was 78.8
+   68.1  DERIVED  7 d +6h timer      65.7   cost-aware-gate.jsonl
+   42.0  DERIVED  30 d +6h timer     41.7   reversal-shadow-signals.jsonl ← was 51.6
+volume: 973.4 MiB total, 231.1 MiB free (23.745%)
+```
+
+The trio's overshoot premium drops from `bootGap/30` (+16.4% at the measured 4.93 d gap) to
+**+0.83%**, cutting ~27 MiB of worst-case reservation. Resulting `/data` growth and
+days-to-`minFreePct`: headroom to the 10% floor is `231.1 − 97.3` = **133.8 MiB**. With the trio at
+steady state its net growth is ~0 (oscillation ≤ one 6 h interval ≈ 1.8 MiB); the only catalogued
+net grower is `otm-admission-tape` at 4.15 MiB/d with 84.8 MiB left to its cap, so free bottoms out
+near **146 MiB around 2026-10-24 and the catalogued tape population never reaches `minFreePct`**.
+From that point the `/data` slope is owned by the FLOOR/external populations (`option-chains/` 73.2,
+`backups/` 43.3, `logs/` 25.0, `users/**/reports` — the last is TRA-4898's book-reap, not a tape
+cap). Four tapes that landed after 10-02 were catalogued to get the CLEAN exit:
+`equity-entry-funnel.jsonl` (30 d boot-only, TRA-5089), `tra3926-bound-exercise.jsonl` (5,000-row
+hard stop), `tra5061-chandelier-atr-shadow.jsonl` (20,000-row hard stop), `options-evaluation/`
+(newest-400-files cap).
+
+⛔ **Still open — one measurement, not code:**
+
+1. **AC3b — neither the prototype's timer nor the shared one has been observed firing.** The
+   10-02 window (`nextFireDueAt` 18:52:07Z, build `104bc8ed322c`) was lost to a wake delivered a
+   day late and an intervening reboot; uptime resets on every boot and bqb1 is routinely up for
+   under one 6 h interval. Current window: boot 2026-10-03T17:42Z ⇒ both `hookState`s must read
+   `firing` (never `overdue`) on the first read after **23:42:42Z**, if the host stays up. The
+   enum self-reports on every read, so the check costs one curl whenever an uptime >6 h occurs;
+   `overdue` on either surface means the `setInterval` wiring is dead and reopens TRA-5038.
 
 ---
 
