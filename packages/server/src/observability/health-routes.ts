@@ -414,6 +414,11 @@ import {
   type OptionSleeveCellGrid,
   type EtDayCloseWindow,
 } from '../option-journal-sleeve-cells.js';
+// TRA-5035 — the per-sleeve entry-drought detector (off TRA-5014).
+import {
+  foldOptionEntryDrought,
+  type OptionEntryDroughtBlock,
+} from '../option-entry-drought.js';
 import {
   computeOptionLearnedWeights,
   type OptionLearnedWeights,
@@ -2814,6 +2819,18 @@ export interface OptionJournalReport {
    */
   sleeveCells: OptionSleeveCellGrid;
   /**
+   * TRA-5035 (off TRA-5014) — the per-`accountClass × structure` ENTRY-drought
+   * detector: `lastEntryEtDay` + `consecutiveSessionsWithoutEntry` (market
+   * sessions, `isMarketDayIso`), so a sleeve that stops entering is a top-level
+   * number instead of an absence a reader has to notice. The desk paper book
+   * produced ZERO entries for 7 consecutive ET sessions and nothing alarmed;
+   * `booksScannedButNotPublished[]` names the drop but is a pointer, not a
+   * detector. Folded from the FULL journal, deliberately OUTSIDE any cohort
+   * window on this request. A never-entered cell reads `null`/`null`, never 0.
+   * Advisory only — gates nothing, blocks nothing.
+   */
+  entryDrought: OptionEntryDroughtBlock;
+  /**
    * TRA-3715 — the window that actually served this response, resolved and
    * echoed so a grader asserts what it got rather than assuming its params took
    * effect. `axis` names the timestamp compared against; `fromMs`/`toMs` are
@@ -4348,6 +4365,11 @@ export function buildOptionJournalReport(
     // partitions. Four folds over one population; a second population in one
     // 200 is the TRA-2082 shape.
     sleeveCells: foldOptionSleeveCells(summaryRows as OptionTradeJournalRecord[]),
+    // TRA-5035 — folded from the FULL `rows`, NOT the cohort-filtered
+    // `summaryRows`, on purpose: a `?sinceEtDay` window would manufacture a
+    // drought (entries outside it vanish) and an entry-axis window would hide
+    // one. The drought is a lifetime question and gets the lifetime population.
+    entryDrought: foldOptionEntryDrought(rows as OptionTradeJournalRecord[], now),
     window: {
       axis: closeAxis ? 'closeTs' : 'openTs',
       fromMs,
