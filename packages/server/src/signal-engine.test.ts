@@ -90,7 +90,10 @@ import { resetSweepCursors, sweepCursorSnapshot, type SweepPass } from './tick-s
 import { summarizeRvScanPath, __resetRvScanTelemetry } from './rv-scan-telemetry.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
+// TRA-5037 — the fixture-is-live control for the blank-DATA_DIR recorder test below
+// must go through the REAL resolveDemoFlagEnv, not a local mirror of it.
+import { resolveDemoFlagEnv } from './demo-flags.js';
 // TRA-4692 — the TRA-4650 equity-seam admit runs every live bracket through the
 // hard-controls choke point, whose kill/day-loss/idempotency state is module-
 // global AND disk-persisted (48h retention). The bracket fixtures pin a fresh
@@ -11100,5 +11103,75 @@ describe('TRA-4654 — decision panel assembles off the card ring with engine-ow
     engine.clearSignals();
     // After a feed clear the card is gone WITH its panel — no stale proposal survives.
     expect(engine.getDecisionPanel('tra4654-eq-1')).toBeNull();
+  });
+});
+
+// TRA-5037 — the RECORDER's own env resolution must treat a blank-but-present
+// DATA_DIR as unset. This is the site where the ineffective arm actually happens:
+// the writer (`index.ts` → `writeDemoFlagFile(resolveDataDir(), …)`) TRIMS, so with
+// `DATA_DIR=' '` the arm lands in `<bundle>/data/demo-flags.json` while a
+// truthiness-gated reader resolves `" "/demo-flags.json` — write returns 200, flag
+// never reaches the engine.
+//
+// ⚠️ A test that only sets `DATA_DIR=' '` and asserts the safe outcome passes
+// against the defect too (a MISSING overlay also falls back to process.env). The
+// planted `<tmp>/" "/demo-flags.json` fixture below, proven live through the real
+// `resolveDemoFlagEnv`, is what makes the assertion discriminate.
+describe('TRA-5037 blank DATA_DIR on SignalEngine.resolveDemoFlagEnv (the recorder)', () => {
+  const FLAG = 'EXIT_RISK_RULES_ENABLED'; // allowlisted; read by the exit-risk master gate
+  let tmp: string | null = null;
+  let cwd0: string | null = null;
+  let dataDir0: string | undefined;
+  let flag0: string | undefined;
+
+  const recorderEnv = (): NodeJS.ProcessEnv => {
+    const engine = new SignalEngine();
+    return (
+      engine as unknown as { resolveDemoFlagEnv: () => NodeJS.ProcessEnv }
+    ).resolveDemoFlagEnv();
+  };
+
+  beforeEach(() => {
+    dataDir0 = process.env.DATA_DIR;
+    flag0 = process.env[FLAG];
+    tmp = mkdtempSync(join(tmpdir(), 'tra5037-se-'));
+    delete process.env[FLAG];
+    delete process.env.DATA_DIR;
+  });
+
+  afterEach(() => {
+    if (cwd0) process.chdir(cwd0);
+    cwd0 = null;
+    if (dataDir0 === undefined) delete process.env.DATA_DIR;
+    else process.env.DATA_DIR = dataDir0;
+    if (flag0 === undefined) delete process.env[FLAG];
+    else process.env[FLAG] = flag0;
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    tmp = null;
+  });
+
+  it('BLANK ⇒ treated as UNSET: the planted " " overlay is live, yet the recorder must ignore it', () => {
+    cwd0 = process.cwd();
+    mkdirSync(join(tmp!, ' '), { recursive: true });
+    writeFileSync(join(tmp!, ' ', 'demo-flags.json'), JSON.stringify({ [FLAG]: '1' }), 'utf8');
+    process.chdir(tmp!);
+
+    // FIXTURE IS LIVE — the pre-TRA-5037 idiom (`' '` is truthy ⇒ resolveDemoFlagEnv(' '))
+    // demonstrably reads that file from here. Negative control, anchored to the REAL
+    // resolveDemoFlagEnv; without it the assertions below pass against the defect.
+    expect(resolveDemoFlagEnv(' ', {} as NodeJS.ProcessEnv)[FLAG]).toBe('1');
+
+    process.env.DATA_DIR = ' ';
+    expect(recorderEnv()[FLAG]).toBeUndefined();
+
+    // Blank is UNSET, not "overlay off": process.env still arms the recorder.
+    process.env[FLAG] = '1';
+    expect(recorderEnv()[FLAG]).toBe('1');
+
+    // `''` is the other blank spelling (already falsy under the old idiom — pinned so
+    // a future `!= null` "simplification" cannot un-fix it).
+    delete process.env[FLAG];
+    process.env.DATA_DIR = '';
+    expect(recorderEnv()[FLAG]).toBeUndefined();
   });
 });

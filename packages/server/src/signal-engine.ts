@@ -697,7 +697,7 @@ import {
 import type { BrokerCloseEvent, BrokerRejectClass } from './broker-submit-census.js';
 import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
 import { isSma200DemoForwardTestEnabled } from './sma200-forward-test-flag.js';
-import { resolveDemoFlagEnv } from './demo-flags.js';
+import { resolveDemoFlagEnvFromEnv } from './demo-flags.js';
 // TRA-2233 — marketable(bid) open-position valuation, DARK behind
 // ENABLE_MARKETABLE_OPEN_MTM. Demo-scoped downstream (account guards on
 // mode==='demo'), so wiring it into both accounts can never change a live number.
@@ -9290,10 +9290,18 @@ export class SignalEngine {
    * the only writable switch a non-admin agent has on the self-hosted host.
    * When `DATA_DIR` is unset (unit tests / CLI) there is no canonical file
    * location, so `process.env` is used directly.
+   *
+   * TRA-5037 — through `resolveDemoFlagEnvFromEnv`, which TRIMS, so a
+   * blank-but-present `DATA_DIR` (`' '`, bqb1 has reached it twice) behaves as
+   * UNSET instead of resolving the overlay against a directory literally named
+   * `" "` relative to the launch cwd. This is the RECORDER: the writer
+   * (`index.ts` → `writeDemoFlagFile(resolveDataDir(), …)`) already trimmed, so
+   * under the old truthiness gate a blank value had the arm written to
+   * `<bundle>/data/demo-flags.json` and read from `" "/demo-flags.json` — the
+   * write returned 200 and the flag never took effect here.
    */
   private resolveDemoFlagEnv(): NodeJS.ProcessEnv {
-    const dir = process.env.DATA_DIR;
-    return dir ? resolveDemoFlagEnv(dir) : process.env;
+    return resolveDemoFlagEnvFromEnv();
   }
 
   /**

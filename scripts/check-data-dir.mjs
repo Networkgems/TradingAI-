@@ -240,10 +240,10 @@ const BASELINE = {
       },
     ],
   },
-  'signal-engine.ts': {
-    copies: 0,
-    exempt: [{ text: 'const dir = process.env.DATA_DIR;', count: 1, reason: R.REPORT }],
-  },
+  // TRA-5037 — `signal-engine.ts` left the baseline: its one hit (the RECORDER's
+  // `SignalEngine.resolveDemoFlagEnv()`) now resolves through
+  // `resolveDemoFlagEnvFromEnv()`, which trims. Removal, not a new copy; the
+  // ratchet demanded this hand edit, which is the design.
 };
 
 /** Sum of `copies` across the baseline — the number the ticket records. */
