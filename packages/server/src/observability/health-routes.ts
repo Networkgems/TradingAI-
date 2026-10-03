@@ -374,7 +374,7 @@ import { summarizeChandelierAtrShadow } from '../tra5061-chandelier-atr-shadow.j
 import { summarizeOptionsBreakerLedger } from '../options-breaker-ledger.js'; // TRA-3218
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
-import { resolveDemoFlagEnv, resolveDemoFlagEnvFromEnv, DEMO_FLAG_ALLOWLIST } from '../demo-flags.js';
+import { resolveDemoFlagEnvFromEnv, DEMO_FLAG_ALLOWLIST } from '../demo-flags.js';
 // TRA-4436 — demo-effective ma20 confirm bars, derived from the shipped
 // `buildRvExitParams` so the option-swing-exits readout cannot drift from it.
 import { demoEffectiveMa20ConfirmBars } from '../rv-exit-params.js';
@@ -5604,8 +5604,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // reads mostly `pending` on a calm/empty forward book — an honest not-yet, never
   // a silent pass. Read-only: routes no order. Live stays gated on TRA-382.
   app.get('/api/health/wheel-promotion-gate', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const ivFilterEnabled = isWheelIvEntryFilterEnabled(env);
     res.json({
       ok: true,
@@ -5696,8 +5695,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // and reset on the ~daily reboot (same contract as `/api/health/live-equity`); a
   // validation run reads them within a session. No balances/PII.
   app.get('/api/health/churn-brake', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const armed = isChurnLossBrakeEnabled(env);
     const cap = resolveSameSessionOpenCap(env);
     const build = resolveBuildInfo();
@@ -5753,8 +5751,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // DEMO-ONLY by construction: the engine records here only on the demo directional
   // chokepoint. No balances/PII — just flag, thresholds, symbol counts, reject codes.
   app.get('/api/health/directional-quality-gate', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const armed = isDirectionalQualityGateEnabled(env);
     const thresholds = resolveDirectionalQualityThresholds(env);
     const etDay = etDateString(new Date(now()));
@@ -5940,11 +5937,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // whenever the recorder is dark or stale, and `invalidations` serializes as `null`
   // rather than `0` while dark (TRA-1707: `0` is never "not measured").
   app.get('/api/health/giveback-arm-floor', (_req, res) => {
-    const dir = process.env.DATA_DIR;
     // The live book reads process.env; the demo book overlays demo-flags.json — mirror
     // the engine's `bookMarkEnv` resolution so `armed` reflects what each book sees.
     const liveEnv = process.env;
-    const demoEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const demoEnv = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const summary = summarizeGiveBackArmFloor({ now: now() });
     const rec = summary.recorder;
     // Darkness and staleness are BOTH failures of the instrument, not of the book: a
@@ -7367,8 +7363,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   });
 
   app.get('/api/health/cost-aware-gate', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const armed = isOptionCostAwareGateEnabled(env);
     const config = resolveCostGateConfig(env);
     const structures = ['single_leg_rv', 'single_leg_otm', 'directional'];
@@ -8667,8 +8662,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   //
   // Observe-only: reading this never routes an order or moves a bar.
   app.get('/api/health/option-spread-cost', async (req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const config = resolveCostGateConfig(env);
 
     // TRA-2316 — optional `?sinceTs=` (epoch ms) cohort filter on the ENTRY
@@ -8954,8 +8948,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // the DATA_DIR demo-flags.json overlay, file wins), so a reader can tell whether
     // a `session_edge_blackout` bucket of 0 is "armed but no entries hit an edge" vs
     // "disarmed, could never increment". DARK by default; tightening-only.
-    const sebDir = process.env.DATA_DIR;
-    const sebEnv = sebDir ? resolveDemoFlagEnv(sebDir) : process.env;
+    const sebEnv = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const sebArmed = isSessionEdgeBlackoutEnabled(sebEnv);
     const sebMinutes = resolveSessionEdgeBlackoutMinutes(sebEnv);
     res.json({
@@ -9079,8 +9072,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // the demo-flags.json overlay, and the live flag alone arms the exit-risk
   // input: signal-engine `optionExitRisk = master || takeProfitEarlyArmed`).
   app.get('/api/health/take-profit-early', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const enabled = isTakeProfitEarlyEnabled(env);
     const liveEnabled = isTakeProfitEarlyLiveEnabled(process.env);
     res.json({
@@ -9121,8 +9113,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // missing signal, stated out loud. It also makes TRA-1293's own forward-sample of
   // gate 2's rejection rate — the stated pre-live-promotion bar — takeable at last.
   app.get('/api/health/entry-greeks-gate', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const enabled = isEntryGreeksGateEnabled(env);
     const etDay = etDateString(new Date(now()));
     const counts = summarizeEntryGreeksGate(etDay);
@@ -9254,17 +9245,11 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const rvRetuneLive = isRvExitRetuneLiveEnabled(process.env);
     const tpEarlyLive = isTakeProfitEarlyLiveEnabled(process.env);
     const swingTimeStopTradingDays = resolveSwingTimeStopTradingDays(process.env);
-    // The demo book's env view — the same `dir ? resolveDemoFlagEnv(dir) :
-    // process.env` the engine's private `resolveDemoFlagEnv()` returns.
-    // TRA-4606 — `dir`, not `dataDir`. The TRA-4440 exemption in
-    // scripts/check-data-dir.mjs covers exactly the `dir` report-read idiom at
-    // count 11, and the rename to `dataDir` both dropped that count to 10
-    // (STALE_EXEMPTION) and presented as an eleventh, UNEXEMPTED copy (NEW_COPY).
-    // Same read, same blank-value behaviour; only the identifier moved.
-    // ⛔ Do not spell the exempted line out in prose here — the scanner matches on
-    // text, so quoting it verbatim in a comment counts as another copy.
-    const dir = process.env.DATA_DIR;
-    const demoEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
+    // The demo book's env view — the same resolution the engine's private
+    // `resolveDemoFlagEnv()` returns (TRA-5037: both now go through
+    // `resolveDemoFlagEnvFromEnv()`, which trims, so a blank-but-present
+    // DATA_DIR behaves as unset instead of resolving a dir literally named " ").
+    const demoEnv = resolveDemoFlagEnvFromEnv();
     // TRA-5061 — hoisted so the ATR-series selection is resolved EXACTLY ONCE
     // for this response. The shadow census publishes `decidedBy` and the spread
     // below publishes `atrTimeframe`; resolving the flag twice is precisely how
@@ -9408,8 +9393,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // structurally incapable of touching live capital (the live branch stays
   // hard-gated by the empty TRA-817 manifest regardless of this flag).
   app.get('/api/health/sma200-forward-test', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const enabled = isSma200DemoForwardTestEnabled(env);
     // TRA-1289 — fill evidence for the TRA-1242 accrual monitor. Without a
     // countable signal, "armed, no swing yet" is indistinguishable from "a fill
@@ -9879,9 +9863,8 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // `<bundle>/data/demo-flags.json` when `DATA_DIR` is unset, which the engine
     // never does — re-opening the route-vs-recorder disagreement above, inverted.
     //
-    // ⚠️ The 11 sibling reads in this file still carry the naked idiom, so do NOT
-    // "match the neighbours" here — they are the backlog, not the pattern. TRA-5037
-    // carries them, the recorder included, with the per-site classification.
+    // TRA-5037 converted the 11 sibling reads in this file (and the recorder) to
+    // the same helper, so the neighbours now ARE the pattern.
     const flagEnv = resolveDemoFlagEnvFromEnv();
     const enabled = isOptionRealFillShadowEnabled(flagEnv);
 

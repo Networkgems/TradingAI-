@@ -63,6 +63,9 @@ import {
   isOptionRealFillShadowEnabled,
   OPTION_REAL_FILL_SHADOW_FLAG,
 } from '../option-real-fill-shadow.js';
+// TRA-5037 — the churn-brake flag, the surface the sibling-reads blank-case test
+// below grades after the 11 class-A conversions in health-routes.ts.
+import { CHURN_LOSS_BRAKE_FLAG } from '../churn-loss-brake-flag.js';
 // TRA-3216 — the live OTM underlying allowlist + the enforcement-gate ledger it publishes through.
 import { OPTION_LIVE_OTM_UNIVERSE_VAR } from '../otm-live-universe-flag.js';
 import { clearLiveEnforceGateLedger, recordLiveEnforceDecision } from '../live-enforce-gate-ledger.js';
@@ -8839,5 +8842,74 @@ describe('TRA-5030 DATA_DIR states on /api/health/option-real-fill-shadow', () =
     delete process.env[FLAG];
     process.env.DATA_DIR = '';
     expect(await serve()).toMatchObject({ enabled: false, enabledSource: 'off' });
+  });
+});
+
+// TRA-5037 — the 11 sibling reads in this file (TRA-5030 converted only
+// /api/health/option-real-fill-shadow) must also treat a blank-but-present DATA_DIR
+// as unset. One per-surface test, on /api/health/churn-brake, built on the same
+// planted-`" "` fixture as the TRA-5030 block above — a test that only sets
+// `DATA_DIR=' '` and asserts the safe outcome passes against the defect, because a
+// MISSING overlay also falls back to process.env.
+describe('TRA-5037 blank DATA_DIR on /api/health/churn-brake (the sibling reads)', () => {
+  const FLAG = CHURN_LOSS_BRAKE_FLAG;
+  let tmp: string | null = null;
+  let cwd0: string | null = null;
+
+  const serve = async (): Promise<{ armed: boolean }> => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    await routes.get('/api/health/churn-brake')![0]!({ query: {} }, res);
+    return res.body as { armed: boolean };
+  };
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'tra5037-hr-'));
+    delete process.env[FLAG];
+    delete process.env.DATA_DIR;
+  });
+
+  afterEach(() => {
+    if (cwd0) process.chdir(cwd0);
+    cwd0 = null;
+    delete process.env[FLAG];
+    delete process.env.DATA_DIR;
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    tmp = null;
+  });
+
+  it('BLANK ⇒ treated as UNSET; the planted " " overlay is live, yet the readout must ignore it', async () => {
+    cwd0 = process.cwd();
+    mkdirSync(join(tmp!, ' '), { recursive: true });
+    writeFileSync(join(tmp!, ' ', 'demo-flags.json'), JSON.stringify({ [FLAG]: '1' }), 'utf8');
+    process.chdir(tmp!);
+
+    // FIXTURE IS LIVE — negative control through the real resolveDemoFlagEnv.
+    expect(resolveDemoFlagEnv(' ', {} as NodeJS.ProcessEnv)[FLAG]).toBe('1');
+
+    process.env.DATA_DIR = ' ';
+    expect((await serve()).armed).toBe(false);
+
+    // Blank is UNSET, not "overlay off": process.env still arms the readout.
+    process.env[FLAG] = '1';
+    expect((await serve()).armed).toBe(true);
+
+    // `''` — the other blank spelling, pinned.
+    delete process.env[FLAG];
+    process.env.DATA_DIR = '';
+    expect((await serve()).armed).toBe(false);
+  });
+
+  it('SET ⇒ the overlay still wins (the conversion must not have weakened the file path)', async () => {
+    writeFileSync(join(tmp!, 'demo-flags.json'), JSON.stringify({ [FLAG]: '1' }), 'utf8');
+    process.env.DATA_DIR = tmp!;
+    expect(process.env[FLAG]).toBeUndefined();
+    expect((await serve()).armed).toBe(true);
   });
 });
