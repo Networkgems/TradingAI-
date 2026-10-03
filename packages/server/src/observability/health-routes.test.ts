@@ -3791,7 +3791,14 @@ describe('GET /api/health/equity-entry-funnel — symbol layer (TRA-1793)', () =
 // The acceptance criterion is not "the route exists" but "the route can tell an
 // outage from a drought", so these assert the SEPARATION, not the shape.
 describe('TRA-2193 GET /api/health/rv-scan', () => {
-  function mountRvScan(env: Record<string, string | undefined> = {}) {
+  function mountRvScan(
+    env: Record<string, string | undefined> = {},
+    // TRA-5087 — the staleness grade needs BOTH instants or it grades nothing:
+    // a fixture `now` against the vitest process's real boot reads as a
+    // permanent arming grace. Defaults keep the legacy cases on NOW (1970,
+    // outside calendar coverage, where the grade is `calendar_uncovered`).
+    clock: { nowMs?: number; bootedAtMs?: number } = {},
+  ) {
     const saved: Record<string, string | undefined> = {};
     for (const k of Object.keys(env)) {
       saved[k] = process.env[k];
@@ -3803,7 +3810,8 @@ describe('TRA-2193 GET /api/health/rv-scan', () => {
       requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
       userCtx: async () => ctx('admin', engineState()),
       getSettings: () => settings(),
-      now: () => NOW,
+      now: () => clock.nowMs ?? NOW,
+      bootedAtMs: clock.bootedAtMs,
     });
     const handlers = routes.get('/api/health/rv-scan')!;
     const res = fakeRes();
@@ -3871,6 +3879,55 @@ describe('TRA-2193 GET /api/health/rv-scan', () => {
     ).toBe(last.candidatesEvaluated - last.candidatesPassed);
     expect(dir.lastScan!['bucketsBalance']).toBe(true);
     expect((body.dataSource as unknown as Record<string, unknown>).lastFetchOkAt).toBe(NOW);
+  });
+
+  // TRA-5087 — the wiring of the in-RTH staleness discriminator, asserted on the
+  // route's own payload (the pure grader has its own suite in
+  // rv-scan-rth-staleness.test.ts). Both directions, because the whole defect
+  // was a reading that could not distinguish them.
+  it('TRA-5087 RED: a day-old lastScanAt mid-RTH on a session day flips verdict to stale_in_rth and ok to false', () => {
+    const fridayClose = Date.parse('2026-10-02T19:59:59.326Z');
+    const run = beginRvScan('directional', 1, () => fridayClose);
+    run.enterSymbol();
+    run.reject('no_trend_confluence');
+    run.fetchOk();
+    run.finish();
+
+    // Monday 2026-10-05, 11:00 ET — the next session, mid-RTH, booted pre-open.
+    const { body } = mountRvScan(
+      { ENABLE_OPTION_DEMO_DIRECTIONAL: '1' },
+      { nowMs: Date.parse('2026-10-05T15:00:00Z'), bootedAtMs: fridayClose },
+    );
+    expect(body.verdict).toBe('stale_in_rth');
+    expect(body.ok).toBe(false);
+    const g = body.rthStaleness as unknown as Record<string, unknown>;
+    expect(g.state).toBe('stale_in_rth');
+    expect(g.inRth).toBe(true);
+    // The loop DID turn since boot — that is exactly the claim `scanning` used
+    // to hide behind, so pin that the raw counters still say so while the
+    // verdict no longer does.
+    expect(body.scanCountSinceBoot).toBe(1);
+  });
+
+  it('TRA-5087 GREEN CONTROL: the 2026-10-03 incident read — Saturday, lastScanAt at Friday close — keeps verdict scanning and ok true', () => {
+    const fridayClose = Date.parse('2026-10-02T19:59:59.326Z');
+    const run = beginRvScan('directional', 1, () => fridayClose);
+    run.enterSymbol();
+    run.reject('no_trend_confluence');
+    run.fetchOk();
+    run.finish();
+
+    // The filing's own read instant: 2026-10-03T16:39:53Z, which is 12:39 ET
+    // on a SATURDAY — the weekday misread that produced this ticket.
+    const { body } = mountRvScan(
+      { ENABLE_OPTION_DEMO_DIRECTIONAL: '1' },
+      { nowMs: Date.parse('2026-10-03T16:39:53Z'), bootedAtMs: fridayClose },
+    );
+    expect(body.verdict).toBe('scanning');
+    expect(body.ok).toBe(true);
+    const g = body.rthStaleness as unknown as Record<string, unknown>;
+    expect(g.state).toBe('out_of_session');
+    expect(g.reason).toMatch(/not an NYSE session/);
   });
 
   it('separates ARMED-BUT-NEVER-RAN from DISARMED — the two an operator must not confuse', () => {

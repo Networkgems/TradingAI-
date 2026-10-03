@@ -121,6 +121,7 @@ import {
   RV_SCAN_PATH_STRUCTURE_LABEL,
   type RvScanAdmissibilityLedgerRead, // TRA-4255
 } from '../rv-scan-telemetry.js'; // TRA-2193 / TRA-2245
+import { gradeRvScanRthStaleness } from '../rv-scan-rth-staleness.js'; // TRA-5087
 import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
 import { buildWheelPromotionGateSummary } from '../wheel-promotion-gate-store.js'; // TRA-2028
 import {
@@ -655,6 +656,13 @@ export interface LiveHealthDeps {
   adoptedHandoverRows?: () => AdoptedHandoverCensusRow[];
   /** Injectable clock for deterministic tests. Defaults to Date.now. */
   now?: () => number;
+  /**
+   * TRA-5087 — when this process booted, for the rv-scan in-RTH staleness
+   * boot grace. Tests inject it beside `now`; absent ⇒ derived from
+   * `process.uptime()`. A fixture `now` mixed with the REAL boot instant
+   * grades nothing, which is why this is a dep and not an inline read.
+   */
+  bootedAtMs?: number;
 }
 
 /** TRA-3445 — one engine's aggregate live-OTM exposure readout. */
@@ -10258,8 +10266,35 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           ? 'armed_but_never_ran'
           : 'scanning';
 
+    // TRA-5087 — the in-RTH staleness discriminator. `scanning` + `enabled: true`
+    // read IDENTICALLY at 20.7h stale on a Saturday (healthy — the exchange was
+    // shut) and at 20.7h stale mid-session on a weekday (dark-in-RTH on the
+    // money host), and the Saturday reading got filed as an RTH outage because
+    // the route left the calendar question to the reader. `scanning` only ever
+    // asserted "the loop has turned since boot", which on a multi-day process
+    // says nothing about TODAY. The grade is calendar-aware (weekends, NYSE
+    // closures, early closes, DST) and fail-closed; thresholds and the full
+    // state table live in rv-scan-rth-staleness.ts.
+    const rthStaleness = gradeRvScanRthStaleness({
+      nowMs: now(),
+      lastScanAtMs: lastScanAt,
+      armed: armed.length > 0,
+      bootedAtMs: deps.bootedAtMs,
+    });
+    // `stale_in_rth` outranks `scanning` on the roll-up: a loop that turned
+    // YESTERDAY must not wear the same word mid-session today. The more
+    // specific `disarmed` / `armed_but_never_ran` keep their names —
+    // `rthStaleness` carries the red beside them either way.
+    const verdictOut =
+      verdict === 'scanning' && rthStaleness.state === 'stale_in_rth'
+        ? 'stale_in_rth'
+        : verdict;
+
     res.json({
-      ok: true,
+      // TRA-5087 — `ok` is the staleness grade, not a pulse. False when scans
+      // are stale INSIDE regular hours on a session day (or the calendar cannot
+      // say), true overnight/weekend/holiday no matter how old `lastScanAt` is.
+      ok: rthStaleness.ok,
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       // Top-level `enabled` = is ANY instrumented single-leg entry path armed.
@@ -10267,9 +10302,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // actually reach the pass (TRA-3080). The two disagree whenever a book is in a
       // mode whose arm flag is off, which is the desk's state since 2026-07-30.
       enabled: armed.length > 0,
-      verdict,
+      verdict: verdictOut,
       lastScanAt,
       scanCountSinceBoot: watched.reduce((n, p) => n + (p.scanCountSinceBoot ?? 0), 0),
+      // TRA-5087 — the dark-in-RTH vs quiet-overnight discriminator. Read
+      // `state` + `reason`; `ok` above is wired to it.
+      rthStaleness,
       // TRA-2245 — per-path structure labels. `single_leg_rv` is now reserved for the
       // (compile-time-OFF) rv_scan path; the directional producers journal
       // `single_leg_directional`. Each path in `paths[]` also carries its own
@@ -10402,7 +10440,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         + 'passes; `rejectionsByGate[g] - blindRejectionsByGate[g]` is the ledger of the '
         + 'passes that actually ruled. Both maps are empty on lines written before '
         + '2026-09-10 (NOT MEASURED): if `sum(blindScansByGate) < blindScans` a contributing '
-        + 'boot predates them and the subtraction is incomplete.',
+        + 'boot predates them and the subtraction is incomplete. '
+        // TRA-5087 — the census absence that got filed as an outage: no 2026-10-03
+        // row at "12:39 ET mid-RTH" was cited as evidence the scanner was dark,
+        // but 10-03 was a SATURDAY. The note has to carry the calendar or the
+        // next reader repeats it.
+        + 'TRA-5087: an absent ET DAY (not just an absent cell) on a NON-SESSION date — a '
+        + 'weekend or NYSE closure, e.g. 2026-09-26/27 and 2026-10-03 (Saturdays) — is the '
+        + 'exchange calendar, not an outage. `rthStaleness` above is the in-RTH '
+        + 'discriminator: it reads `stale_in_rth` when scans stop INSIDE regular hours on a '
+        + 'session day and stays green over weekends/holidays/overnight.',
       censusRetentionDays: 30,
     });
   });
