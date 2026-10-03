@@ -697,11 +697,12 @@ export function resolveDemoFlagEnv(
  * from `" "/demo-flags.json`. The write returns 200 and its read-back succeeds; the
  * flag never takes.
  *
- * ⚠️ 15 of the 17 reader sites still gate on truthiness — including
- * `SignalEngine.resolveDemoFlagEnv()`, which is the RECORDER, so the ineffective arm
- * above is still live until they are converted to this helper. TRA-5037 carries the
- * migration and the per-site classification; TRA-5030 converted only the one site
- * `check:data-dir` flagged.
+ * TRA-5037 converted the 15 remaining truthiness-gated reader sites: the 13
+ * demo-flags overlay reads (the RECORDER `SignalEngine.resolveDemoFlagEnv()`, the 11
+ * health-routes readouts, the giveback `resolveRecorderEnvs()`) now resolve through
+ * this helper, and the 2 different-predicate sites (`observability/logger.ts`,
+ * `engine-scorecard.ts`) trim in place. The only remaining bare reads are the two
+ * report-reads that publish the operator's raw value on purpose.
  */
 export function resolveDemoFlagEnvFromEnv(
   baseEnv: NodeJS.ProcessEnv = process.env,

@@ -291,7 +291,9 @@ export function proposalsReportCandidates(): string[] {
   const env = process.env['PROPOSALS_OOS_REPORT_PATH'];
   const candidates: string[] = [];
   if (env && env.trim() !== '') candidates.push(env.trim());
-  const dataDir = process.env['DATA_DIR'];
+  // TRA-5037 — trim, so a blank-but-present DATA_DIR (`' '`, bqb1 has reached it
+  // twice) does not push `" "/proposals-oos-report.json` as a candidate.
+  const dataDir = process.env['DATA_DIR']?.trim();
   if (dataDir) candidates.push(join(dataDir, 'proposals-oos-report.json'));
   // Monorepo dev layout: server/src → backtest/reports.
   candidates.push(resolve(__dirname, '..', '..', 'backtest', 'reports', 'tra797-agents-ab.json'));

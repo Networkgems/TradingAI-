@@ -175,7 +175,16 @@ const BASELINE = {
   },
   'engine-scorecard.ts': {
     copies: 0,
-    exempt: [{ text: "const dataDir = process.env['DATA_DIR'];", count: 1, reason: R.REPORT }],
+    exempt: [
+      {
+        text: "const dataDir = process.env['DATA_DIR']?.trim();",
+        count: 1,
+        reason:
+          'TRA-5037 disposition: CONVERTED in place — trims, so blank no longer pushes a ' +
+          '`" "/…` path candidate; not a demo-flags overlay, so resolveDemoFlagEnvFromEnv() ' +
+          'does not apply, and resolveDataDir() would invent an in-bundle candidate',
+      },
+    ],
   },
   'giveback-arm-floor-ledger.ts': {
     copies: 0,
@@ -224,9 +233,12 @@ const BASELINE = {
     copies: 0,
     exempt: [
       {
-        text: "process.env['LOG_DIR'] ?? join(process.env['DATA_DIR'] ?? process.cwd(), 'logs');",
+        text: "process.env['LOG_DIR']?.trim() || join(process.env['DATA_DIR']?.trim() || process.cwd(), 'logs');",
         count: 1,
-        reason: `${R.REPORT} — falls back to cwd, not an in-bundle path; a different predicate`,
+        reason:
+          'TRA-5037 disposition: CONVERTED in place — `||` over trimmed values, so a blank ' +
+          'LOG_DIR/DATA_DIR no longer sends the log tree to `" "/logs`; falls back to cwd, ' +
+          'not an in-bundle path, so resolveDataDir() would change the meaning',
       },
     ],
   },
