@@ -47,7 +47,7 @@ import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 import { isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG } from './exit-risk-rules-flag.js'; // TRA-2220
-import { resolveDemoFlagEnv } from './demo-flags.js'; // TRA-2220
+import { resolveDemoFlagEnvFromEnv } from './demo-flags.js'; // TRA-2220 / TRA-5037
 import { etDateString, isMarketDayIso } from './scheduler.js'; // TRA-2220
 import { etHour } from './et-clock.js'; // TRA-2498
 
@@ -694,16 +694,17 @@ function lastCompletedTradingDay(now: number): string {
 /**
  * TRA-2220 — resolve the RECORDER's arm state from the same env its one call site reads.
  *
- * Mirrors `SignalEngine.resolveDemoFlagEnv()` EXACTLY (`process.env.DATA_DIR` — not this
- * module's `dataDir`, which index.ts defaults to a bundle path when the var is unset).
+ * Mirrors `SignalEngine.resolveDemoFlagEnv()` EXACTLY (TRA-5037: both resolve through
+ * `resolveDemoFlagEnvFromEnv()`, which trims, so a blank-but-present DATA_DIR behaves
+ * as unset — and NOT through this module's `dataDir`, which index.ts defaults to a
+ * bundle path when the var is unset).
  * Computed HERE rather than passed in by the route, so no caller can ship a readout that
  * silently omits it (TRA-2210: a filter applied at some call sites is a bug awaiting the
  * next one).
  */
 function resolveRecorderEnvs(override?: GiveBackRecorderEnvOverride): GiveBackRecorderEnvOverride {
   if (override) return override;
-  const dir = process.env.DATA_DIR;
-  return { live: process.env, demo: dir ? resolveDemoFlagEnv(dir) : process.env };
+  return { live: process.env, demo: resolveDemoFlagEnvFromEnv() };
 }
 
 function computeRecorderLiveness(

@@ -180,20 +180,15 @@ const BASELINE = {
   'giveback-arm-floor-ledger.ts': {
     copies: 0,
     exempt: [
+      // TRA-5037 — 3 → 1: `resolveRecorderEnvs()`'s read now goes through
+      // `resolveDemoFlagEnvFromEnv()` (it fed the value to resolveDemoFlagEnv as a
+      // ROOT — never a report-read), and the doc comment that spelled the old idiom
+      // out was rewritten with it. The remaining comment documents the banned
+      // in-bundle fallback and stays.
       {
         text: "// build bundle (`index.ts`: `process.env.DATA_DIR ?? join(__dirname,'..','data')`) —",
         count: 1,
         reason: R.COMMENT,
-      },
-      {
-        text: '* Mirrors `SignalEngine.resolveDemoFlagEnv()` EXACTLY (`process.env.DATA_DIR` — not this',
-        count: 1,
-        reason: R.COMMENT,
-      },
-      {
-        text: 'const dir = process.env.DATA_DIR;',
-        count: 1,
-        reason: `${R.REPORT} — deliberately mirrors resolveDemoFlagEnv(), see the comment above it`,
       },
     ],
   },
