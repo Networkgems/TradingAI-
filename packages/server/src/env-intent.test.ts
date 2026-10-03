@@ -13,7 +13,11 @@ const RULED_PROD_ENV: NodeJS.ProcessEnv = {
   // production RATIFIED (TRA-1655 G2), the OTM sleeve RE-ARMED per TRA-4750 item 5,
   // and the TRA-4814 telemetry rider armed in the same change.
   TRADIER_ENV: 'production',
-  ENABLE_OPTION_LIVE_OTM: 'true',
+  // TRA-4885 default B executed by TRA-4988 (2026-10-03): the OTM sleeve is STOOD
+  // DOWN again — card f8cd3843 expired unanswered, bands dark first, caps restored
+  // to the ratified 300/500 as hygiene. Intent is `off`; a stored `false` mirrors
+  // the bqb1 write (absence would match too — the flag defaults off).
+  ENABLE_OPTION_LIVE_OTM: 'false',
   ENABLE_OPTION_MAKER_TELEMETRY: 'true',
   // ENABLE_ORDER_QUOTE_GUARD / ENABLE_OPTION_LIVE_RV_LONG / _DIRECTIONAL absent:
   // their intent is `off` and their code default is off — absence MATCHES.
@@ -64,42 +68,42 @@ describe('summarizeEnvIntent (TRA-4474)', () => {
     expect(s.mismatches).toEqual(['ENABLE_OPTION_LIVE_DIRECTIONAL']);
   });
 
-  // This assertion has now run BOTH ways. Until 2026-09-22 it graded a wipe of
+  // This assertion has now run THREE ways. Until 2026-09-22 it graded a wipe of
   // the TRA-2877 standing arm; TRA-4750 stood the sleeve down and it graded a
   // silent RE-ARM; card 6b82a9e7 on TRA-3401 (2026-09-24) executed the TRA-4750
-  // item 5 board sign-off, so the hazard inverted back: the event to catch is
-  // the board-armed sleeve being found silently DISARMED on the money host.
-  it('THE RE-ARM: the board-armed OTM sleeve found DARK on the money host is a named mismatch', () => {
-    for (const env of [{ ...RULED_PROD_ENV, ENABLE_OPTION_LIVE_OTM: 'false' }] as NodeJS.ProcessEnv[]) {
-      const s = graded(env);
+  // item 5 re-arm and it graded a silent DISARM; TRA-4885's default B (executed
+  // by TRA-4988, 2026-10-03) stood the sleeve down again, so the hazard inverted
+  // once more: the event to catch is the stood-down sleeve being found silently
+  // RE-ARMED on the money host.
+  it('THE STAND-DOWN: the stood-down OTM sleeve found ARMED on the money host is a named mismatch', () => {
+    for (const raw of ['1', 'true', 'yes', 'on']) {
+      const s = graded({ ...RULED_PROD_ENV, ENABLE_OPTION_LIVE_OTM: raw });
       expect(s.ok).toBe(false);
       expect(s.mismatches).toEqual(['ENABLE_OPTION_LIVE_OTM']);
       expect(s.levers.find((l) => l.key === 'ENABLE_OPTION_LIVE_OTM')).toMatchObject({
         present: true,
-        effective: 'off',
-        intended: 'on',
+        effective: 'on',
+        intended: 'off',
         matches: false,
       });
     }
-    // A WIPE reads dark too (the flag defaults off) — same named mismatch, with
-    // present:false keeping the wipe distinguishable from a stored `false`.
+  });
+
+  it('the stood-down sleeve reads ok on a stored false AND on a wipe (the flag defaults off)', () => {
+    const stored = graded(RULED_PROD_ENV);
+    expect(stored.mismatches).toEqual([]);
+    expect(stored.ok).toBe(true);
+    // A wipe reads dark too — matching, with present:false keeping the wipe
+    // distinguishable from a stored `false`.
     const { ENABLE_OPTION_LIVE_OTM: _gone, ...wiped } = RULED_PROD_ENV;
     const s = graded(wiped);
-    expect(s.ok).toBe(false);
-    expect(s.mismatches).toEqual(['ENABLE_OPTION_LIVE_OTM']);
+    expect(s.ok).toBe(true);
     expect(s.levers.find((l) => l.key === 'ENABLE_OPTION_LIVE_OTM')).toMatchObject({
       present: false,
       effective: 'off',
-      matches: false,
+      intended: 'off',
+      matches: true,
     });
-  });
-
-  it('the re-armed sleeve reads ok on every truthy raw the shipped flag accepts', () => {
-    for (const raw of ['1', 'true', 'yes', 'on']) {
-      const s = graded({ ...RULED_PROD_ENV, ENABLE_OPTION_LIVE_OTM: raw });
-      expect(s.mismatches).toEqual([]);
-      expect(s.ok).toBe(true);
-    }
   });
 
   // TRA-4814 rider: a re-opened sleeve may not run untelemetered.
@@ -287,7 +291,9 @@ describe('overlay-backed levers (TRA-5014)', () => {
       [ARM_FLAG]: '1',
       DURABILITY_POLICY: 'observe',
       TRADIER_ENV: 'sandbox',
-      ENABLE_OPTION_LIVE_OTM: 'false',
+      // A re-ARM attempt now that the sleeve is stood down (TRA-4988) — the
+      // overlay must be as inert for a loosening as it was for a disarm.
+      ENABLE_OPTION_LIVE_OTM: 'true',
       ENABLE_OPTION_MAKER_TELEMETRY: 'false',
       ENABLE_OPTION_LIVE_DIRECTIONAL: 'true',
     };
