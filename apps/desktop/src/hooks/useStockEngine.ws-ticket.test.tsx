@@ -181,47 +181,51 @@ describe('TRA-4488 useStockEngine ticket handshake', () => {
     expect(ticketFetches()).toBe(1);
   });
 
-  it('falls back to ?token= when the SERVER predates the ticket endpoint (404)', async () => {
-    // The deploy ordering here is fixed and runs the wrong way: Pages promotes
-    // this client on CI green, bqb1 is deployed by hand later. Without this arm
-    // every Pages user loses live push (and spins on a 404) until the server
-    // catches up — see `buildLegacySocketUrl`.
+  it('TRA-4492 — does NOT fall back to ?token= on a 404; it opens no socket at all', async () => {
+    // This asserted the opposite until TRA-4492. The `?token=` fallback existed
+    // because Pages promotes this client on CI green while bqb1 is deployed by
+    // hand later, so a new client could meet a server with no ticket endpoint.
+    // Every deployed bqb1 build has carried that endpoint since 2026-09-20 and
+    // the server branch that honoured `?token=` is deleted, so there is nothing
+    // left for the fallback to reach — it would just put the session token in a
+    // URL for no gain.
     ticketPlan = ['absent'];
-    render();
-
-    await waitFor(() => expect(sockets.length).toBe(1));
-    expect(sockets[0]!.url).toContain('token=session-token');
-    expect(sockets[0]!.url).not.toContain('ticket=');
-    expect(logoutCalls).toBe(0);
-  });
-
-  it('returns to the TICKET path on the next reconnect once the server has caught up', async () => {
-    // The fallback must not be sticky: one 404 must not pin the client to the
-    // legacy URL for the life of the page. Nothing caches the decision, so this
-    // holds by construction — asserted because "by construction" is how the
-    // reconnect bug in this very file would also have been described.
-    ticketPlan = ['absent', 'ok'];
-    render();
-    await waitFor(() => expect(sockets.length).toBe(1));
-    expect(sockets[0]!.url).toContain('token=session-token');
-
-    act(() => { sockets[0]!.onclose?.({ code: 1006 }); });
-    await act(async () => { await vi.advanceTimersByTimeAsync(31_000); });
-
-    await waitFor(() => expect(sockets.length).toBe(2));
-    expect(sockets[1]!.url).toContain('ticket=ticket-1');
-    expect(sockets[1]!.url).not.toContain('session-token');
-  });
-
-  it('does NOT fall back on a 503 — only a 404 proves the endpoint is absent', async () => {
-    // A 5xx is a blip at an endpoint that exists. Falling back there would put
-    // the session token in the URL on every transient server error, i.e. reopen
-    // the defect on the most common failure in the set.
-    ticketPlan = ['fail'];
     render();
 
     await waitFor(() => expect(ticketFetches()).toBe(1));
     expect(sockets.length).toBe(0);
+    // Not a logout either: a 404 is not a dead session.
+    expect(logoutCalls).toBe(0);
+  });
+
+  it('TRA-4492 — retries a 404 on backoff and takes the TICKET path when it clears', async () => {
+    // A 404 is now an ordinary retryable fault. The replacement for the old
+    // fallback is the backoff loop, so this asserts the client still recovers
+    // rather than merely that it stopped leaking.
+    ticketPlan = ['absent', 'ok'];
+    render();
+
+    await waitFor(() => expect(ticketFetches()).toBe(1));
+    expect(sockets.length).toBe(0);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(31_000); });
+
+    await waitFor(() => expect(sockets.length).toBe(1));
+    expect(sockets[0]!.url).toContain('ticket=ticket-1');
+    expect(sockets[0]!.url).not.toContain('session-token');
+  });
+
+  it('TRA-4492 — a 404 and a 503 are now the SAME case', async () => {
+    // The 404/503 split was the whole point of the fallback: only a 404 proved
+    // the endpoint was absent. With no fallback the distinction carries nothing,
+    // and asserting they agree is what stops a future change from quietly
+    // reviving a status-specific arm that puts a token back in the URL.
+    ticketPlan = ['fail'];
+    render();
+    await waitFor(() => expect(ticketFetches()).toBe(1));
+    const after503 = { sockets: sockets.length, logouts: logoutCalls };
+
+    expect(after503).toEqual({ sockets: 0, logouts: 0 });
   });
 
   it('does not open a socket when the component unmounts while the mint is in flight', async () => {

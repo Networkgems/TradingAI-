@@ -9782,14 +9782,14 @@ app.post('/api/auth/ws-ticket', requireAuth, (_req, res) => {
 });
 
 /**
- * TRA-4488 — WS auth counters, including whether the legacy `?token=` door is
- * still open and how many upgrades have come through it.
+ * TRA-4488 — WS ticket counters. The legacy `?token=` door and its counters are
+ * gone (TRA-4492), so a ticket is the only credential an upgrade can carry.
  *
- * ⚠ `legacyTokenUpgrades` is SINCE-BOOT. Reading 0 here is not clearance to
- * delete the compat branch — bqb1's watchdog restarts the process without any
- * deploy record (TRA-2203/TRA-2261), so a fresh 0 and a genuinely unused door
- * are the same number. `ws-auth.ts` emits one log line per legacy upgrade
- * precisely so the question is answered off the Render log tape instead.
+ * ⚠ These counters are SINCE-BOOT and bqb1's watchdog restarts the process
+ * without writing any deploy record (TRA-2203/TRA-2261), so a 0 here never
+ * discriminates "nothing happened" from "the process restarted a second ago".
+ * That is why the TRA-4492 removal was graded off the Render log tape and not
+ * off this route — see `UpgradeCredential` in `ws-auth.ts`.
  */
 app.get('/api/health/ws-auth', requireAuth, (_req, res) => {
   res.json(wsAuthCounters());
@@ -19539,9 +19539,10 @@ httpServer.on('upgrade', (req, socket, head) => {
   //
   // It used to be inline here, reading a FULL 24h session token out of
   // `?token=` — i.e. out of the request line, which is what every proxy access
-  // log records. It now prefers a single-use 30s `?ticket=` minted by
-  // `POST /api/auth/ws-ticket`, and accepts `?token=` for one deploy window so
-  // an in-flight client is not cut off mid-session.
+  // log records. It now takes a single-use 30s `?ticket=` minted by
+  // `POST /api/auth/ws-ticket`, and nothing else: the `?token=` compat window
+  // TRA-4488 opened was closed by TRA-4492 once the Render tape graded clean,
+  // so a token-bearing upgrade is simply `no_credential`.
   //
   // The TRA-2421 account-existence check (a deleted user must not reach
   // `ensureUserContext` through the WS, which would re-create the data

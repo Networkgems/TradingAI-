@@ -56,34 +56,14 @@ export function buildSocketUrl(serverUrl: string, ticket: string): string {
   return `${serverUrl}?ticket=${encodeURIComponent(ticket)}`;
 }
 
-/**
- * TRA-4488 — the OTHER half of the compat window, and the half the server cannot
- * provide.
- *
- * The server keeps `?token=` working so an OLD client meeting a NEW server is
- * fine. Nothing protects the reverse, and the reverse is the direction that
- * actually happens here: `deploy-pages.yml` promotes the web client
- * automatically once CI is green on `main`, while `tradingai-bqb1` has
- * `autoDeploy=no` and is deployed by an explicit REST trigger whenever the
- * window allows (CLAUDE.md §"Merging does not deploy"). So the new client is
- * live minutes after the merge and the new server may be hours behind it.
- *
- * Against a server that predates this change, `POST /api/auth/ws-ticket` is a
- * 404 — unambiguously "this endpoint does not exist here", distinct from the 401
- * of a dead session and from the 5xx/network of a blip. On exactly that status
- * the client falls back to the old URL shape. The socket reconnects normally, so
- * the next attempt after bqb1 is deployed takes the ticket path with no further
- * action.
- *
- * Without this the dashboard does not go dark (both hooks fall back to 5s REST
- * polling when the socket is down) but it loses live push for every Pages user
- * until the server deploy lands, and spins a retry loop against a 404 the whole
- * time. That is a real regression to ship deliberately for no gain.
- *
- * DELETE THIS WITH THE SERVER'S LEGACY BRANCH — one release after the tape
- * (`TRA-4488 WS upgrade authenticated by LEGACY`) is clean. It is the only
- * remaining place a session token is put in a URL.
- */
-export function buildLegacySocketUrl(serverUrl: string, token: string): string {
-  return `${serverUrl}?token=${encodeURIComponent(token)}`;
-}
+// TRA-4492 — `buildLegacySocketUrl` is DELETED, with the server branch that
+// honoured it. It was the other half of the TRA-4488 compat window: a client
+// promoted by `deploy-pages.yml` on CI green can be hours ahead of `bqb1`
+// (`autoDeploy=no`), so on a 404 from the ticket endpoint it fell back to
+// `?token=<session>`. Every deployed bqb1 build has carried the ticket endpoint
+// since 2026-09-20, and the Render tape showed zero legacy upgrades over the
+// 7.08-day grading window, so the fallback had no server left to reach.
+//
+// It was the last place in the repo that put a session token in a URL, and that
+// absence is the acceptance property of TRA-4492 — asserted by
+// `ws-ticket.no-token-in-url.test.ts`, not left to a convention.

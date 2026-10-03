@@ -49,10 +49,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { hashSecretValue, verifyToken } from './auth.js';
-import { logger } from './observability/index.js';
-
-const log = logger.child({ module: 'ws-auth' });
+import { hashSecretValue } from './auth.js';
 
 /**
  * Ticket lifetime. Long enough for the client's own `fetch` → `new WebSocket`
@@ -80,13 +77,11 @@ interface TicketEntry {
 const tickets = new Map<string, TicketEntry>();
 let seqCounter = 0;
 
-/** Since-boot counters. See `wsAuthCounters` for why these are not the tape. */
+/** Since-boot counters for `/api/health/ws-auth`. */
 const counters = {
   ticketsIssued: 0,
   ticketsRedeemed: 0,
   ticketsRefused: 0,
-  legacyTokenUpgrades: 0,
-  legacyTokenRefused: 0,
 };
 
 function pruneExpired(now: number): number {
@@ -165,48 +160,36 @@ export function revokeWsTicketsFor(username: string): number {
   return revoked;
 }
 
-// ── Legacy `?token=` compatibility window ────────────────────────────────────
-
-/**
- * Whether the upgrade handler still accepts `?token=<session>`.
- *
- * This is the TRA-4479 `consumeLegacyResetToken` pattern: an in-flight client
- * that was shipped before this change holds a socket it will re-open on the
- * next reconnect, and cutting it off at the deploy is a dead dashboard for
- * whoever has the old build open. So the old door stays open for **one deploy
- * window** and then goes.
- *
- * It is resolved from the environment rather than hard-coded so the door can be
- * shut on bqb1 with an env write and a zero-byte redeploy (see CLAUDE.md
- * §"Merging does not deploy") the moment the tape says nothing is using it —
- * i.e. without waiting for a code release to be schedulable.
- *
- * Default is ACCEPT. An unparseable value is also ACCEPT: this switch's
- * fail-open direction is "an old client keeps working", and the alternative
- * (typo ⇒ every pre-upgrade client silently locked out) is the outage.
- */
-export function resolveLegacyTokenAccepted(raw: string | undefined): boolean {
-  if (raw === undefined) return true;
-  const v = raw.trim().toLowerCase();
-  if (v === 'off' || v === '0' || v === 'false' || v === 'no') return false;
-  return true;
-}
-
-export const LEGACY_TOKEN_ACCEPTED = resolveLegacyTokenAccepted(process.env.WS_LEGACY_TOKEN_QUERY);
-
 // ── The upgrade decision ─────────────────────────────────────────────────────
 
-export type UpgradeCredential = 'ticket' | 'legacy_token';
+/**
+ * TRA-4492 — the legacy `?token=` compatibility window is CLOSED.
+ *
+ * TRA-4488 left the old door open for one deploy window (plus a
+ * `WS_LEGACY_TOKEN_QUERY` kill switch) so an in-flight client shipped before the
+ * ticket handshake was not cut off mid-session. Both halves were deleted
+ * together once the Render tape was graded clean: zero
+ * `TRA-4488 WS upgrade authenticated by LEGACY` lines over
+ * 2026-09-26T14:20:18Z → 2026-10-03T16:20Z — 7.08 days spanning five RTH
+ * sessions and a full weekend, with the door measured OPEN for the whole window
+ * (`WS_LEGACY_TOKEN_QUERY` absent from all 97 of bqb1's env keys, so
+ * `resolveLegacyTokenAccepted(undefined)` → accept). A tokenless upgrade is now
+ * `no_credential`.
+ *
+ * ⚠ The counters below were never the clearance and a future removal must not
+ * read them as one — they are since-boot, and bqb1's watchdog restarts the
+ * process without writing a deploy record (TRA-2203/TRA-2261), so a fresh 0 and
+ * a genuinely unused door are the same number. The grade came off the log tape.
+ */
+export type UpgradeCredential = 'ticket';
 
 export type UpgradeAuthResult =
   | { ok: true; username: string; credential: UpgradeCredential }
-  | { ok: false; reason: 'no_credential' | 'bad_ticket' | 'bad_token' | 'legacy_disabled' | 'no_such_user' };
+  | { ok: false; reason: 'no_credential' | 'bad_ticket' | 'no_such_user' };
 
 export interface UpgradeAuthDeps {
   /** Same existence check `requireAuth` applies — see TRA-2421. */
   userExists: (username: string) => boolean;
-  /** Defaults to `LEGACY_TOKEN_ACCEPTED`; the tests drive both arms. */
-  allowLegacyToken?: boolean;
   now?: number;
 }
 
@@ -226,7 +209,6 @@ export function authenticateUpgrade(
   rawUrl: string | undefined,
   deps: UpgradeAuthDeps,
 ): UpgradeAuthResult {
-  const allowLegacy = deps.allowLegacyToken ?? LEGACY_TOKEN_ACCEPTED;
   const now = deps.now ?? Date.now();
 
   let params: URLSearchParams;
@@ -236,55 +218,32 @@ export function authenticateUpgrade(
     return { ok: false, reason: 'no_credential' };
   }
 
+  // A ticket is the ONLY credential an upgrade carries (TRA-4492 closed the
+  // `?token=` window), so anything else — including a `?token=` from a client
+  // older than the TRA-4488 deploy — is `no_credential`.
   const ticket = params.get('ticket') ?? '';
-  if (ticket) {
-    const username = consumeWsTicket(ticket, now);
-    if (!username) { counters.ticketsRefused += 1; return { ok: false, reason: 'bad_ticket' }; }
-    if (!deps.userExists(username)) { counters.ticketsRefused += 1; return { ok: false, reason: 'no_such_user' }; }
-    counters.ticketsRedeemed += 1;
-    return { ok: true, username, credential: 'ticket' };
-  }
+  if (!ticket) return { ok: false, reason: 'no_credential' };
 
-  const token = params.get('token') ?? '';
-  if (!token) return { ok: false, reason: 'no_credential' };
-  if (!allowLegacy) { counters.legacyTokenRefused += 1; return { ok: false, reason: 'legacy_disabled' }; }
-
-  const username = verifyToken(token);
-  if (!username) return { ok: false, reason: 'bad_token' };
-  if (!deps.userExists(username)) return { ok: false, reason: 'no_such_user' };
-
-  counters.legacyTokenUpgrades += 1;
-  // THE REMOVAL DISCRIMINATOR, and it has to be on the log tape rather than in
-  // the counter below. `legacyTokenUpgrades` is since-boot: bqb1's memory
-  // watchdog restarts the process without writing a deploy record at all
-  // (TRA-2203/TRA-2261), so reading 0 off a fresh process is indistinguishable
-  // from "no client has used the old door since the deploy" — the former is
-  // ignorance, the latter is the clearance to delete this branch. One line per
-  // legacy upgrade, so the question is answered by grepping the Render log over
-  // the window, which survives the restart. Carries no token and no ticket.
-  log.warn('TRA-4488 WS upgrade authenticated by LEGACY ?token= query param — client predates the ticket handshake', {
-    username,
-    legacyUpgradesSinceBoot: counters.legacyTokenUpgrades,
-  });
-  return { ok: true, username, credential: 'legacy_token' };
+  const username = consumeWsTicket(ticket, now);
+  if (!username) { counters.ticketsRefused += 1; return { ok: false, reason: 'bad_ticket' }; }
+  if (!deps.userExists(username)) { counters.ticketsRefused += 1; return { ok: false, reason: 'no_such_user' }; }
+  counters.ticketsRedeemed += 1;
+  return { ok: true, username, credential: 'ticket' };
 }
 
 /**
  * Since-boot counters for `/api/health/ws-auth`.
  *
  * ⚠ These are **since-boot** and bqb1 restarts without leaving a deploy record
- * (TRA-2203/TRA-2261), so `legacyTokenUpgrades: 0` here is NOT evidence the
- * compat branch is unused — it is equally consistent with a restart one second
- * ago. Grade the removal off the log tape (`TRA-4488 WS upgrade authenticated
- * by LEGACY`) over the whole window. `legacyAccepted` is printed so the door's
- * state is read, never assumed.
+ * (TRA-2203/TRA-2261), so a 0 here never discriminates "nothing happened" from
+ * "the process restarted a second ago". Grade anything that matters off the log
+ * tape, which survives the restart — see TRA-4492 on `UpgradeCredential`.
  */
 export function wsAuthCounters(): Record<string, unknown> {
   return {
     ...counters,
     ticketsOutstanding: tickets.size,
     ticketTtlMs: WS_TICKET_TTL_MS,
-    legacyAccepted: LEGACY_TOKEN_ACCEPTED,
   };
 }
 
@@ -293,6 +252,4 @@ export function resetWsAuthCountersForTest(): void {
   counters.ticketsIssued = 0;
   counters.ticketsRedeemed = 0;
   counters.ticketsRefused = 0;
-  counters.legacyTokenUpgrades = 0;
-  counters.legacyTokenRefused = 0;
 }
