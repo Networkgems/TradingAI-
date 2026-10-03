@@ -168,6 +168,8 @@
     "check:cost-bar-input-age:controls": "node scripts/check-cost-bar-input-age.mjs --selftest",
     "check:backup-integrity": "node scripts/tra5003-backup-integrity-audit.mjs",
     "check:backup-integrity:controls": "node scripts/tra5003-backup-integrity-audit.mjs --selftest",
+    "check:equity-dry": "node scripts/check-equity-dry.mjs",
+    "check:equity-dry:controls": "node scripts/check-equity-dry.mjs --selftest",
     "//tra2906:rebuild-cash-flow": "TRA-2906 — one-time v1→v2 migration of tradier-cash-flow.<env>.json, which is … → docs/package-script-notes.md § \"//tra2906:rebuild-cash-flow\"",
     "tra2906:rebuild-cash-flow": "node scripts/tra2906-rebuild-cash-flow.mjs",
     "tra2906:rebuild-cash-flow:controls": "node scripts/tra2906-rebuild-cash-flow.mjs --selftest",
