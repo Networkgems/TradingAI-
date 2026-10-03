@@ -73,6 +73,73 @@ export function isRthInstant(ms) {
 }
 
 /**
+ * AC1's divergence ruling, as a function rather than a `=== 0` so the verdict
+ * discriminates the defect class AC1 actually targets (user-DEPENDENT content)
+ * from upstream revision noise the pre-hoist code exhibited identically.
+ *
+ * A same-instant, same-length divergence confined to the `volume` field is the
+ * vendor restating a bar as late trades settle — both values existed under the
+ * per-user caches too (each engine held whichever its own fetch returned), so
+ * it is not evidence the content depends on the user. Anything touching a
+ * price/time field, or changing the series shape, stays FAIL.
+ *
+ * The ruling REFUSES (FAIL) when any divergence is unwitnessed: a count above
+ * the witness list's length contains divergences nobody can classify, and an
+ * unclassifiable divergence must not be ruled benign by the classifiable ones
+ * beside it.
+ */
+export function classifyDivergence(share) {
+  const n = share?.divergentSameInstant ?? 0;
+  if (n === 0) return { verdict: 'PASS', note: null };
+  const witnesses = share.divergentWitness ?? [];
+  if (witnesses.length !== n) {
+    return {
+      verdict: 'FAIL',
+      note: `ruling REFUSED: ${n} divergences but ${witnesses.length} witnesses captured — an unwitnessed divergence cannot be ruled benign.`,
+    };
+  }
+  const allVolumeRevisions = witnesses.every(
+    (w) => w.field === 'volume' && w.heldLength === w.incomingLength,
+  );
+  if (allVolumeRevisions) {
+    return {
+      verdict: 'PASS',
+      note: 'RULED BENIGN: every witnessed divergence is a volume-only, same-length, same-instant revision — upstream late-settling-trades restatement, visible under per-user caches too. Not user-dependent content.',
+    };
+  }
+  return {
+    verdict: 'FAIL',
+    note: 'a witnessed divergence touches a price/time field or changes the series shape — not classifiable as an upstream volume revision.',
+  };
+}
+
+/**
+ * AC3's ratio arm is only measurable over the FULL ring with a weekday
+ * premarket slot (~11:00–13:30Z Mon–Fri) inside it — the measured growth lands
+ * there, so a ring without one shows ratio 1.00 vacuously.
+ *
+ * ⛔ "Full" is SATURATION (`samples >= capacity`), never a 24-hour span test.
+ * The ring is `capacity` slots at `intervalMs`, so its maximum span is
+ * `(capacity−1)×interval` — 288×300s tops out at 23.92h — and the original
+ * `spanH >= 24` conjunct was UNSATISFIABLE by construction: the ratio arm read
+ * BLIND on every read forever, including the ones it was armed to measure
+ * (caught live 2026-10-03, same shape as TRA-3681's unsatisfiable AND).
+ * A `capacity` the census did not publish reads NOT measurable, never full.
+ */
+export function ratioArmMeasurable(tape, capacity) {
+  const samples = Array.isArray(tape) ? tape.length : 0;
+  const coversPremarket = (Array.isArray(tape) ? tape : []).some((s) => {
+    const d = new Date(s.atMs);
+    const dow = d.getUTCDay();
+    const min = d.getUTCHours() * 60 + d.getUTCMinutes();
+    return dow >= 1 && dow <= 5 && min >= 11 * 60 && min < RTH_OPEN_MIN;
+  });
+  const ringFull = typeof capacity === 'number' && capacity > 0 && samples >= capacity;
+  const spanH = samples >= 2 ? (tape[samples - 1].atMs - tape[0].atMs) / 3.6e6 : 0;
+  return { measurable: ringFull && coversPremarket, coversPremarket, ringFull, spanH };
+}
+
+/**
  * The POPULATION the read was taken at — the number of per-user engines.
  *
  * Read off `signalEngine.*` owners and deliberately NOT as a max over all rows:
@@ -562,6 +629,42 @@ function selftest() {
     'priced BLIND on a non-finite saving',
     pricedVerdict({ refusal: null, savingBytes: Number.NaN }).verdict === 'BLIND',
   );
+  // AC1 divergence ruling — the classifier, in BOTH directions
+  const volWitness = {
+    symbol: 'MU', newestMs: Date.parse('2026-10-02T18:40:00Z'), atIndex: 1,
+    field: 'volume', heldValue: 40317, incomingValue: 40336, heldLength: 80, incomingLength: 80,
+  };
+  check('AC1 clean zero stays PASS',
+    classifyDivergence({ divergentSameInstant: 0, divergentWitness: [] }).verdict === 'PASS');
+  check('AC1 rules a fully-witnessed volume-only same-length divergence BENIGN (PASS)',
+    classifyDivergence({ divergentSameInstant: 1, divergentWitness: [volWitness] }).verdict === 'PASS');
+  check('AC1 FAILs a price-field witness',
+    classifyDivergence({ divergentSameInstant: 1, divergentWitness: [{ ...volWitness, field: 'close' }] }).verdict === 'FAIL');
+  check('AC1 FAILs a shape-changing volume witness',
+    classifyDivergence({ divergentSameInstant: 1, divergentWitness: [{ ...volWitness, incomingLength: 81 }] }).verdict === 'FAIL');
+  check('AC1 REFUSES to rule an unwitnessed divergence (count 2, 1 witness)',
+    classifyDivergence({ divergentSameInstant: 2, divergentWitness: [volWitness] }).verdict === 'FAIL');
+
+  // AC3 ratio arm — "full" is SATURATION, because spanH>=24 was unsatisfiable:
+  // the ring's maximum span is (capacity−1)×interval = 287×300s = 23.92h.
+  const mkTape = (n, startMs, stepMs) => Array.from({ length: n }, (_, i) => ({ atMs: startMs + i * stepMs }));
+  // The live regression shape: a saturated 288x300s ring ending Mon 13:10Z —
+  // spans Sun 13:15Z -> Mon 13:10Z, Monday premarket (11:00–13:10Z) inside it.
+  const monTape = mkTape(288, Date.parse('2026-10-04T13:15:00Z'), 300_000);
+  check('AC3 ratio arm MEASURABLE on a saturated ring containing a weekday premarket slot (spanH>=24 regression)',
+    ratioArmMeasurable(monTape, 288).measurable === true);
+  check('that saturated ring really spans under 24h — what made the old conjunct unsatisfiable',
+    ratioArmMeasurable(monTape, 288).spanH < 24);
+  // Today's live shape: Fri 17:30Z -> Sat 17:25Z — saturated, but the only
+  // premarket hours inside it are Saturday's, which do not count.
+  const satTape = mkTape(288, Date.parse('2026-10-02T17:30:00Z'), 300_000);
+  check('AC3 ratio arm NOT measurable on a saturated ring without a weekday premarket slot',
+    ratioArmMeasurable(satTape, 288).measurable === false);
+  check('AC3 ratio arm NOT measurable on an UNSATURATED ring even with premarket covered',
+    ratioArmMeasurable(mkTape(100, Date.parse('2026-10-05T11:00:00Z'), 300_000), 288).measurable === false);
+  check('AC3 ratio arm NOT measurable when the census did not publish a capacity',
+    ratioArmMeasurable(monTape, null).measurable === false);
+
   // The read must ASK for the pricing pass, or AC4 is BLIND by construction.
   check(
     'the live census URL the fetch uses requests BOTH the deep and the sizing pass',
@@ -646,8 +749,8 @@ async function main() {
     console.log('  the shared store is written by refreshCandles, which needs a cold-bar scan — i.e. an RTH session');
     bump(3);
   } else {
-    const ok = share.divergentSameInstant === 0;
-    console.log(`\n[AC1 soundness] ${ok ? 'PASS' : 'FAIL'} — divergentSameInstant ${share.divergentSameInstant} over ${share.rewrites} rewrites of ${share.writes} writes`);
+    const ruling = classifyDivergence(share);
+    console.log(`\n[AC1 soundness] ${ruling.verdict} — divergentSameInstant ${share.divergentSameInstant} over ${share.rewrites} rewrites of ${share.writes} writes`);
     console.log(`  symbols(|union|) ${share.symbols} · equalByValue ${share.equalByValue} · newerSeries ${share.newerSeries} · olderSeries ${share.olderSeries} · sameReference ${share.sameReference}`);
     if (share.olderSeries > 0) {
       console.log(`  ⚠️  olderSeries ${share.olderSeries} — the backwards-write hazard IS real. This is the measured case for a monotone guard; it is not itself a failure (last-writer-wins is pre-existing semantics).`);
@@ -655,7 +758,8 @@ async function main() {
     for (const w of share.divergentWitness ?? []) {
       console.log(`  WITNESS ${w.symbol} @${new Date(w.newestMs).toISOString()} idx ${w.atIndex} ${w.field}: held ${w.heldValue} vs incoming ${w.incomingValue} (len ${w.heldLength}/${w.incomingLength})`);
     }
-    bump(ok ? 0 : 1);
+    if (ruling.note) console.log(`  ${ruling.note}`);
+    bump(ruling.verdict === 'PASS' ? 0 : 1);
   }
 
   // ── AC3 ────────────────────────────────────────────────────────────────────
@@ -667,30 +771,25 @@ async function main() {
     console.log(`  bound: ${JSON.stringify(dynRow.note.bound)} · boundedBy: ${dynRow.note.boundedBy ?? '(none)'}`);
   }
   if (dynTrend) {
-    // A premarket slot is ~11:00–13:30Z on a weekday. Without one in the ring,
-    // ratio 1.00 is vacuous — the growth this row shows lands overnight.
-    const coversPremarket = tape.some((s) => {
-      const d = new Date(s.atMs);
-      const dow = d.getUTCDay();
-      const min = d.getUTCHours() * 60 + d.getUTCMinutes();
-      return dow >= 1 && dow <= 5 && min >= 11 * 60 && min < RTH_OPEN_MIN;
-    });
-    const spanH = tape.length >= 2 ? (tape[tape.length - 1].atMs - tape[0].atMs) / 3.6e6 : 0;
-    console.log(`  ring ratio ${fmt(dynTrend.ratio)} (delta ${dynTrend.delta}, ${dynTrend.first} -> ${dynTrend.last})`);
-    console.log(`  ring span ${spanH.toFixed(2)}h · covers a premarket slot: ${coversPremarket}`);
     // AC3 has TWO arms and they must be graded apart. The disposition arm is
     // satisfied by a published reason (above). The ratio arm is only measurable
-    // over a FULL ring that contains the slot the growth lands in — the measured
-    // +433 arrived entirely inside the overnight premarket window. A 2.8h ring
-    // on a fresh boot shows ratio 1.00 because nothing has had a chance to be
-    // added, which is the quiet-day false green this clause exists to refuse.
-    if (!coversPremarket || spanH < 24) {
-      console.log(`  ⚠️  ratio arm UNMEASURED: AC3 asks for ratio -> 1.00 over a FULL 24h ring containing a premarket`);
-      console.log(`      slot; this ring is ${spanH.toFixed(2)}h with premarket=${coversPremarket}. The disposition arm PASSES;`);
-      console.log('      the ratio arm is BLIND, not green.');
+    // over the FULL ring with the slot the growth lands in — the measured +433
+    // arrived entirely inside the overnight premarket window. A 2.8h ring on a
+    // fresh boot shows ratio 1.00 because nothing has had a chance to be added,
+    // which is the quiet-day false green this clause exists to refuse.
+    // "Full" = SATURATED (samples >= capacity) — see ratioArmMeasurable for why
+    // the original spanH>=24 conjunct was unsatisfiable by the ring's own
+    // construction (288 slots x 300s tops out at 23.92h).
+    const arm = ratioArmMeasurable(tape, census.capacity);
+    console.log(`  ring ratio ${fmt(dynTrend.ratio)} (delta ${dynTrend.delta}, ${dynTrend.first} -> ${dynTrend.last})`);
+    console.log(`  ring span ${arm.spanH.toFixed(2)}h · saturated ${arm.ringFull} (${tape.length}/${fmt(census.capacity)}) · covers a premarket slot: ${arm.coversPremarket}`);
+    if (!arm.measurable) {
+      console.log('  ⚠️  ratio arm UNMEASURED: AC3 asks for the ratio over the FULL (saturated) ring containing a');
+      console.log(`      weekday premarket slot; this ring is saturated=${arm.ringFull}, premarket=${arm.coversPremarket}.`);
+      console.log('      The disposition arm PASSES; the ratio arm is BLIND, not green.');
       bump(3);
     } else {
-      console.log('  ratio arm MEASURED over a full ring with a premarket slot in it.');
+      console.log('  ratio arm MEASURED over the full ring with a premarket slot in it.');
     }
   } else {
     console.log('  ⚠️  no ring trend row for dynamicSymbols — ratio arm BLIND');
