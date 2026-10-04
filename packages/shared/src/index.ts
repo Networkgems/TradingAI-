@@ -2886,6 +2886,27 @@ export interface OptionProfitLockFire {
  * as "no volatility" rather than "not measured", and the two license opposite
  * conclusions about the same close.
  */
+/**
+ * TRA-5101 (TRA-4991 residual) — the ratchet inputs at the tick the persisted
+ * `chandelierStop` was last SET. `peakUnderlying ∓ atrMult × atr` (− for a
+ * `buy`-side trail, + for `sell`) reproduces the stop to full precision by
+ * construction: the stamp is written only when the ratchet ACCEPTS that exact
+ * candidate. Carried on the open row beside the stop and published on the fire
+ * block when the firing tick's own inputs no longer recompose the level.
+ */
+export interface OptionChandelierStopBasis {
+  /** ms epoch of the tick the stop last moved. */
+  at: number;
+  /** The favorable extreme the accepted candidate was computed from. */
+  peakUnderlying: number;
+  /** The ATR consumed on that tick. */
+  atr: number;
+  /** ATR/price on that tick, `null` when none was served. */
+  atrPct: number | null;
+  /** The multiplier the ratchet resolved on that tick (base or high-beta). */
+  atrMult: number;
+}
+
 export interface OptionChandelierFire {
   /** ms epoch of the tick the trail chose to exit. */
   at: number;
@@ -2951,6 +2972,34 @@ export interface OptionChandelierFire {
    * re-anchor). Absent ⇔ an ordinary trail whose anchor was a real entry spot.
    */
   trailNote?: 'spot_seeded' | 'restarted_stale_breach';
+  /**
+   * TRA-5101 (TRA-4991 residual) — whether `peakUnderlying ∓ atrMult × atr`
+   * (− for `side: 'buy'`, + for `'sell'`) reproduces `chandelierStop` EXACTLY
+   * from the fields above. `false` is not corruption: the stop is a monotone
+   * ratchet, so when ATR rose (or the multiplier flipped) after the tick that
+   * last set the level, the ratchet holds the prior stop while this block
+   * publishes the firing tick's inputs — NU 2026-10-03 missed by 0.013% that
+   * way while XLF reconstructed to full precision. Absent ⇔ the row closed
+   * before TRA-5101 shipped. ⛔ Never backfilled.
+   */
+  stopReconstructs?: boolean;
+  /**
+   * TRA-5101 — present iff `stopReconstructs === false`; names WHY the firing
+   * tick's inputs cannot recompose the stop. `ratchet_held_prior_level` ⇒ the
+   * level predates the firing tick's (peak, atr, mult); `stopBasis` beside it
+   * carries the inputs that DO reconstruct it. `stop_predates_basis_stamp` ⇒
+   * the stop was persisted by a pre-TRA-5101 build and never advanced after,
+   * so the setting tick's inputs were never captured — ⛔ they are not
+   * reconstructed after the fact.
+   */
+  stopNonReconstructionReason?: 'ratchet_held_prior_level' | 'stop_predates_basis_stamp';
+  /**
+   * TRA-5101 — the ratchet inputs at the tick the stop was last SET, published
+   * only when the firing tick's inputs no longer recompose the level
+   * (`stopNonReconstructionReason: 'ratchet_held_prior_level'`). These
+   * reconstruct `chandelierStop` to full precision by construction.
+   */
+  stopBasis?: OptionChandelierStopBasis;
 }
 
 /**
@@ -4913,6 +4962,18 @@ export interface OptionPosition {
    * Absent ↔ chandelier not yet armed / rules-off snapshot.
    */
   chandelierStop?: number;
+  /**
+   * TRA-5101 (TRA-4991 residual) — the ratchet inputs at the tick that last SET
+   * `chandelierStop`, i.e. the tick the ratchet accepted its raw candidate
+   * instead of holding `prevTrailStop`. The stop is a monotone ratchet, so the
+   * level can be CARRIED from an earlier tick whose ATR/multiplier differ from
+   * the firing tick's — these are the inputs that reconstruct it exactly when
+   * the firing tick's cannot (NU 2026-10-03: held stop 13.199253 vs final-tick
+   * candidate 13.200928). Stamped/refreshed only when the stop moves; deleted
+   * whenever `chandelierStop` is. Absent beside a present `chandelierStop` ⇔
+   * the stop was persisted by a pre-TRA-5101 build and has not advanced since.
+   */
+  chandelierStopBasis?: OptionChandelierStopBasis;
   /**
    * TRA-3217 — true while the chandelier stop is breached on ticks where the
    * exit decision is structurally unable (TRA-483 PDT hold, TRA-495/1136 swing

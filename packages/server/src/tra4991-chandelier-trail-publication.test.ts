@@ -213,6 +213,13 @@ describe('TRA-4991 AC1 — the chandelier publishes its SPOT-space trigger input
     // fields alone — no constant, no source read. This is the derivation
     // TRA-4945 had to do with `git show`.
     expect(fire.peakUnderlying - fire.atrMult * fire.atr).toBeCloseTo(fire.chandelierStop, 6);
+    // TRA-5101 — and the row SAYS it reconciles, to FULL precision (strict
+    // equality, not a tolerance): the stop last moved on this very tick's
+    // inputs, so recomposing them is bit-identical arithmetic.
+    expect(fire.peakUnderlying - fire.atrMult * fire.atr).toBe(fire.chandelierStop);
+    expect(fire.stopReconstructs).toBe(true);
+    expect(fire.stopNonReconstructionReason).toBeUndefined();
+    expect(fire.stopBasis).toBeUndefined();
     expect(fire.spotAtFire).toBeLessThanOrEqual(fire.chandelierStop);
     // …and the excursion that PREMIUM space reported as zero is visible here:
     // the underlying ran 200 → 210 and gave back 13.
@@ -303,6 +310,126 @@ describe('TRA-4991 AC1 — the chandelier publishes its SPOT-space trigger input
     // conclusions about the same close.
     expect('chandelier' in row).toBe(false);
     expect(row.chandelier).toBeUndefined();
+  });
+});
+
+// ── TRA-5101 — the published inputs reconstruct the stop, or the row says why ─
+//
+// The stop is a MONOTONE ratchet (`chandelierStop` clamps against
+// `prevTrailStop`), so the level can be CARRIED from an earlier tick whose
+// ATR/multiplier differ from the firing tick's. Measured 2026-10-04 off live
+// b2dca7c1: NU's close row published chandelierStop 13.199253350520513 whose
+// implied extreme missed the published peakUnderlying 13.0601 by 0.013%, while
+// XLF reconstructed to full precision — the difference being only WHEN each
+// stop last advanced. The block must either recompose its own stop exactly or
+// name the reason it cannot.
+
+describe('TRA-5101 — a ratchet-held stop names itself and ships the basis that reconstructs it', () => {
+  it('ATR grew after the level last advanced ⇒ `stopReconstructs: false`, reason named, basis exact', async () => {
+    const { acct, sym, id } = openOtmCall();
+    const opts = { otmSleeveExitRule: 'chandelier' } as const;
+
+    // Session 1: ATR 4 under the 210 high ⇒ the ratchet ACCEPTS 198. That tick
+    // is the stop's basis.
+    vi.setSystemTime(SESSION_1);
+    expect(
+      acct.checkExits(new Map([['AAPL', 210]]), new Map([[sym, 1.4]]), 'demo', opts, undefined, risk()),
+    ).toHaveLength(0);
+    const open = acct.getState().openOptions[0]!;
+    expect(open.chandelierStop).toBe(210 - EXIT_CHANDELIER_ATR_MULT * UATR);
+    expect(open.chandelierStopBasis).toEqual({
+      at: SESSION_1, peakUnderlying: 210, atr: UATR, atrPct: null, atrMult: EXIT_CHANDELIER_ATR_MULT,
+    });
+
+    // Session 2: the NU shape — ATR rises to 5, so this tick's candidate is
+    // 210 − 15 = 195 and the ratchet HOLDS 198 (a rising ATR must never loosen
+    // the stop). Spot 197 is through the held level ⇒ fire. The firing tick's
+    // published inputs now CANNOT recompose the stop.
+    const widerAtr = 5;
+    vi.setSystemTime(SESSION_2_OPEN);
+    const closed = acct.checkExits(
+      new Map([['AAPL', 197]]), new Map([[sym, 1.36]]), 'demo', opts, undefined,
+      risk({ underlyingAtrBySymbol: new Map([['AAPL', widerAtr]]) }),
+    );
+    expect(closed).toHaveLength(1);
+    expect(closed[0]!.exitReason).toBe('chandelier');
+
+    const fire = closed[0]!.chandelierFire!;
+    // The firing tick's own inputs, verbatim — truthful, just not the ones the
+    // level came from.
+    expect(fire.atr).toBe(widerAtr);
+    expect(fire.peakUnderlying).toBe(210);
+    expect(fire.chandelierStop).toBe(BASE_STOP); // 198, held
+    expect(fire.peakUnderlying - fire.atrMult * fire.atr).not.toBe(fire.chandelierStop); // 195 ≠ 198
+    // ⭐ THE POINT: the row SAYS so, names why, and ships the inputs that DO
+    // reconstruct the level — to full precision, strict equality.
+    expect(fire.stopReconstructs).toBe(false);
+    expect(fire.stopNonReconstructionReason).toBe('ratchet_held_prior_level');
+    expect(fire.stopBasis).toEqual({
+      at: SESSION_1, peakUnderlying: 210, atr: UATR, atrPct: null, atrMult: EXIT_CHANDELIER_ATR_MULT,
+    });
+    expect(fire.stopBasis!.peakUnderlying - fire.stopBasis!.atrMult * fire.stopBasis!.atr)
+      .toBe(fire.chandelierStop);
+
+    // AC5 posture — the verdict is observe-only: same label, same premium.
+    expect(closed[0]!.currentPremium).toBeCloseTo(1.36, 6);
+
+    // …and the journal close row carries the verdict, the reason and the basis
+    // verbatim (`toEqual` so a field that never reaches the journal goes red).
+    await acct.flushOptionTradeJournal();
+    const rows = await listOptionTradeJournal();
+    expect(rows.find((r) => r.id === id)!.chandelier).toEqual(fire);
+  });
+
+  it('a stop PERSISTED by a pre-TRA-5101 build has no captured basis: the reason says so, ⛔ nothing is fabricated', async () => {
+    // A row that last ratcheted on an older build: level present, basis never
+    // captured. The ratchet must not invent one after the fact.
+    const { acct, sym, id } = openOtmCall();
+    const open = acct.getState().openOptions[0]!;
+    open.peakUnderlying = 210;
+    open.chandelierStop = BASE_STOP; // 198, from inputs this build never saw
+    expect(open.chandelierStopBasis).toBeUndefined();
+    const opts = { otmSleeveExitRule: 'chandelier' } as const;
+
+    // First tick on THIS build serves the wider ATR, so the ratchet HOLDS the
+    // inherited level (candidate 195 < 198) — no basis is ever stamped — and
+    // spot 197 fires through it on the same pass.
+    vi.setSystemTime(SESSION_2_OPEN);
+    const closed = acct.checkExits(
+      new Map([['AAPL', 197]]), new Map([[sym, 1.36]]), 'demo', opts, undefined,
+      risk({ underlyingAtrBySymbol: new Map([['AAPL', 5]]) }),
+    );
+    expect(closed).toHaveLength(1);
+
+    const fire = closed[0]!.chandelierFire!;
+    expect(fire.chandelierStop).toBe(BASE_STOP);
+    expect(fire.stopReconstructs).toBe(false);
+    expect(fire.stopNonReconstructionReason).toBe('stop_predates_basis_stamp');
+    // ⛔ ABSENT, never reconstructed: the setting tick's inputs were never
+    // captured, and a backfilled basis is a fabricated column.
+    expect('stopBasis' in fire).toBe(false);
+
+    await acct.flushOptionTradeJournal();
+    const rows = await listOptionTradeJournal();
+    expect(rows.find((r) => r.id === id)!.chandelier).toEqual(fire);
+  });
+
+  it('the basis FOLLOWS the stop: a later advance restamps it, and the fire off that tick reconstructs', () => {
+    const { acct, sym } = openOtmCall();
+    const opts = { otmSleeveExitRule: 'chandelier' } as const;
+
+    vi.setSystemTime(SESSION_1);
+    acct.checkExits(new Map([['AAPL', 210]]), new Map([[sym, 1.4]]), 'demo', opts, undefined, risk());
+    // The high advances to 214 on the same ATR ⇒ the ratchet accepts 202 and
+    // the basis moves WITH the level — it is the setting tick's record, not
+    // the first tick's.
+    vi.setSystemTime(SESSION_2_OPEN);
+    acct.checkExits(new Map([['AAPL', 214]]), new Map([[sym, 1.42]]), 'demo', opts, undefined, risk());
+    const open = acct.getState().openOptions[0]!;
+    expect(open.chandelierStop).toBe(214 - EXIT_CHANDELIER_ATR_MULT * UATR);
+    expect(open.chandelierStopBasis).toEqual({
+      at: SESSION_2_OPEN, peakUnderlying: 214, atr: UATR, atrPct: null, atrMult: EXIT_CHANDELIER_ATR_MULT,
+    });
   });
 });
 

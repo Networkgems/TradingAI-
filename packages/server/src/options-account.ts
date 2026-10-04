@@ -11834,6 +11834,7 @@ export class PaperOptionsAccount {
         // `chandelier_daily_close_hold` against a rule that no longer exists,
         // for as long as the row stays open.
         delete opt.chandelierStop;
+        delete opt.chandelierStopBasis;
         delete opt.chandelierTrailNote;
         delete opt.chandelierBreachedWhileSuppressed;
         delete opt.chandelierHeldForDailyClose;
@@ -11883,6 +11884,7 @@ export class PaperOptionsAccount {
               opt.chandelierTrailNote = 'spot_seeded';
             }
             delete opt.chandelierStop;
+            delete opt.chandelierStopBasis;
           }
           // TRA-4020 (R2) — stamp `peakUnderlyingAt` only when the extreme
           // actually moves (a seed from the entry anchor or from spot is not a
@@ -11912,6 +11914,27 @@ export class PaperOptionsAccount {
           // ticket is answering (a flag reads the same whether its branch is
           // live or dead; so does a mis-derived counter).
           const uatrMult = chandelierMultiplier(uatrPct);
+          // TRA-5101 (TRA-4991 residual) — stamp the inputs that SET the stop,
+          // at the tick they set it. The ratchet accepted this tick's raw
+          // candidate exactly when the returned level EQUALS it (bit-identical
+          // arithmetic: `chandelierStop` computes `extreme ∓ mult×atr` from
+          // these same operands); a held `prevTrailStop` keeps the prior
+          // basis, which is the whole point — the fire can then publish the
+          // inputs the level actually came from instead of leaving the reader
+          // a 0.013% gap with no column saying why (NU, 2026-10-03).
+          // ⛔ Observe-only — no exit predicate reads this.
+          const uatrRaw = chandelierUSide === 'buy'
+            ? opt.peakUnderlying - uatrMult * uatr
+            : opt.peakUnderlying + uatrMult * uatr;
+          if (opt.chandelierStop === uatrRaw) {
+            opt.chandelierStopBasis = {
+              at: Date.now(),
+              peakUnderlying: opt.peakUnderlying,
+              atr: uatr,
+              atrPct: uatrPct !== undefined && Number.isFinite(uatrPct) ? uatrPct : null,
+              atrMult: uatrMult,
+            };
+          }
           const atrSource = exitRisk.underlyingAtrSourceBySymbol?.get(opt.symbol);
           chandelierRatchetInputs = {
             atr: uatr,
@@ -11966,13 +11989,24 @@ export class PaperOptionsAccount {
               });
               opt.peakUnderlying = chandelierUnderlying;
               delete opt.chandelierStop;
+              const restartAtrPct = exitRisk.underlyingAtrPctBySymbol?.get(opt.symbol);
               opt.chandelierStop = chandelierStop({
                 side: chandelierUSide,
                 initialStop: chandelierUSide === 'buy' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY,
                 extremeSinceEntry: chandelierUnderlying,
                 atr: uatr,
-                atrPct: exitRisk.underlyingAtrPctBySymbol?.get(opt.symbol),
+                atrPct: restartAtrPct,
               });
+              // TRA-5101 — a restart has no `prevTrailStop` to hold, so the
+              // re-anchored level IS this tick's raw candidate; its basis is
+              // this tick's inputs by construction.
+              opt.chandelierStopBasis = {
+                at: Date.now(),
+                peakUnderlying: chandelierUnderlying,
+                atr: uatr,
+                atrPct: restartAtrPct !== undefined && Number.isFinite(restartAtrPct) ? restartAtrPct : null,
+                atrMult: chandelierMultiplier(restartAtrPct),
+              };
               opt.chandelierTrailNote = 'restarted_stale_breach';
               this.chandelierStaleBreachVetoes += 1;
             }
@@ -12845,6 +12879,22 @@ export class PaperOptionsAccount {
             && opt.chandelierStop !== undefined
             && opt.peakUnderlying !== undefined
           ) {
+            // TRA-5101 (TRA-4991 residual) — does the block about to be
+            // published recompose its own stop? The stop is a monotone
+            // ratchet, so a width that grew after the level last advanced
+            // leaves the firing tick's (peak, atr, mult) unable to reproduce
+            // it (NU 2026-10-03, off by 0.013%). EXACT equality on purpose:
+            // when the ratchet accepted the firing tick's candidate this is
+            // the same arithmetic on the same operands, bit-identical — and a
+            // tolerance would re-open the exact "close enough, no column says
+            // why" gap this field exists to close. When it cannot recompose,
+            // the row names the reason and, where the basis stamp exists,
+            // publishes the inputs that DO reconstruct it. ⛔ Observe-only.
+            const chandelierStopReconstructs = opt.chandelierStop === (
+              chandelierUSide === 'buy'
+                ? opt.peakUnderlying - chandelierRatchetInputs.atrMult * chandelierRatchetInputs.atr
+                : opt.peakUnderlying + chandelierRatchetInputs.atrMult * chandelierRatchetInputs.atr
+            );
             opt.chandelierFire = {
               at: Date.now(),
               exitReason: exitJournalReason,
@@ -12867,6 +12917,19 @@ export class PaperOptionsAccount {
               ...(opt.chandelierTrailNote !== undefined
                 ? { trailNote: opt.chandelierTrailNote }
                 : {}),
+              stopReconstructs: chandelierStopReconstructs,
+              // A `false` carries its reason: the level predates the firing
+              // tick's inputs (basis published beside it), or the stop was
+              // persisted by a pre-TRA-5101 build whose setting tick was never
+              // captured — ⛔ a basis is never reconstructed after the fact.
+              ...(chandelierStopReconstructs
+                ? {}
+                : opt.chandelierStopBasis !== undefined
+                  ? {
+                      stopNonReconstructionReason: 'ratchet_held_prior_level' as const,
+                      stopBasis: { ...opt.chandelierStopBasis },
+                    }
+                  : { stopNonReconstructionReason: 'stop_predates_basis_stamp' as const }),
             };
           }
         } else if (exitPremium === null) {
