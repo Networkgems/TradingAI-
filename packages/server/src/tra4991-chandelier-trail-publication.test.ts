@@ -433,6 +433,122 @@ describe('TRA-5101 — a ratchet-held stop names itself and ships the basis that
   });
 });
 
+// ── TRA-5102 — the OPEN row carries the verdict, not just the fire ──────────
+//
+// TRA-5101 made the CLOSE row name a non-reconstructing stop; the NU reader was
+// auditing an OPEN row (live b2dca7c1, 2026-10-04: stop 13.199253 implies
+// extreme 13.058425 against a published peakUnderlying of 13.0601 — 0.013%,
+// nothing on the row saying why). The open-row contract: either the row's live
+// fields recompose the stop exactly, or `chandelierStopNonReconstructionReason`
+// is present — with the basis beside it reconstructing to full precision when
+// one was ever captured.
+
+describe('TRA-5102 — an open row either reconstructs its stop or says why it cannot', () => {
+  const SESSION_2_LATER = Date.parse('2024-06-05T15:00:00Z');
+
+  it('a held ratchet stamps `ratchet_held_prior_level` on the OPEN row; the basis beside it is exact', () => {
+    const { acct, sym } = openOtmCall();
+    const opts = { otmSleeveExitRule: 'chandelier' } as const;
+
+    // Session 1: ATR 4 under the 210 high ⇒ ACCEPTED. The open row recomposes
+    // from its own live fields, so there is NO verdict column to read.
+    vi.setSystemTime(SESSION_1);
+    acct.checkExits(new Map([['AAPL', 210]]), new Map([[sym, 1.4]]), 'demo', opts, undefined, risk());
+    let open = acct.getState().openOptions[0]!;
+    expect(open.chandelierStop).toBe(BASE_STOP);
+    expect(open.chandelierStopNonReconstructionReason).toBeUndefined();
+
+    // Session 2: ATR widens to 5 with the peak unmoved ⇒ candidate 195, the
+    // ratchet HOLDS 198, and spot 205 stays clear of the level — the row stays
+    // OPEN. This is the NU shape at the instant the auditor actually read it.
+    vi.setSystemTime(SESSION_2_OPEN);
+    expect(
+      acct.checkExits(
+        new Map([['AAPL', 205]]), new Map([[sym, 1.42]]), 'demo', opts, undefined,
+        risk({ underlyingAtrBySymbol: new Map([['AAPL', 5]]) }),
+      ),
+    ).toHaveLength(0);
+    open = acct.getState().openOptions[0]!;
+    expect(open.chandelierStop).toBe(BASE_STOP); // held
+    // The live fields really do miss — the column is load-bearing, not decor.
+    expect(open.peakUnderlying! - EXIT_CHANDELIER_ATR_MULT * 5).not.toBe(open.chandelierStop);
+    expect(open.chandelierStopNonReconstructionReason).toBe('ratchet_held_prior_level');
+    // The basis is the SESSION_1 stamp, untouched by the hold, and it closes
+    // the gap to full precision — strict equality, no tolerance.
+    expect(open.chandelierStopBasis).toEqual({
+      at: SESSION_1, peakUnderlying: 210, atr: UATR, atrPct: null, atrMult: EXIT_CHANDELIER_ATR_MULT,
+    });
+    expect(
+      open.chandelierStopBasis!.peakUnderlying
+      - open.chandelierStopBasis!.atrMult * open.chandelierStopBasis!.atr,
+    ).toBe(open.chandelierStop);
+
+    // Later the same session: ATR back to 4 and the high advances to 214 ⇒ the
+    // ratchet ACCEPTS 202. The verdict is CONSUMED with the accept — the column
+    // never outlives the condition it names — and the basis moves to this tick.
+    vi.setSystemTime(SESSION_2_LATER);
+    expect(
+      acct.checkExits(new Map([['AAPL', 214]]), new Map([[sym, 1.42]]), 'demo', opts, undefined, risk()),
+    ).toHaveLength(0);
+    open = acct.getState().openOptions[0]!;
+    expect(open.chandelierStop).toBe(214 - EXIT_CHANDELIER_ATR_MULT * UATR);
+    expect(open.chandelierStopNonReconstructionReason).toBeUndefined();
+    expect(open.chandelierStopBasis).toEqual({
+      at: SESSION_2_LATER, peakUnderlying: 214, atr: UATR, atrPct: null, atrMult: EXIT_CHANDELIER_ATR_MULT,
+    });
+  });
+
+  it('a stop persisted by a pre-TRA-5101 build says `stop_predates_basis_stamp` WHILE OPEN — ⛔ no basis fabricated', () => {
+    // Level present, basis never captured: the first HOLD on this build must
+    // name the inheritance on the open row instead of leaving the miss silent.
+    const { acct, sym } = openOtmCall();
+    const seeded = acct.getState().openOptions[0]!;
+    seeded.peakUnderlying = 210;
+    seeded.chandelierStop = BASE_STOP; // from inputs this build never saw
+    expect(seeded.chandelierStopBasis).toBeUndefined();
+    const opts = { otmSleeveExitRule: 'chandelier' } as const;
+
+    vi.setSystemTime(SESSION_2_OPEN);
+    expect(
+      acct.checkExits(
+        new Map([['AAPL', 205]]), new Map([[sym, 1.42]]), 'demo', opts, undefined,
+        risk({ underlyingAtrBySymbol: new Map([['AAPL', 5]]) }),
+      ),
+    ).toHaveLength(0);
+    const open = acct.getState().openOptions[0]!;
+    expect(open.chandelierStop).toBe(BASE_STOP);
+    expect(open.chandelierStopNonReconstructionReason).toBe('stop_predates_basis_stamp');
+    // ⛔ ABSENT, never reconstructed after the fact.
+    expect('chandelierStopBasis' in open).toBe(false);
+  });
+
+  it('retirement deletes the verdict with the stop — no orphaned reason on a trail that no longer exists', () => {
+    const { acct, sym } = openOtmCall();
+
+    // Build the held state under the legacy rule…
+    vi.setSystemTime(SESSION_1);
+    acct.checkExits(new Map([['AAPL', 210]]), new Map([[sym, 1.4]]), 'demo',
+      { otmSleeveExitRule: 'chandelier' }, undefined, risk());
+    vi.setSystemTime(SESSION_2_OPEN);
+    acct.checkExits(
+      new Map([['AAPL', 205]]), new Map([[sym, 1.42]]), 'demo',
+      { otmSleeveExitRule: 'chandelier' }, undefined,
+      risk({ underlyingAtrBySymbol: new Map([['AAPL', 5]]) }),
+    );
+    expect(acct.getState().openOptions[0]!.chandelierStopNonReconstructionReason)
+      .toBe('ratchet_held_prior_level');
+
+    // …then the TRA-3941 ruling retires the sleeve's chandelier: the verdict
+    // goes with the level it was a verdict ABOUT.
+    vi.setSystemTime(SESSION_2_LATER);
+    acct.checkExits(new Map([['AAPL', 205]]), new Map([[sym, 1.42]]), 'demo',
+      { otmSleeveExitRule: 'trail' }, undefined, risk());
+    const open = acct.getState().openOptions[0]!;
+    expect(open.chandelierStop).toBeUndefined();
+    expect('chandelierStopNonReconstructionReason' in open).toBe(false);
+  });
+});
+
 // ── AC5 — read-only ─────────────────────────────────────────────────────────
 
 describe('TRA-4991 AC5 — no exit behaviour moved', () => {

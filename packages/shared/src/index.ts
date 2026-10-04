@@ -4975,6 +4975,23 @@ export interface OptionPosition {
    */
   chandelierStopBasis?: OptionChandelierStopBasis;
   /**
+   * TRA-5102 (TRA-5101 residual) — the OPEN row's reconstruction verdict,
+   * re-derived in the same pass that writes `chandelierStop`. Present ⇔ the
+   * last maintenance tick's raw candidate was NOT the persisted level, i.e.
+   * `peakUnderlying ∓ atrMult × atr` off this row's live fields will not
+   * recompose `chandelierStop`, and the auditor needs a column saying why
+   * instead of inferring it from a 0.013% miss (NU 2026-10-04: stop implies
+   * extreme 13.058425 vs published peak 13.0601, nothing on the row said so).
+   * `ratchet_held_prior_level` ⇒ `chandelierStopBasis` beside it reconstructs
+   * the level to full precision; `stop_predates_basis_stamp` ⇒ the stop was
+   * persisted by a pre-TRA-5101 build and the setting tick's inputs were never
+   * captured — ⛔ never fabricated after the fact. Deleted whenever the
+   * ratchet ACCEPTS a tick (the row then reconstructs from its own live
+   * fields) and whenever `chandelierStop` is deleted. ⛔ Observe-only — no
+   * exit predicate reads it.
+   */
+  chandelierStopNonReconstructionReason?: 'ratchet_held_prior_level' | 'stop_predates_basis_stamp';
+  /**
    * TRA-3217 — true while the chandelier stop is breached on ticks where the
    * exit decision is structurally unable (TRA-483 PDT hold, TRA-495/1136 swing
    * hold) or deliberately unwilling (live opening-range window) to act. The

@@ -11835,6 +11835,7 @@ export class PaperOptionsAccount {
         // for as long as the row stays open.
         delete opt.chandelierStop;
         delete opt.chandelierStopBasis;
+        delete opt.chandelierStopNonReconstructionReason;
         delete opt.chandelierTrailNote;
         delete opt.chandelierBreachedWhileSuppressed;
         delete opt.chandelierHeldForDailyClose;
@@ -11885,6 +11886,7 @@ export class PaperOptionsAccount {
             }
             delete opt.chandelierStop;
             delete opt.chandelierStopBasis;
+            delete opt.chandelierStopNonReconstructionReason;
           }
           // TRA-4020 (R2) — stamp `peakUnderlyingAt` only when the extreme
           // actually moves (a seed from the entry anchor or from spot is not a
@@ -11934,6 +11936,24 @@ export class PaperOptionsAccount {
               atrPct: uatrPct !== undefined && Number.isFinite(uatrPct) ? uatrPct : null,
               atrMult: uatrMult,
             };
+            // TRA-5102 — the row's live fields recompose the level again, so
+            // the standing verdict (if any) is consumed, not left to rot.
+            delete opt.chandelierStopNonReconstructionReason;
+          } else {
+            // TRA-5102 (TRA-5101 residual, split from TRA-5100) — the ratchet
+            // HELD, so this row's live (peak, atr, mult) no longer recompose
+            // its own persisted stop. Say so ON THE OPEN ROW, in the same
+            // breath as the stop write: the fire block (`:12916`) only speaks
+            // at the close, and the NU reader was auditing an OPEN row when
+            // the 0.013% gap appeared with no column saying why. With a basis
+            // stamp the reason points at the inputs that DO reconstruct it;
+            // without one (stop persisted by a pre-TRA-5101 build) the reason
+            // says exactly that — ⛔ a basis is never fabricated after the
+            // fact. ⛔ Observe-only — no exit predicate reads this.
+            opt.chandelierStopNonReconstructionReason =
+              opt.chandelierStopBasis !== undefined
+                ? 'ratchet_held_prior_level'
+                : 'stop_predates_basis_stamp';
           }
           const atrSource = exitRisk.underlyingAtrSourceBySymbol?.get(opt.symbol);
           chandelierRatchetInputs = {
@@ -12007,6 +12027,9 @@ export class PaperOptionsAccount {
                 atrPct: restartAtrPct !== undefined && Number.isFinite(restartAtrPct) ? restartAtrPct : null,
                 atrMult: chandelierMultiplier(restartAtrPct),
               };
+              // TRA-5102 — a re-anchored level IS this tick's candidate, so
+              // the row reconstructs again; drop any standing verdict.
+              delete opt.chandelierStopNonReconstructionReason;
               opt.chandelierTrailNote = 'restarted_stale_breach';
               this.chandelierStaleBreachVetoes += 1;
             }
