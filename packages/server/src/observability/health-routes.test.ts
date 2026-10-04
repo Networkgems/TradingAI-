@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rm } from 'node:fs/promises';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync } from 'node:fs';
 import {
   makeHypothesis,
   runHypothesis,
@@ -29,6 +29,7 @@ import {
   rollUpExitCadence,
   RTH_DECOUPLED_SHARE_FLOOR,
   durabilityNote, // TRA-3011
+  MIRROR_SEAM_GATES, // TRA-5042
   type HealthUserContext,
   type ExitCadenceRollup,
 } from './health-routes.js';
@@ -6135,6 +6136,80 @@ describe('GET /api/health/live-enforce-gates (TRA-3216)', () => {
     });
     expect(body.arm.universe.symbols).toEqual(['AAPL', 'SPY', 'QQQ', 'PLTR', 'TSLA']);
     expect(body.note).toMatch(/universe=RESTRICTED to \[AAPL,SPY,QQQ,PLTR,TSLA\]/);
+  });
+
+  // ─── TRA-5042 (residual of TRA-4795) — the mirror-seam paragraph ────────────
+  // `byGate` presents its rows as one flat list, but two of them are bound at
+  // the live `buy_to_open` broker-mirror seam and denominated in live broker
+  // orders, not scan candidates. TRA-4795's defect test graded one against the
+  // other and fired a false wiring accusation against a correctly wired gate.
+  // The note must say which rows are mirror-seam — and the list must be tied to
+  // the code, because a hardcoded prose list that silently drifts from the
+  // engine is the same failure one layer down.
+
+  /** The gates `mirrorLiveOptionOpen` actually records, read off the SOURCE. */
+  function mirrorSeamGatesFromSource(src: string): string[] {
+    const fnStart = src.indexOf('private async mirrorLiveOptionOpen(');
+    if (fnStart < 0) return [];
+    // The method body ends where the next two-space-indented member begins;
+    // statements inside the body are indented deeper, so this cannot fire early.
+    const fnEnd = src.indexOf('\n  private ', fnStart);
+    const body = src.slice(fnStart, fnEnd < 0 ? undefined : fnEnd);
+    return [...body.matchAll(/recordLiveEnforceDecision\(\s*'([a-z_]+)'/g)].map((m) => m[1]!);
+  }
+
+  const ENGINE_SRC = () =>
+    readFileSync(new URL('../signal-engine.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+
+  it('TRA-5042 — serves the mirror-seam paragraph, naming the gates and the hard-controls gap', () => {
+    const note = serve().note;
+    expect(note).toContain('THE ROWS ARE NOT ALL ON ONE SEAM');
+    for (const gate of MIRROR_SEAM_GATES) expect(note).toContain(`\`${gate}\``);
+    // The seam is named by SYMBOL, which survives line drift (the ticket's own
+    // :14229/:14312 citations were stale by the time this shipped).
+    expect(note).toContain('mirrorLiveOptionOpen');
+    // The one benign explanation for a sibling split, with its instrument.
+    expect(note).toContain('hard-controls');
+    expect(note).toContain('/api/controls/hard');
+    // AC3 — the illustrative "evaluated 5" figure is attributed author-time
+    // prose, no longer readable as a live measurement.
+    expect(note).toMatch(/evaluated 5 on that same 2026-08-21 — author-time prose/);
+    expect(note).not.toContain('evaluated 5 on that same day)');
+  });
+
+  it('TRA-5042 — MIRROR_SEAM_GATES matches the gates the engine records at the mirror seam', () => {
+    const src = ENGINE_SRC();
+    const recorded = mirrorSeamGatesFromSource(src);
+    // Order matters: canary first, stand-down last — the note's sibling-grading
+    // advice (`canary_ceiling.evaluated > 0` with `sleeve_stand_down` at 0 is
+    // the suspect condition) depends on which gate is upstream.
+    expect(recorded).toEqual([...MIRROR_SEAM_GATES]);
+    // And the hard-controls choke point the note blames for the benign split
+    // really does sit BETWEEN the two recorded gates on that seam, recording
+    // no live-enforce row of its own.
+    const fnStart = src.indexOf('private async mirrorLiveOptionOpen(');
+    const body = src.slice(fnStart, src.indexOf('\n  private ', fnStart));
+    const canaryIdx = body.indexOf("'canary_ceiling'");
+    const hardIdx = body.indexOf('admitOrderThroughHardControls(');
+    const standDownIdx = body.indexOf("'sleeve_stand_down'");
+    expect(canaryIdx).toBeGreaterThan(-1);
+    expect(hardIdx).toBeGreaterThan(canaryIdx);
+    expect(standDownIdx).toBeGreaterThan(hardIdx);
+  });
+
+  it('TRA-5042 — negative control: a gate added to the mirror seam turns the census red', () => {
+    const src = ENGINE_SRC();
+    const fnEnd = src.indexOf('\n  private ', src.indexOf('private async mirrorLiveOptionOpen('));
+    expect(fnEnd).toBeGreaterThan(-1);
+    const planted =
+      src.slice(0, fnEnd)
+      + "\n    recordLiveEnforceDecision(\n      'planted_gate',\n    );\n"
+      + src.slice(fnEnd);
+    const recorded = mirrorSeamGatesFromSource(planted);
+    // The extractor SEES the plant (it is not vacuously green) and the primary
+    // assertion above would go red on it.
+    expect(recorded).toContain('planted_gate');
+    expect(recorded).not.toEqual([...MIRROR_SEAM_GATES]);
   });
 
   // ─── TRA-4244 (parent TRA-4238) — the PROFIT side of the same sleeve ────────
