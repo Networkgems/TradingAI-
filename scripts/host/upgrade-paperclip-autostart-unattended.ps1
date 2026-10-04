@@ -48,6 +48,20 @@
     (a) a heartbeat_runs row within ~10 min of LastBootUpTime,
     (b) ZERO Id-332 events for this task in that window, and
     (c) one agent run completing with error_code IS NULL on the ACP lane.
+
+  SAME SITTING -- TRA-5123 (board ruling on TRA-4853, card 3f0ac1ee, CEO
+  2026-10-04). If you are running this ELEVATED, also re-point the
+  "PM2 Resurrect" scheduled task off the shared working tree in the same
+  Administrator session -- ONE admin sitting, not two. Verbatim runbook
+  (full context in TRA-5123's description):
+    1. cd C:\Users\eetienne\.paperclip\instances\default\projects\fc64eaf4-0c08-4270-9a4c-31ee16594dec\b6a879bc-aabf-4ee4-9e47-12404018a8f1\_default\tradingai_repo
+    2. schtasks /query /tn "PM2 Resurrect" /v /fo LIST
+       (record the pre-existing -File for the postmortem BEFORE changing it)
+    3. powershell -NoProfile -ExecutionPolicy Bypass -File ops\install-pm2-autostart.ps1
+    4. powershell -NoProfile -ExecutionPolicy Bypass -File ops\verify-pm2-autostart.ps1
+       (expect VERDICT: PASS, exit 0)
+  Nice-to-have while elevated: grant the task READ to non-elevated sessions
+  so the TRA-5123 verifier's C1/C2 checks stop reading UNREADABLE.
 #>
 [CmdletBinding()]
 param(
@@ -150,3 +164,9 @@ Write-Output 'UPGRADE: definition PASS. The ACCEPTANCE gate is a real unattended
 Write-Output '  reboot with nobody logged on, then assert (a) a heartbeat_runs row within'
 Write-Output '  ~10 min of LastBootUpTime, (b) zero Id-332 events for this task in that'
 Write-Output '  window, (c) one ACP-lane agent run with error_code IS NULL. (TRA-5105)'
+if ($elevated) {
+  Write-Output ''
+  Write-Output 'SAME SITTING (board ruling, TRA-5123): you are elevated -- also run the'
+  Write-Output '  4-command "PM2 Resurrect" re-point runbook in this session before you'
+  Write-Output '  close the window. Commands are in this script''s header and in TRA-5123.'
+}
