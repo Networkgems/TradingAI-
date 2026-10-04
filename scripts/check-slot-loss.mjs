@@ -120,21 +120,69 @@
  *     89/100. The universal is the RUN-ROW COUNT, which is window-free; the
  *     renderer prints that and the two are never collapsed again.
  *
- * VERDICTS — precedence BLIND > SLOT_LOSS > LATE_DISPATCH > CLEAN
+ * THE DARKNESS ARM (TRA-5055, off the TRA-5053 ruling)
+ * ----------------------------------------------------
+ * A scheduler-dark window used to show up here only as N routines each
+ * independently "losing slots" — N symptoms, no cause, and TRA-5053 had to
+ * reason its way back to the single incident in prose. Worse, every number a
+ * routine's own fire history can produce about the darkness is wrong by
+ * construction: a routine's fires are a lagging, coarse PROXY for scheduler
+ * availability (TRA-5053's on-cron fire reported 89.08h bounded [77.0, 89.1]
+ * for a darkness that is 86.06h measurable to the second — 89.08h is the
+ * ROUTINE INTER-FIRE GAP, a different quantity with a different name).
+ *
+ * So darkness is derived from the two surfaces that can actually see it:
+ *
+ *   1. `heartbeat_runs` — the whole-process liveness tape (heartbeats,
+ *      monitors AND routines), read off the LIST route's timestamps only.
+ *      ⛔ The list route STRIPS `contextSnapshot` (`source: None`); grading
+ *      anything off that field here is reading a surface known to be blank.
+ *      ⛔ `limit` caps at 1000 and `offset`/`page`/`before` are IGNORED, so
+ *      for history past the 1000-row window the tape is EXTENDED from
+ *      `data/run-logs/<companyId>/<agentId>/<runId>.ndjson` first-line `ts`
+ *      (measured 2026-10-04: the API window reached back only 11.7 days and
+ *      could not see the 09-21 occurrence; the ndjson arm reproduced it to
+ *      within 4 minutes — tick-source skew, run-row createdAt vs first log
+ *      byte).
+ *   2. Host boot/shutdown events (System log Ids 6005 boot / 6006 clean
+ *      shutdown / 6008 unexpected / 1074 initiated / 109 kernel-power), to
+ *      split each gap into HOST-DOWN vs HOST-UP-BUT-SERVER-DARK. That split
+ *      is the whole actionable content of a dark window: host-down belongs
+ *      to the auto-start fix (TRA-5105), host-up-dark belongs to whatever
+ *      did not start the server. An unreadable event log reads
+ *      NOT MEASURED on the split — never zero, never a guess — and the gap
+ *      itself is still reported.
+ *
+ * ⛔ THE BAR IS 12h AND IT COMES FROM THE MEASURED DISTRIBUTION, NOT TASTE.
+ * On 2026-10-04 the healthy band of the merged tape showed natural quiet of
+ * up to 8.3h (overnight host sleep, which writes no 6005/6006 pair), while
+ * the smallest real occurrence on record is 17.1h (TRA-4141). 720min splits
+ * the two populations with ~4h of margin in both directions. Lowering it
+ * past ~500min brands every quiet night DARK_WINDOW, which is how a
+ * detector stops being read.
+ *
+ * VERDICTS — precedence BLIND > DARK_WINDOW > SLOT_LOSS > LATE_DISPATCH > CLEAN
  *   0 CLEAN          every graded trigger served every expected slot in the window
  *   1 SLOT_LOSS      at least one trigger has >= --min-lost slots with NO run at
  *                    either bar — a dispatch failure
  *   2 usage
  *   3 BLIND          unparseable cron, unknown timezone, truncated history,
- *                    transport failure, or an empty population
+ *                    transport failure, an empty population, or an empty/
+ *                    unreadable liveness tape
  *   4 LATE_DISPATCH  no dispatch failure, but >= --min-lost slots on some trigger
  *                    were served only past --max-late. NOT a broken routine and
  *                    NOT green: the repair is to the dispatcher (trap 9).
+ *   5 DARK_WINDOW    the liveness tape itself has a hole over --dark-gap: the
+ *                    scheduler was dark for EVERYTHING, whether or not any
+ *                    routine was due. Outranks SLOT_LOSS because it is the
+ *                    single cause the per-routine rows are symptoms of; those
+ *                    rows still print underneath, nothing is swallowed.
  *
  * USAGE
  *   pnpm check:slot-loss
  *   pnpm check:slot-loss -- --days=14 --json
  *   pnpm check:slot-loss -- --late-ceiling=2160
+ *   pnpm check:slot-loss -- --dark-gap=720
  *   pnpm check:slot-loss:controls
  */
 
@@ -196,7 +244,27 @@ const DEFAULT_RUN_LIMIT = 1000;
 /** Refuses to enumerate a pathological cron (e.g. `* * * * *` over 90 days). */
 const MAX_SLOTS_PER_TRIGGER = 20_000;
 
-const VERDICT_EXIT = { CLEAN: 0, SLOT_LOSS: 1, BLIND: 3, LATE_DISPATCH: 4 };
+const VERDICT_EXIT = { CLEAN: 0, SLOT_LOSS: 1, BLIND: 3, LATE_DISPATCH: 4, DARK_WINDOW: 5 };
+
+/**
+ * Darkness bar (TRA-5055). See the header: 12h sits between the measured
+ * healthy-band maximum (8.3h overnight host sleep) and the smallest real
+ * occurrence (17.1h, TRA-4141).
+ */
+const DEFAULT_DARK_GAP_MIN = 12 * 60;
+/** heartbeat-runs list cap — `offset`/`page`/`before` are IGNORED server-side. */
+const HEARTBEAT_LIMIT = 1000;
+
+/** One combined verdict for the exit code; every arm's rows still print. */
+const VERDICT_PRECEDENCE = ['BLIND', 'DARK_WINDOW', 'SLOT_LOSS', 'LATE_DISPATCH', 'CLEAN'];
+export function combineVerdicts(...verdicts) {
+  // An unknown verdict ANYWHERE fails closed — checking only "is some known
+  // verdict present" would let ('WAT', 'CLEAN') read CLEAN, the quiet-green
+  // direction this whole file exists to refuse.
+  if (verdicts.some((v) => !VERDICT_PRECEDENCE.includes(v))) return 'BLIND';
+  for (const v of VERDICT_PRECEDENCE) if (verdicts.includes(v)) return v;
+  return 'BLIND';
+}
 
 /* ==================================================================
  * Cron
@@ -696,6 +764,163 @@ export async function sweep(transport, opts = {}) {
     lateRows,
     tally: rows.reduce((acc, r) => ((acc[r.state] = (acc[r.state] || 0) + 1), acc), {}),
   };
+}
+
+/* ==================================================================
+ * Darkness (TRA-5055) — scheduler-dark windows off the liveness tape
+ * ================================================================== */
+
+/**
+ * Find every hole over `darkGapMs` in the merged liveness tape that overlaps
+ * [fromMs, toMs]. Windows are reported at their TRUE bounds (a gap that opened
+ * before the lookback is still the gap it is); overlap with the lookback is
+ * the admission test. A trailing hole against `toMs` (= now) is an ONGOING
+ * dark window — the most actionable shape of all, so it must not wait for the
+ * recovery tick that would close it.
+ *
+ * ⛔ A tape that opens AFTER `fromMs` leaves [fromMs, tapeStart) UNOBSERVED.
+ * That span is named on the result and printed — it is an alarm, not a pass
+ * (CLAUDE.md: absent evidence is its own state). It is not folded into a
+ * window: a retention edge is not evidence of darkness either.
+ */
+export function deriveDarkWindows(ticksMs, { fromMs, toMs, darkGapMs }) {
+  const ticks = [...new Set((ticksMs ?? []).filter((t) => Number.isFinite(t) && t <= toMs))].sort(
+    (a, b) => a - b,
+  );
+  if (!ticks.length) {
+    return { state: 'BLIND', reason: 'liveness tape empty — darkness unmeasurable', windows: [] };
+  }
+  const tapeStartMs = ticks[0];
+  const windows = [];
+  const push = (startMs, endMs, ongoing) => {
+    const gapMs = endMs - startMs;
+    if (gapMs <= darkGapMs) return;
+    if (endMs < fromMs || startMs > toMs) return; // no overlap with the lookback
+    windows.push({ startMs, endMs, gapMs, ongoing });
+  };
+  for (let i = 1; i < ticks.length; i += 1) push(ticks[i - 1], ticks[i], false);
+  push(ticks[ticks.length - 1], toMs, true);
+  return {
+    state: 'OK',
+    windows,
+    tapeStartMs,
+    tapeEndMs: ticks[ticks.length - 1],
+    tickCount: ticks.length,
+    unobservedMs: Math.max(0, tapeStartMs - fromMs),
+  };
+}
+
+/**
+ * Split one dark window into HOST-DOWN vs HOST-UP-BUT-SERVER-DARK off the
+ * System event log. Down intervals are bracketed 6006 (clean shutdown) ->
+ * 6005 (event log start = boot); 1074/109/6008 corroborate but do not
+ * bracket — 6008's own TimeCreated is stamped at the NEXT boot, so it cannot
+ * date when a crash took the host down.
+ *
+ *   events == null  => the log was unreadable: the split is NOT MEASURED
+ *                      (hostDownMs null), never a fabricated zero.
+ *   a 6005 with no prior 6006 => a crash boot: the down-start is unknowable,
+ *                      so the split is kept but marked confidence 'partial'.
+ *                      The conservative reading stands: unbracketed time
+ *                      counts as HOST-UP-DARK, i.e. we never use a crash to
+ *                      excuse the server side.
+ */
+export function splitGapByHostEvents(win, events) {
+  if (!Array.isArray(events)) {
+    return { hostDownMs: null, hostUpDarkMs: null, boots: null, confidence: 'NOT_MEASURED' };
+  }
+  const sorted = [...events]
+    .filter((e) => Number.isFinite(e?.t))
+    .sort((a, b) => a.t - b.t);
+  const downs = [];
+  let openDown = null;
+  let partial = false;
+  for (const e of sorted) {
+    if (e.id === 6006) {
+      if (openDown == null) openDown = e.t;
+    } else if (e.id === 6005) {
+      if (openDown != null) {
+        downs.push([openDown, e.t]);
+        openDown = null;
+      } else if (e.t > win.startMs && e.t < win.endMs) {
+        partial = true; // crash boot inside the window — down-start unknown
+      }
+    }
+  }
+  // A shutdown never followed by a boot: down through the end of evidence.
+  if (openDown != null) downs.push([openDown, win.endMs]);
+
+  let hostDownMs = 0;
+  for (const [a, b] of downs) {
+    hostDownMs += Math.max(0, Math.min(b, win.endMs) - Math.max(a, win.startMs));
+  }
+  const boots = sorted.filter((e) => e.id === 6005 && e.t > win.startMs && e.t < win.endMs).length;
+  return {
+    hostDownMs,
+    hostUpDarkMs: win.gapMs - hostDownMs,
+    boots,
+    confidence: partial ? 'partial' : 'bracketed',
+  };
+}
+
+/** Grade the darkness arm: windows + splits -> verdict + rows. */
+export function gradeDarkness(tape, events, { fromMs, toMs, darkGapMs }) {
+  const derived = deriveDarkWindows(tape, { fromMs, toMs, darkGapMs });
+  if (derived.state === 'BLIND') {
+    return { verdict: 'BLIND', reason: derived.reason, windows: [], unobservedMs: null };
+  }
+  const windows = derived.windows.map((w) => ({
+    ...w,
+    ...splitGapByHostEvents(w, events),
+    start: new Date(w.startMs).toISOString(),
+    end: new Date(w.endMs).toISOString(),
+    gapHours: +(w.gapMs / HOUR).toFixed(2),
+  }));
+  return {
+    verdict: windows.length ? 'DARK_WINDOW' : 'CLEAN',
+    windows,
+    darkGapMin: darkGapMs / MIN,
+    tapeStart: new Date(derived.tapeStartMs).toISOString(),
+    tapeEnd: new Date(derived.tapeEndMs).toISOString(),
+    tickCount: derived.tickCount,
+    unobservedMs: derived.unobservedMs,
+    hostEventsRead: Array.isArray(events),
+  };
+}
+
+function renderDarkReport(dark, { fromMs, days }) {
+  const out = [];
+  out.push('');
+  if (dark.verdict === 'BLIND') {
+    out.push(`  DARKNESS ARM — BLIND: ${dark.reason}`);
+    return out;
+  }
+  const h = (ms) => `${(ms / HOUR).toFixed(2)}h`;
+  out.push(
+    `  DARKNESS ARM — ${dark.verdict} · tape ${dark.tickCount} tick(s) ${dark.tapeStart} .. ${dark.tapeEnd} · bar ${dark.darkGapMin}min`,
+  );
+  if (dark.unobservedMs > 0) {
+    out.push(
+      `    ⚠ tape opens ${h(dark.unobservedMs)} AFTER the requested --days=${days} window start ` +
+        `(${new Date(fromMs).toISOString()}) — that span is UNOBSERVED, not clean`,
+    );
+  }
+  if (!dark.hostEventsRead) {
+    out.push('    ⚠ host event log unreadable — every split below is NOT MEASURED, the gaps stand');
+  }
+  for (const w of dark.windows) {
+    const split =
+      w.hostDownMs == null
+        ? 'split NOT MEASURED'
+        : `host DOWN ${h(w.hostDownMs)} (${w.boots} boot(s)) · host UP server dark ${h(w.hostUpDarkMs)}` +
+          (w.confidence === 'partial' ? ' · ⚠ crash boot inside — down-start unknown, split partial' : '');
+    out.push(`    DARK ${w.gapHours}h  ${w.start} -> ${w.end}${w.ongoing ? '  ⚠ ONGOING' : ''}`);
+    out.push(`        ${split}`);
+  }
+  if (dark.windows.length) {
+    out.push('    (per-routine SLOT_LOSS/LATE rows inside these spans are SYMPTOMS of this single cause)');
+  }
+  return out;
 }
 
 /* ================================================================== */
@@ -1234,6 +1459,194 @@ const CONTROLS = [
   },
 ];
 
+/* ---- darkness controls (TRA-5055) ----------------------------------- */
+
+const D_NOW = Date.parse('2026-10-04T12:00:00Z');
+const D_FROM = D_NOW - 14 * DAY;
+const DARK_GAP = DEFAULT_DARK_GAP_MIN * MIN;
+
+/** Ticks every 30min across the window, minus holes given as [startIso, endIso]. */
+function tapeWithHoles(holes = []) {
+  const ticks = [];
+  for (let t = D_FROM; t <= D_NOW; t += 30 * MIN) {
+    const inHole = holes.some(([a, b]) => t > Date.parse(a) && t < Date.parse(b));
+    if (!inHole) ticks.push(t);
+  }
+  for (const [a, b] of holes) {
+    ticks.push(Date.parse(a), Date.parse(b)); // exact hole edges are real ticks
+  }
+  return ticks;
+}
+
+const DARK_CONTROLS = [
+  {
+    name: 'dark CLEAN — a fully ticking tape has no window',
+    run: () => {
+      const d = gradeDarkness(tapeWithHoles(), [], { fromMs: D_FROM, toMs: D_NOW, darkGapMs: DARK_GAP });
+      return d.verdict === 'CLEAN' || `expected CLEAN, got ${d.verdict}`;
+    },
+  },
+  {
+    name: 'bar placement — 8.3h (measured overnight-sleep max) is NOT a window at the default bar',
+    run: () => {
+      const d = gradeDarkness(
+        tapeWithHoles([['2026-09-24T01:57:00Z', '2026-09-24T10:15:00Z']]),
+        [],
+        { fromMs: D_FROM, toMs: D_NOW, darkGapMs: DARK_GAP },
+      );
+      return d.verdict === 'CLEAN' || `the healthy band must not read dark (got ${d.verdict})`;
+    },
+  },
+  {
+    name: 'bar placement — 17.1h (the smallest REAL occurrence, TRA-4141) IS a window',
+    run: () => {
+      const d = gradeDarkness(
+        tapeWithHoles([['2026-09-24T01:00:00Z', '2026-09-24T18:06:00Z']]),
+        [],
+        { fromMs: D_FROM, toMs: D_NOW, darkGapMs: DARK_GAP },
+      );
+      if (d.verdict !== 'DARK_WINDOW') return `expected DARK_WINDOW, got ${d.verdict}`;
+      const w = d.windows[0];
+      if (w.start !== '2026-09-24T01:00:00.000Z' || w.end !== '2026-09-24T18:06:00.000Z') {
+        return `window mis-dated: ${w.start} -> ${w.end}`;
+      }
+      return true;
+    },
+  },
+  {
+    name: 'THE BACK-FILED 09-21 OCCURRENCE — 32.9h gap splits 25.71h down / 7.18h up-dark off one boot',
+    run: () => {
+      // The real merged-tape edges and the real System-log events (2026-10-04 read).
+      const a = Date.parse('2026-09-21T10:30:07.674Z');
+      const b = Date.parse('2026-09-22T19:23:16.299Z');
+      const d = gradeDarkness(
+        [...tapeWithHoles(), a, b].filter((t) => t < Date.parse('2026-09-21T10:30:08Z') || t > Date.parse('2026-09-22T19:23:16Z')),
+        [
+          { t: Date.parse('2026-09-21T11:01:23Z'), id: 1074 },
+          { t: Date.parse('2026-09-21T11:01:45Z'), id: 6006 },
+          { t: Date.parse('2026-09-21T11:01:50Z'), id: 109 },
+          { t: Date.parse('2026-09-22T12:44:08Z'), id: 6005 },
+        ],
+        { fromMs: Date.parse('2026-09-15T00:00:00Z'), toMs: D_NOW, darkGapMs: DARK_GAP },
+      );
+      const w = d.windows.find((x) => x.startMs === a);
+      if (!w) return 'the 09-21 window was not found';
+      if (Math.abs(w.gapMs / HOUR - 32.89) > 0.02) return `gap ${w.gapHours}h, expected ~32.89h`;
+      if (Math.abs(w.hostDownMs / HOUR - 25.71) > 0.02) return `hostDown ${(w.hostDownMs / HOUR).toFixed(2)}h, expected ~25.71h`;
+      if (w.boots !== 1) return `expected 1 boot, got ${w.boots}`;
+      if (Math.abs((w.hostDownMs + w.hostUpDarkMs - w.gapMs)) > 1) return 'split does not sum to the gap';
+      if (w.confidence !== 'bracketed') return `expected bracketed, got ${w.confidence}`;
+      return true;
+    },
+  },
+  {
+    name: 'window A shape — a ~100%-host-down gap does NOT exercise the up-dark branch',
+    run: () => {
+      const a = Date.parse('2026-09-25T20:35:06Z');
+      const b = Date.parse('2026-09-27T22:10:24Z');
+      const w = { startMs: a, endMs: b, gapMs: b - a };
+      const s = splitGapByHostEvents(w, [
+        { t: Date.parse('2026-09-25T20:37:39Z'), id: 6006 },
+        { t: Date.parse('2026-09-27T22:06:29Z'), id: 6005 },
+      ]);
+      if (s.hostDownMs / w.gapMs < 0.99) return `expected ~all down, got ${(s.hostDownMs / w.gapMs * 100).toFixed(1)}%`;
+      return s.boots === 1 || `expected 1 boot, got ${s.boots}`;
+    },
+  },
+  {
+    name: 'window B shape — six boots, down intervals sum, up-dark branch exercised (the branch A cannot test)',
+    run: () => {
+      // The real 09-28 -> 10-01 event tape, verbatim from the System log
+      // (2026-10-04 read). The measured split — 58.91h down / 27.05h up-dark —
+      // reproduces TRA-5055's "~26.93h host-up-dark" prose figure to within
+      // tick-source skew on the gap edges, which is the verification the issue
+      // asked for: window A alone cannot exercise this branch.
+      const a = Date.parse('2026-09-28T01:17:52.199Z');
+      const b = Date.parse('2026-10-01T15:15:27.153Z');
+      const w = { startMs: a, endMs: b, gapMs: b - a };
+      const ev = [
+        ['2026-09-28T01:22:41Z', 6006], ['2026-09-28T01:23:21Z', 6005],
+        ['2026-09-28T08:59:08Z', 6006], ['2026-09-28T12:46:00Z', 6005],
+        ['2026-09-28T14:54:54Z', 6006], ['2026-09-28T20:20:20Z', 6005],
+        ['2026-09-28T20:57:52Z', 6006], ['2026-09-28T23:27:00Z', 6005],
+        ['2026-09-29T00:10:45Z', 6006], ['2026-09-29T00:11:45Z', 6005],
+        ['2026-09-29T16:01:48Z', 6006], ['2026-10-01T15:13:11Z', 6005],
+      ].map(([t, id]) => ({ t: Date.parse(t), id }));
+      const s = splitGapByHostEvents(w, ev);
+      if (s.boots !== 6) return `expected 6 boots, got ${s.boots}`;
+      if (s.hostUpDarkMs < 6 * HOUR) return 'the up-dark branch was not exercised';
+      if (Math.abs(s.hostDownMs + s.hostUpDarkMs - w.gapMs) > 1) return 'split does not sum to the gap';
+      if (Math.abs(s.hostDownMs / HOUR - 58.91) > 0.02) return `hostDown ${(s.hostDownMs / HOUR).toFixed(2)}h, expected ~58.91h`;
+      if (Math.abs(s.hostUpDarkMs / HOUR - 27.05) > 0.02) return `upDark ${(s.hostUpDarkMs / HOUR).toFixed(2)}h, expected ~27.05h`;
+      return true;
+    },
+  },
+  {
+    name: 'split NOT MEASURED — a null event tape yields null, never a fabricated zero',
+    run: () => {
+      const s = splitGapByHostEvents({ startMs: 0, endMs: DAY, gapMs: DAY }, null);
+      if (s.hostDownMs !== null || s.hostUpDarkMs !== null) return 'split must be null when unmeasured';
+      return s.confidence === 'NOT_MEASURED' || `expected NOT_MEASURED, got ${s.confidence}`;
+    },
+  },
+  {
+    name: 'no events in range — host up throughout, the WHOLE gap is server-dark',
+    run: () => {
+      const s = splitGapByHostEvents({ startMs: 0, endMs: DAY, gapMs: DAY }, []);
+      if (s.hostDownMs !== 0) return `expected 0 down, got ${s.hostDownMs}`;
+      return s.hostUpDarkMs === DAY || 'up-dark must equal the gap';
+    },
+  },
+  {
+    name: 'crash boot — a 6005 with no bracketing 6006 reads confidence partial, not a guess',
+    run: () => {
+      const s = splitGapByHostEvents(
+        { startMs: 0, endMs: DAY, gapMs: DAY },
+        [{ t: 12 * HOUR, id: 6005 }],
+      );
+      return s.confidence === 'partial' || `expected partial, got ${s.confidence}`;
+    },
+  },
+  {
+    name: 'ONGOING — a tape that stopped 20h ago is a live dark window ending at now',
+    run: () => {
+      const ticks = tapeWithHoles().filter((t) => t < D_NOW - 20 * HOUR);
+      const d = gradeDarkness(ticks, [], { fromMs: D_FROM, toMs: D_NOW, darkGapMs: DARK_GAP });
+      if (d.verdict !== 'DARK_WINDOW') return `expected DARK_WINDOW, got ${d.verdict}`;
+      const w = d.windows[d.windows.length - 1];
+      if (!w.ongoing) return 'the trailing hole must read ongoing';
+      return w.endMs === D_NOW || 'an ongoing window ends at now';
+    },
+  },
+  {
+    name: 'empty tape — BLIND, never CLEAN',
+    run: () => {
+      const d = gradeDarkness([], [], { fromMs: D_FROM, toMs: D_NOW, darkGapMs: DARK_GAP });
+      return d.verdict === 'BLIND' || `expected BLIND, got ${d.verdict}`;
+    },
+  },
+  {
+    name: 'short tape — the pre-tape span reads UNOBSERVED, named, not folded into a window',
+    run: () => {
+      const ticks = tapeWithHoles().filter((t) => t > D_FROM + 5 * DAY);
+      const d = gradeDarkness(ticks, [], { fromMs: D_FROM, toMs: D_NOW, darkGapMs: DARK_GAP });
+      if (d.verdict !== 'CLEAN') return `a retention edge is not darkness (got ${d.verdict})`;
+      return d.unobservedMs >= 5 * DAY - HOUR || `unobserved span not named (${d.unobservedMs})`;
+    },
+  },
+  {
+    name: 'precedence — DARK_WINDOW outranks SLOT_LOSS, BLIND outranks both, late stays below loss',
+    run: () => {
+      if (combineVerdicts('SLOT_LOSS', 'DARK_WINDOW') !== 'DARK_WINDOW') return 'DARK_WINDOW must outrank SLOT_LOSS';
+      if (combineVerdicts('DARK_WINDOW', 'BLIND') !== 'BLIND') return 'BLIND must outrank DARK_WINDOW';
+      if (combineVerdicts('CLEAN', 'CLEAN') !== 'CLEAN') return 'two CLEANs are CLEAN';
+      if (combineVerdicts('LATE_DISPATCH', 'CLEAN') !== 'LATE_DISPATCH') return 'LATE must survive a clean arm';
+      if (combineVerdicts('WAT', 'CLEAN') !== 'BLIND') return 'an unknown verdict must fail closed';
+      return true;
+    },
+  },
+];
+
 async function selftest() {
   let pass = 0;
   const seen = new Set();
@@ -1252,11 +1665,28 @@ async function selftest() {
     if (ok) pass += 1;
     console.log(`${ok ? 'PASS' : 'FAIL'}  ${c.name}${c.note ? `  [${c.note}]` : ''}${detail ? ` — ${detail}` : ''}`);
   }
-  console.log(`\n${pass}/${CONTROLS.length} controls pass; verdicts reachable: ${[...seen].sort().join(', ')}`);
+  let darkPass = 0;
+  for (const c of DARK_CONTROLS) {
+    let ok;
+    let detail = '';
+    try {
+      const r = c.run();
+      ok = r === true;
+      if (!ok) detail = String(r);
+    } catch (err) {
+      ok = false;
+      detail = String(err?.message ?? err);
+    }
+    if (ok) darkPass += 1;
+    console.log(`${ok ? 'PASS' : 'FAIL'}  ${c.name}${detail ? ` — ${detail}` : ''}`);
+  }
+
+  const total = CONTROLS.length + DARK_CONTROLS.length;
+  console.log(`\n${pass + darkPass}/${total} controls pass; verdicts reachable: ${[...seen].sort().join(', ')}`);
   for (const v of ['CLEAN', 'SLOT_LOSS', 'LATE_DISPATCH', 'BLIND']) {
     if (!seen.has(v)) console.log(`WARN  verdict ${v} was never reached by any control`);
   }
-  return pass === CONTROLS.length ? 0 : 1;
+  return pass + darkPass === total ? 0 : 1;
 }
 
 /* ================================================================== */
@@ -1284,6 +1714,7 @@ function liveTransport() {
     return null;
   };
   return {
+    companyId: CO,
     listAgents: async () => unwrap(await get(`${BASE}/api/companies/${CO}/agents`), 'agents') || [],
     getRoutines: async () => unwrap(await get(`${BASE}/api/companies/${CO}/routines`), 'routines'),
     getRuns: async (id) => {
@@ -1293,7 +1724,106 @@ function liveTransport() {
       rows.truncated = rows.length >= runLimit;
       return rows;
     },
+    /**
+     * The whole-process liveness tape (TRA-5055). Timestamps ONLY — the list
+     * route strips `contextSnapshot`, so nothing else on these rows may be
+     * graded. `offset`/`page`/`before` are ignored server-side; history past
+     * this window comes from the ndjson arm below.
+     */
+    getHeartbeatTicks: async () => {
+      const rows = unwrap(
+        await get(`${BASE}/api/companies/${CO}/heartbeat-runs?limit=${HEARTBEAT_LIMIT}`),
+        'heartbeatRuns',
+      );
+      if (!Array.isArray(rows)) throw new Error('heartbeat-runs did not deserialise to an array');
+      return rows.map((r) => Date.parse(r?.createdAt ?? '')).filter(Number.isFinite);
+    },
   };
+}
+
+/**
+ * Extend the liveness tape past the heartbeat-runs 1000-row cap from the
+ * local run logs: `data/run-logs/<companyId>/<agentId>/<runId>.ndjson`. Each
+ * file's FIRST line carries `{"ts": ...}` — one liveness tick per run, read
+ * off the first 300 bytes so 2k files stay cheap. Unreadable dir or files
+ * return what could be read; the caller's coverage line names what the tape
+ * actually spans, so a short ndjson arm cannot silently read as clean.
+ */
+async function readRunLogTicks(dir) {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const ticks = [];
+  let agents;
+  try {
+    agents = fs.readdirSync(dir);
+  } catch {
+    return { ticks, readable: false };
+  }
+  const buf = Buffer.alloc(300);
+  for (const agent of agents) {
+    const ad = path.join(dir, agent);
+    let files;
+    try {
+      if (!fs.statSync(ad).isDirectory()) continue;
+      files = fs.readdirSync(ad);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!f.endsWith('.ndjson')) continue;
+      try {
+        const fd = fs.openSync(path.join(ad, f), 'r');
+        const n = fs.readSync(fd, buf, 0, 300, 0);
+        fs.closeSync(fd);
+        const m = buf.toString('utf8', 0, n).match(/"ts":"([^"]+)"/);
+        if (m) {
+          const t = Date.parse(m[1]);
+          if (Number.isFinite(t)) ticks.push(t);
+        }
+      } catch {
+        /* one unreadable file is not a blind tape */
+      }
+    }
+  }
+  return { ticks, readable: true };
+}
+
+/**
+ * Host boot/shutdown tape off the System event log, for the down/up-dark
+ * split. Any failure returns null, which `splitGapByHostEvents` renders as
+ * NOT MEASURED — the one thing this must never do is fabricate a split.
+ */
+async function readHostEvents(sinceMs) {
+  const { execFile } = await import('node:child_process');
+  const since = new Date(sinceMs).toISOString();
+  // ⛔ Zero matching events is a TERMINATING error on Get-WinEvent, and it is
+  // a truthful reading ("no boot/shutdown in range" => host up throughout),
+  // NOT the unreadable-log case. The two must map to [] and null respectively.
+  const ps =
+    `try { $e = @(Get-WinEvent -FilterHashtable @{LogName='System'; Id=6005,6006,6008,1074,109; ` +
+    `StartTime=[datetime]::Parse('${since}').ToLocalTime()} -ErrorAction Stop) } catch { ` +
+    `if ($_.Exception.Message -match 'No events were found') { $e = @() } else { exit 1 } }; ` +
+    `if ($e.Count -eq 0) { '[]' } else { ` +
+    `ConvertTo-Json @($e | ForEach-Object { @{ t = $_.TimeCreated.ToUniversalTime().ToString('o'); id = $_.Id } }) -Compress }`;
+  const out = await new Promise((resolve) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', ps],
+      { timeout: 60_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true },
+      (err, stdout) => resolve(err ? null : stdout),
+    );
+  });
+  if (out == null) return null;
+  try {
+    const parsed = JSON.parse(out);
+    const rows = Array.isArray(parsed) ? parsed : [parsed];
+    const events = rows
+      .map((r) => ({ t: Date.parse(r?.t ?? ''), id: Number(r?.id) }))
+      .filter((e) => Number.isFinite(e.t) && Number.isFinite(e.id));
+    return events;
+  } catch {
+    return null;
+  }
 }
 
 async function main() {
@@ -1308,12 +1838,18 @@ async function main() {
         '  --late-ceiling=N  minutes past --max-late a run still credits its slot as',
         '                  LATE_SERVED rather than LOST (default 4320 = 72h)',
         '  --min-lost=N    lost slots before a trigger is a finding (default 2)',
-        '  --run-limit=N   /runs page size; a full page inside the window reads BLIND (default 200)',
+        '  --run-limit=N   /runs page size; a full page inside the window reads BLIND (default 1000)',
+        '  --dark-gap=N    minutes of liveness-tape silence that reads DARK_WINDOW (default 720;',
+        '                  the bar sits between 8.3h measured overnight quiet and the 17.1h',
+        '                  smallest real occurrence — see header before moving it)',
+        '  --run-logs-dir=P  ndjson run-log root for tape history past the 1000-row API cap',
+        '                  (default <home>/.paperclip/instances/default/data/run-logs/<companyId>)',
+        '  --no-host-split do not read the Windows event log (splits read NOT MEASURED)',
         '  --json          machine-readable',
         '  --selftest      run the controls',
         '',
-        '  0 CLEAN · 1 SLOT_LOSS · 2 usage · 3 BLIND · 4 LATE_DISPATCH;',
-        '  BLIND > SLOT_LOSS > LATE_DISPATCH > CLEAN',
+        '  0 CLEAN · 1 SLOT_LOSS · 2 usage · 3 BLIND · 4 LATE_DISPATCH · 5 DARK_WINDOW;',
+        '  BLIND > DARK_WINDOW > SLOT_LOSS > LATE_DISPATCH > CLEAN',
       ].join('\n'),
     );
     return 2;
@@ -1321,13 +1857,46 @@ async function main() {
   if (argv.includes('--selftest')) return selftest();
 
   const transport = liveTransport();
+  const days = numArg('days', DEFAULT_DAYS);
   const result = await sweep(transport, {
-    days: numArg('days', DEFAULT_DAYS),
+    days,
     graceMin: numArg('grace', DEFAULT_GRACE_MIN),
     maxLateMin: numArg('max-late', DEFAULT_MAX_LATE_MIN),
     lateCeilingMin: numArg('late-ceiling', DEFAULT_LATE_CEILING_MIN),
     minLost: numArg('min-lost', DEFAULT_MIN_LOST),
   });
+
+  /* ---- darkness arm (TRA-5055) ---- */
+  const now = result.now;
+  const fromMs = now - days * DAY;
+  const darkGapMs = numArg('dark-gap', DEFAULT_DARK_GAP_MIN) * MIN;
+  let dark;
+  try {
+    const apiTicks = await transport.getHeartbeatTicks();
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const defaultLogDir = path.join(
+      os.homedir(),
+      '.paperclip', 'instances', 'default', 'data', 'run-logs',
+      String(transport.companyId),
+    );
+    const logDirArg = argOf('run-logs-dir');
+    const logDir = typeof logDirArg === 'string' ? logDirArg : defaultLogDir;
+    const ndjson = await readRunLogTicks(logDir);
+    const tape = [...apiTicks, ...ndjson.ticks];
+    // The split's event query starts 8d before the window so a down interval
+    // that opened before the lookback still brackets.
+    const events = argv.includes('--no-host-split') ? null : await readHostEvents(fromMs - 8 * DAY);
+    dark = gradeDarkness(tape, events, { fromMs, toMs: now, darkGapMs });
+    dark.apiTickCount = apiTicks.length;
+    dark.apiTapeTruncated = apiTicks.length >= HEARTBEAT_LIMIT;
+    dark.ndjsonArm = ndjson.readable ? `${ndjson.ticks.length} tick(s) from ${logDir}` : `UNREADABLE: ${logDir}`;
+  } catch (err) {
+    // The tape being unreadable is not a clean scheduler (fail closed).
+    dark = { verdict: 'BLIND', reason: `liveness tape unreadable: ${err.message}`, windows: [] };
+  }
+
+  const overall = combineVerdicts(result.verdict, dark.verdict);
 
   let names = {};
   try {
@@ -1339,11 +1908,19 @@ async function main() {
   }
 
   if (argv.includes('--json')) {
-    console.log(JSON.stringify({ issue: 'TRA-4049', checkedAt: new Date().toISOString(), ...result }, null, 2));
+    console.log(
+      JSON.stringify(
+        { issue: 'TRA-4049/TRA-5055', checkedAt: new Date().toISOString(), overall, darkness: dark, ...result },
+        null,
+        2,
+      ),
+    );
   } else {
     for (const l of renderReport(result, names)) console.log(l);
+    for (const l of renderDarkReport(dark, { fromMs, days })) console.log(l);
+    console.log(`\n  OVERALL ${overall} (routines ${result.verdict} · darkness ${dark.verdict})`);
   }
-  return VERDICT_EXIT[result.verdict] ?? 3;
+  return VERDICT_EXIT[overall] ?? 3;
 }
 
 main()
