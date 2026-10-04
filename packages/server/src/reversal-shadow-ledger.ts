@@ -6,6 +6,7 @@ import type { CandlePattern, ReversalChecklist } from '@trading-app/engine';
 import { logger } from './observability/index.js';
 import {
   bufferSharedTapeAppend,
+  extractLineTs,
   sharedTapeRewriteInFlight,
   type SharedTapeSpec,
 } from './shared-tape-compaction.js';
@@ -373,6 +374,25 @@ export function reversalShadowSharedTapeSpec(): SharedTapeSpec {
       'One line per captured reversal setup (plus its forward outcome) — 44.3 MiB on '
       + '2026-10-02, and the only one of the four that SHRANK over the week (-6.2), which '
       + 'is itself evidence its 30-day cutoff is already binding.',
+    // This tape is a two-kind union and a `resolve` line carries NO `ts` — by design
+    // (ageing the kinds independently would orphan resolutions from their opens; see
+    // ensureLoaded). The shared walk's default reader therefore stops dead on the
+    // first resolve line it meets, which the first live timer fire proved
+    // (2026-10-03T23:42Z: 106 opens dropped, then wedged, span `unknown`). Dating a
+    // resolve by `resolvedAt` is safe IN A PREFIX WALK: a resolve can only follow its
+    // own open, so any resolve the walk reaches is an orphan whose open was already
+    // dropped, and `resolvedAt > rec.ts` always — the substitution can only retain
+    // longer, never drop a row whose open survived. `resolvedAt` is the LAST key on a
+    // resolve line (~120–150 bytes in), hence the widened head.
+    tsHeadBytes: 256,
+    lineTs: (head) => {
+      const ts = extractLineTs(head);
+      if (ts !== null) return ts;
+      const m = /"resolvedAt":\s*(-?\d+(?:\.\d+)?)/.exec(head);
+      if (m === null) return null;
+      const at = Number(m[1]);
+      return Number.isFinite(at) ? at : null;
+    },
   };
 }
 

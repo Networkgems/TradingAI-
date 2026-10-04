@@ -187,6 +187,93 @@ describe('age predicate', () => {
   });
 });
 
+describe('per-tape lineTs reader (the reversal-shadow union)', () => {
+  // The shape that wedged the FIRST LIVE FIRE (2026-10-03T23:42Z): reversal's
+  // `resolve` lines carry no `ts` at all, so the default reader dropped the aged
+  // opens, stopped dead on the first resolve line, and left it HEADING the file —
+  // every later pass read `cut=0` and the timer predicate went inert for that tape
+  // until the next boot hydrate.
+  function openLine(ts: number, id: string): string {
+    return JSON.stringify({ kind: 'open', rec: { id, ts, symbol: 'NVTS', side: 'long' } });
+  }
+  function resolveLine(id: string, resolvedAt: number): string {
+    return JSON.stringify({
+      kind: 'resolve',
+      id,
+      res: { outcome: 'SL_HIT', realizedR: -1, barsToResolution: 57 },
+      resolvedAt,
+    });
+  }
+  function registerUnion(retainMs: number): void {
+    registerSharedTape({
+      tape: 'fixture',
+      resolvePath: () => path,
+      predicate: () => ({ kind: 'age', retainMs }),
+      flushLine: (line) => {
+        flushed.push(line);
+      },
+      note: 'test fixture',
+      // Mirrors reversalShadowSharedTapeSpec(): `resolvedAt` is the LAST key on a
+      // resolve line, beyond the default 96-byte head.
+      tsHeadBytes: 256,
+      lineTs: (head) => {
+        const ts = extractLineTs(head);
+        if (ts !== null) return ts;
+        const m = /"resolvedAt":\s*(-?\d+(?:\.\d+)?)/.exec(head);
+        return m === null ? null : Number(m[1]);
+      },
+    });
+  }
+
+  it('dates aged resolve lines by resolvedAt instead of wedging on them', async () => {
+    const aged = [
+      openLine(NOW - 40 * DAY, 'A:long:1'),
+      resolveLine('A:long:1', NOW - 39 * DAY), // no "ts" anywhere on this line
+      openLine(NOW - 35 * DAY, 'B:long:2'),
+    ];
+    const young = [openLine(NOW - 2 * DAY, 'C:long:3')];
+    write([...aged, ...young]);
+    registerUnion(30 * DAY);
+
+    const out = await compactSharedTapeNow('fixture', NOW, 'timer');
+
+    expect(out.stoppedOnUnreadableTs).toBeUndefined();
+    expect(out.linesDropped).toBe(3);
+    expect(readFileSync(path, 'utf8')).toBe(young.join('\n') + '\n');
+    expect(out.span.fill).not.toBe('unknown');
+    expect(out.span.oldestRetainedTs).toBe(new Date(NOW - 2 * DAY).toISOString());
+  });
+
+  it('keeps a resolve head whose resolvedAt is inside the window, and can still date the span', async () => {
+    // Over-retention is the safe direction: the orphan resolve is cleaned by the
+    // boot fold; what matters is the walk neither deletes it nor goes undatable.
+    const lines = [
+      openLine(NOW - 40 * DAY, 'A:long:1'),
+      resolveLine('A:long:1', NOW - 5 * DAY),
+      openLine(NOW - 2 * DAY, 'C:long:3'),
+    ];
+    write(lines);
+    registerUnion(30 * DAY);
+
+    const out = await compactSharedTapeNow('fixture', NOW, 'timer');
+
+    expect(out.linesDropped).toBe(1);
+    expect(readFileSync(path, 'utf8').startsWith('{"kind":"resolve"')).toBe(true);
+    expect(out.span.oldestRetainedTs).toBe(new Date(NOW - 5 * DAY).toISOString());
+  });
+
+  it('names the undatable-head cause instead of claiming the tape has no datable line', async () => {
+    write([row(NOW - 40 * DAY), '{"no_ts":true}', row(NOW - 1 * DAY)]);
+    registerAge(30 * DAY);
+
+    const out = await compactSharedTapeNow('fixture', NOW, 'timer');
+
+    expect(out.stoppedOnUnreadableTs).toBe(true);
+    expect(out.span.fill).toBe('unknown');
+    expect(out.span.fillBasis).toContain('UNDATABLE, not absent');
+  });
+});
+
 describe('byte predicate (otm-admission-tape shape)', () => {
   it('drops oldest whole lines until the file is at or under the cap', async () => {
     const lines: string[] = [];

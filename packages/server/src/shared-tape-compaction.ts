@@ -269,6 +269,31 @@ export interface SharedTapeSpec {
   onRewrite?: (bytesAfter: number) => void;
   /** One line for the health payload saying what this tape is and why it is here. */
   note: string;
+  /**
+   * Per-tape dater for line kinds whose instant is not a head `"ts"` key. The walk
+   * calls it with the decoded head of each line (see `tsHeadBytes`); `null` still
+   * means "could not date it" and still STOPS an age walk at that line.
+   *
+   * Exists because `reversal-shadow-signals` is a two-kind union and its `resolve`
+   * lines carry NO `ts` at all — by design (ageing the kinds independently would
+   * orphan resolutions from their opens). On the first live timer fire
+   * (2026-10-03T23:42Z) the default reader dropped the 106 aged opens, then stopped
+   * dead on the first resolve line, which then HEADED the file: every later pass read
+   * `cut=0`, so the timer predicate was inert for that tape until the next boot
+   * hydrate, and its published span read `unknown`. Dating a resolve by `resolvedAt`
+   * is safe IN A PREFIX WALK specifically: a resolve can only follow its own open in
+   * an append-only file, so any resolve the walk reaches has its open already
+   * dropped (it is an orphan the boot fold discards anyway), and
+   * `resolvedAt > rec.ts` always, so the substitution can only retain a line longer,
+   * never drop one whose open survived.
+   */
+  lineTs?: (head: string) => number | null;
+  /**
+   * Bytes of head decoded per line for `lineTs` (default {@link TS_HEAD_BYTES}).
+   * Widening is safe, narrowing is safe — the failure mode is retaining bytes, not
+   * losing rows. Reversal needs ~150: `resolvedAt` is the LAST key on a resolve line.
+   */
+  tsHeadBytes?: number;
 }
 
 interface TapeSlot {
@@ -371,6 +396,14 @@ export function extractLineTs(line: string): number | null {
  */
 const TS_HEAD_BYTES = 96;
 
+/** A tape's resolved dater: head window + reader. Defaulted in {@link runOne}. */
+interface LineTsReader {
+  headBytes: number;
+  read: (head: string) => number | null;
+}
+
+const DEFAULT_LINE_TS_READER: LineTsReader = { headBytes: TS_HEAD_BYTES, read: extractLineTs };
+
 /** No newline within this many bytes ⇒ refuse to line-split the file. See {@link scanAgedPrefix}. */
 const MAX_LINE_BYTES = 8 * 1024 * 1024;
 
@@ -397,8 +430,8 @@ function isBlank(raw: Buffer): boolean {
  * every offset derived from it — i.e. it would move the cut. All offsets here are
  * computed on Buffers; this decode feeds the regex and nothing else.
  */
-function decodeHead(raw: Buffer): string {
-  return raw.subarray(0, TS_HEAD_BYTES).toString('latin1');
+function decodeHead(raw: Buffer, headBytes: number = TS_HEAD_BYTES): string {
+  return raw.subarray(0, headBytes).toString('latin1');
 }
 
 /** The cutoff instant a predicate implies, or `null` for the byte caps (they have none). */
@@ -452,6 +485,7 @@ async function scanAgedPrefix(
   fh: Awaited<ReturnType<typeof open>>,
   size: number,
   cutoff: number,
+  reader: LineTsReader = DEFAULT_LINE_TS_READER,
 ): Promise<PrefixScan> {
   let pos = 0;
   /** Bytes of an incomplete trailing line carried from the previous chunk. */
@@ -471,7 +505,7 @@ async function scanAgedPrefix(
     while (idx !== -1) {
       const raw = buf.subarray(from, idx);
       if (!isBlank(raw)) {
-        const ts = extractLineTs(decodeHead(raw));
+        const ts = reader.read(decodeHead(raw, reader.headBytes));
         if (ts === null) {
           // Keep it. A line we cannot date is not a line we are entitled to delete.
           return { cut: lineStart, linesDropped, oldestKeptTs: null, stoppedOnUnreadableTs: true };
@@ -501,7 +535,7 @@ async function scanAgedPrefix(
 
   // Trailing line with no newline: an unterminated row is still a row.
   if (!isBlank(partial)) {
-    const ts = extractLineTs(decodeHead(partial));
+    const ts = reader.read(decodeHead(partial, reader.headBytes));
     if (ts === null) {
       return { cut: lineStart, linesDropped, oldestKeptTs: null, stoppedOnUnreadableTs: true };
     }
@@ -523,12 +557,13 @@ async function scanBytePrefix(
   fh: Awaited<ReturnType<typeof open>>,
   size: number,
   maxBytes: number,
+  reader: LineTsReader = DEFAULT_LINE_TS_READER,
 ): Promise<PrefixScan> {
   if (size <= maxBytes) {
     return {
       cut: 0,
       linesDropped: 0,
-      oldestKeptTs: await firstLineTs(fh, 0, size),
+      oldestKeptTs: await firstLineTs(fh, 0, size, reader),
       stoppedOnUnreadableTs: false,
     };
   }
@@ -576,7 +611,7 @@ async function scanBytePrefix(
   return {
     cut,
     linesDropped,
-    oldestKeptTs: await firstLineTs(fh, cut, size),
+    oldestKeptTs: await firstLineTs(fh, cut, size, reader),
     stoppedOnUnreadableTs: false,
   };
 }
@@ -608,12 +643,13 @@ async function scanWholeDayPrefix(
   fh: Awaited<ReturnType<typeof open>>,
   size: number,
   maxBytes: number,
+  reader: LineTsReader = DEFAULT_LINE_TS_READER,
 ): Promise<PrefixScan> {
   if (size <= maxBytes) {
     return {
       cut: 0,
       linesDropped: 0,
-      oldestKeptTs: await firstLineTs(fh, 0, size),
+      oldestKeptTs: await firstLineTs(fh, 0, size, reader),
       stoppedOnUnreadableTs: false,
     };
   }
@@ -646,7 +682,7 @@ async function scanWholeDayPrefix(
             return {
               cut: lineStart,
               linesDropped: linesBeforeCurrentDay + linesInCurrentDay,
-              oldestKeptTs: extractLineTs(decodeHead(raw)),
+              oldestKeptTs: reader.read(decodeHead(raw, reader.headBytes)),
               stoppedOnUnreadableTs: false,
             };
           }
@@ -679,12 +715,12 @@ async function scanWholeDayPrefix(
   if (currentDayStart === 0) {
     // One day only (or no readable day at all): there is nothing to drop that would
     // not empty the archive. Keep everything and let the overshoot be visible.
-    return { cut: 0, linesDropped: 0, oldestKeptTs: await firstLineTs(fh, 0, size), stoppedOnUnreadableTs: false };
+    return { cut: 0, linesDropped: 0, oldestKeptTs: await firstLineTs(fh, 0, size, reader), stoppedOnUnreadableTs: false };
   }
   return {
     cut: currentDayStart,
     linesDropped: linesBeforeCurrentDay,
-    oldestKeptTs: await firstLineTs(fh, currentDayStart, size),
+    oldestKeptTs: await firstLineTs(fh, currentDayStart, size, reader),
     stoppedOnUnreadableTs: false,
   };
 }
@@ -694,6 +730,7 @@ async function firstLineTs(
   fh: Awaited<ReturnType<typeof open>>,
   from: number,
   size: number,
+  reader: LineTsReader = DEFAULT_LINE_TS_READER,
 ): Promise<number | null> {
   if (from >= size) return null;
   const head = await readAt(fh, from, Math.min(SCAN_CHUNK_BYTES, size - from));
@@ -702,14 +739,18 @@ async function firstLineTs(
     const nl = head.indexOf(0x0a, start);
     const end = nl === -1 ? head.length : nl;
     const raw = head.subarray(start, end);
-    if (!isBlank(raw)) return extractLineTs(decodeHead(raw));
+    if (!isBlank(raw)) return reader.read(decodeHead(raw, reader.headBytes));
     if (nl === -1) return null;
     start = nl + 1;
   }
 }
 
 /** `ts` of the last complete line in the file, read off a bounded tail window. */
-async function newestTs(fh: Awaited<ReturnType<typeof open>>, size: number): Promise<number | null> {
+async function newestTs(
+  fh: Awaited<ReturnType<typeof open>>,
+  size: number,
+  reader: LineTsReader = DEFAULT_LINE_TS_READER,
+): Promise<number | null> {
   if (size === 0) return null;
   const len = Math.min(TAIL_WINDOW_BYTES, size);
   const tail = await readAt(fh, size - len, len);
@@ -719,7 +760,7 @@ async function newestTs(fh: Awaited<ReturnType<typeof open>>, size: number): Pro
   // the correct one.
   const lines = tail.toString('latin1').split('\n').filter((l) => l.trim() !== '');
   for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const ts = extractLineTs(lines[i] as string);
+    const ts = reader.read((lines[i] as string).slice(0, reader.headBytes));
     if (ts !== null) return ts;
   }
   return null;
@@ -885,6 +926,31 @@ async function runOne(
    * invisibly — a field that reads identically whether or not the interlock works,
    * which is the exact defect class this hook exists to remove one level up.
    */
+  const reader: LineTsReader = {
+    headBytes: slot.spec.tsHeadBytes ?? TS_HEAD_BYTES,
+    read: slot.spec.lineTs ?? extractLineTs,
+  };
+
+  // When the walk stopped on a line it could not date, the generic empty-span basis
+  // ("no datable line on disk") would MISATTRIBUTE the unknown — the tape has content,
+  // its head is just undatable. Name the real cause so the surface stays truthful.
+  const spanOf = (
+    bytes: number,
+    scan: PrefixScan,
+    newest: number | null,
+    dropped: number,
+  ): TapeSpan => {
+    const span = buildSpan(predicate, now, bytes, scan.oldestKeptTs, newest, dropped);
+    if (scan.stoppedOnUnreadableTs && scan.oldestKeptTs === null) {
+      span.fillBasis =
+        'UNKNOWN — the walk STOPPED on a line it could not date, so the head of this '
+        + 'tape is UNDATABLE, not absent. The tape has content; `fill` cannot be graded '
+        + 'until the undatable head ages out at a boot hydrate or the tape supplies a '
+        + '`lineTs` reader for that line kind.';
+    }
+    return span;
+  };
+
   const pass = async (): Promise<TapeCompaction> => {
     const fh = await open(path, 'r');
     let scan: PrefixScan;
@@ -892,11 +958,11 @@ async function runOne(
     try {
       scan =
         predicate.kind === 'age'
-          ? await scanAgedPrefix(fh, size, now - predicate.retainMs)
+          ? await scanAgedPrefix(fh, size, now - predicate.retainMs, reader)
           : predicate.kind === 'bytes_whole_day'
-            ? await scanWholeDayPrefix(fh, size, predicate.maxBytes)
-            : await scanBytePrefix(fh, size, predicate.maxBytes);
-      newest = await newestTs(fh, size);
+            ? await scanWholeDayPrefix(fh, size, predicate.maxBytes, reader)
+            : await scanBytePrefix(fh, size, predicate.maxBytes, reader);
+      newest = await newestTs(fh, size, reader);
     } finally {
       await fh.close().catch(() => {});
     }
@@ -908,7 +974,7 @@ async function runOne(
         ...base,
         bytesBefore: size,
         bytesAfter: size,
-        span: buildSpan(predicate, now, size, scan.oldestKeptTs, newest, 0),
+        span: spanOf(size, scan, newest, 0),
         ...(measureOnly && scan.cut !== 0 ? { skipped: 'measure_only' as const } : {}),
         ...(scan.stoppedOnUnreadableTs ? { stoppedOnUnreadableTs: true as const } : {}),
       };
@@ -954,7 +1020,7 @@ async function runOne(
       bytesDropped: rewrote ? size - bytesAfter : 0,
       linesDropped: rewrote ? scan.linesDropped : 0,
       rewrote,
-      span: buildSpan(predicate, now, bytesAfter, scan.oldestKeptTs, newest, rewrote ? scan.linesDropped : 0),
+      span: spanOf(bytesAfter, scan, newest, rewrote ? scan.linesDropped : 0),
       ...(scan.stoppedOnUnreadableTs ? { stoppedOnUnreadableTs: true as const } : {}),
       ...(error !== undefined ? { error } : {}),
     };
