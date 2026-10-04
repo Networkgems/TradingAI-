@@ -255,6 +255,88 @@ describe('durable write-through + hydrate', () => {
     expect(raw.trim().split('\n')).toHaveLength(1); // file compacted
     expect(raw).toContain('long_call');
     expect(raw).not.toContain('long_put');
+
+    // TRA-5114 — the fold is no longer silent: the drop is surfaced on durability.
+    const d = summarizeSandboxStrategyJournal().durability;
+    expect(d.droppedOnHydrateLast).toBe(1);
+    expect(d.compactedLinesLast).toBe(1);
+    expect(d.lastCompactionError).toBeNull();
+  });
+
+  // ── TRA-5114 — droppedOnHydrate / compactedLines on the health payload ──────
+
+  it('TRA-5114: a no-drop hydrate reports a MEASURED zero, present in the payload', () => {
+    const fresh = recordFromContractResult('long_call', makeResult('call'), ET_DAY, NOW)!;
+    writeFileSync(sandboxStrategyLogPath(dir), JSON.stringify(fresh) + '\n', 'utf8');
+
+    hydrateSandboxStrategyJournalFromDisk(dir, NOW);
+    const d = summarizeSandboxStrategyJournal().durability;
+    expect(d.droppedOnHydrateLast).toBe(0); // measured zero, not null/absent
+    expect(d.droppedOnHydrateSinceBoot).toBe(0);
+    expect(d.compactedLinesLast).toBe(0); // hydrate ran, nothing removed
+    expect(d.lastCompactionError).toBeNull();
+    // Present on the wire (the route spreads the summary verbatim).
+    const wire = JSON.parse(JSON.stringify(summarizeSandboxStrategyJournal())).durability;
+    expect(wire.droppedOnHydrateLast).toBe(0);
+    expect(wire.compactedLinesLast).toBe(0);
+  });
+
+  it('TRA-5114: before any hydrate this boot the counters are null, never a fabricated 0', () => {
+    // clearSandboxStrategyJournal ran in beforeEach and no hydrate has run since.
+    const d = summarizeSandboxStrategyJournal().durability;
+    expect(d.droppedOnHydrateLast).toBeNull();
+    expect(d.droppedOnHydrateSinceBoot).toBeNull();
+    expect(d.compactedLinesLast).toBeNull();
+    // null survives serialization as null (absent ≠ 0, and null ≠ 0).
+    const wire = JSON.parse(JSON.stringify(summarizeSandboxStrategyJournal())).durability;
+    expect(wire).toHaveProperty('droppedOnHydrateLast', null);
+    expect(wire).toHaveProperty('droppedOnHydrateSinceBoot', null);
+    expect(wire).toHaveProperty('compactedLinesLast', null);
+  });
+
+  it('TRA-5114: droppedOnHydrateSinceBoot accumulates across re-hydrates; Last is per-hydrate', () => {
+    const fresh = recordFromContractResult('long_call', makeResult('call'), ET_DAY, NOW)!;
+    const staleRow = (daysAgo: number): SandboxStrategyRecord => ({
+      ...recordFromContractResult('long_put', makeResult('put'), '2026-01-01', NOW)!,
+      ts: NOW - daysAgo * 24 * 60 * 60 * 1000,
+    });
+
+    // 1st hydrate: two stale rows dropped.
+    writeFileSync(
+      sandboxStrategyLogPath(dir),
+      [staleRow(90), staleRow(80), fresh].map((r) => JSON.stringify(r)).join('\n') + '\n',
+      'utf8',
+    );
+    hydrateSandboxStrategyJournalFromDisk(dir, NOW);
+    let d = summarizeSandboxStrategyJournal().durability;
+    expect(d.droppedOnHydrateLast).toBe(2);
+    expect(d.droppedOnHydrateSinceBoot).toBe(2);
+    expect(d.compactedLinesLast).toBe(2);
+
+    // 2nd hydrate over the compacted file plus one newly stale row.
+    writeFileSync(
+      sandboxStrategyLogPath(dir),
+      [staleRow(70), fresh].map((r) => JSON.stringify(r)).join('\n') + '\n',
+      'utf8',
+    );
+    hydrateSandboxStrategyJournalFromDisk(dir, NOW);
+    d = summarizeSandboxStrategyJournal().durability;
+    expect(d.droppedOnHydrateLast).toBe(1); // per-hydrate: only this hydrate's drop
+    expect(d.droppedOnHydrateSinceBoot).toBe(3); // since-boot: 2 + 1
+    expect(d.compactedLinesLast).toBe(1);
+  });
+
+  it('TRA-5114: a torn line compacts away without counting as a retention drop', () => {
+    const rec = recordFromContractResult('long_call', makeResult('call'), ET_DAY, NOW)!;
+    writeFileSync(
+      sandboxStrategyLogPath(dir),
+      JSON.stringify(rec) + '\n' + '{"ts":123,"strat', // torn
+      'utf8',
+    );
+    hydrateSandboxStrategyJournalFromDisk(dir, NOW);
+    const d = summarizeSandboxStrategyJournal().durability;
+    expect(d.droppedOnHydrateLast).toBe(0); // the torn line is not a retention drop
+    expect(d.compactedLinesLast).toBe(1); // but the compaction did remove it
   });
 
   it('tolerates a torn trailing line without aborting the hydrate', () => {

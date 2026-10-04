@@ -311,6 +311,16 @@ const records: SandboxStrategyRecord[] = [];
 let appendErrors = 0;
 let lastAppendError: string | null = null;
 let hydratedRecords = 0;
+// TRA-5114 — the 60-day fold was SILENT: hydrate computed its drop count only to decide
+// whether to compact, and `durability.appendErrors: 0` read green while records were
+// discarded (it counts APPEND errors, not hydrate drops). A suppression must ship a
+// counter. All of these are `null` until a hydrate has run this boot: an unreadable
+// counter is serialized as null, never coerced to 0 — a modelled zero and a measured
+// zero must not be the same number (TRA-5011).
+let droppedOnHydrateLast: number | null = null;
+let droppedOnHydrateSinceBoot: number | null = null;
+let compactedLinesLast: number | null = null;
+let lastCompactionError: string | null = null;
 
 export function sandboxStrategyLogPath(dir: string): string {
   return join(dir, SANDBOX_STRATEGY_LOG_FILENAME);
@@ -333,6 +343,10 @@ export function clearSandboxStrategyJournal(): void {
   appendErrors = 0;
   lastAppendError = null;
   hydratedRecords = 0;
+  droppedOnHydrateLast = null;
+  droppedOnHydrateSinceBoot = null;
+  compactedLinesLast = null;
+  lastCompactionError = null;
 }
 
 function isValidRecord(rec: unknown): rec is SandboxStrategyRecord {
@@ -387,6 +401,9 @@ export function hydrateSandboxStrategyJournalFromDisk(
   dir: string,
   now: number = Date.now(),
 ): SandboxStrategyHydration {
+  // TRA-5114 — the since-boot sum survives the idempotent re-hydrate clear below
+  // (the test seam resets it; a re-hydrate must accumulate, not restart).
+  const droppedBeforeThisHydrate = droppedOnHydrateSinceBoot;
   clearSandboxStrategyJournal();
   dataDir = dir;
 
@@ -400,6 +417,7 @@ export function hydrateSandboxStrategyJournalFromDisk(
   const cutoff = now - RETAIN_MS;
   const kept: string[] = [];
   const strategies = new Set<string>();
+  let droppedByRetention = 0;
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
     if (trimmed === '') continue;
@@ -410,22 +428,33 @@ export function hydrateSandboxStrategyJournalFromDisk(
       continue; // torn/partial line
     }
     if (!isValidRecord(rec)) continue;
-    if (rec.ts < cutoff) continue;
+    if (rec.ts < cutoff) {
+      droppedByRetention += 1;
+      continue;
+    }
     records.push(rec);
     strategies.add(rec.strategy);
     kept.push(JSON.stringify(rec));
   }
   hydratedRecords = records.length;
+  droppedOnHydrateLast = droppedByRetention;
+  droppedOnHydrateSinceBoot = (droppedBeforeThisHydrate ?? 0) + droppedByRetention;
 
   const nonEmptyLines = raw.split('\n').filter((l) => l.trim() !== '').length;
+  compactedLinesLast = 0; // measured: this hydrate ran and (so far) removed nothing
+  lastCompactionError = null;
   if (kept.length < nonEmptyLines) {
     const path = sandboxStrategyLogPath(dir);
     try {
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, kept.length > 0 ? kept.join('\n') + '\n' : '', 'utf8');
+      compactedLinesLast = nonEmptyLines - kept.length;
     } catch (err) {
+      // The rewrite failed, so 0 lines actually left the file; the error string is
+      // what discriminates "nothing needed removing" from "removal failed".
+      lastCompactionError = err instanceof Error ? err.message : String(err);
       log.warn('sandbox strategy journal compaction failed', {
-        reason: err instanceof Error ? err.message : String(err),
+        reason: lastCompactionError,
       });
     }
   }
@@ -491,6 +520,31 @@ export interface SandboxStrategyJournalSummary {
     hydratedRecords: number;
     appendErrors: number;
     lastAppendError: string | null;
+    /**
+     * TRA-5114 — valid records discarded by the {@link RETAIN_MS} cutoff at the MOST
+     * RECENT hydrate (basis is in the name: per-hydrate, last one). `appendErrors`
+     * cannot see these — the 60-day fold was otherwise silent, inferable only from
+     * arithmetic (TRA-5047 watched `total` fall 24 → 22 across healthy fires).
+     * `null` ⇔ no hydrate has run this boot — unreadable is never 0.
+     */
+    droppedOnHydrateLast: number | null;
+    /**
+     * TRA-5114 — cumulative retention drops across every hydrate SINCE PROCESS BOOT
+     * (re-hydrates accumulate). `null` ⇔ no hydrate has run this boot.
+     */
+    droppedOnHydrateSinceBoot: number | null;
+    /**
+     * TRA-5114 — lines actually removed from the journal file by the last hydrate's
+     * compaction rewrite. A superset counter: torn/invalid lines compact away too, so
+     * this can exceed `droppedOnHydrateLast`. A measured `0` = the last hydrate ran
+     * and removed nothing; `null` ⇔ no hydrate has run this boot. When the rewrite
+     * itself fails, this stays `0` (nothing left the file) and
+     * `lastCompactionError` carries the reason — the failed rewrite must not read
+     * identically to "nothing needed removing".
+     */
+    compactedLinesLast: number | null;
+    /** TRA-5114 — why the last compaction rewrite failed; `null` = it did not. */
+    lastCompactionError: string | null;
   };
   caller: SandboxStrategyCallerLiveness;
 }
@@ -822,6 +876,10 @@ export function summarizeSandboxStrategyJournal(): SandboxStrategyJournalSummary
       hydratedRecords,
       appendErrors,
       lastAppendError,
+      droppedOnHydrateLast,
+      droppedOnHydrateSinceBoot,
+      compactedLinesLast,
+      lastCompactionError,
     },
     // TRA-2481 — the ONLY field on this payload that can go false when the external
     // caller stops. Everything above it stays clean at zero requests.
