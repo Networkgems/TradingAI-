@@ -45,6 +45,13 @@
  *   `409 {"error":"Issue run ownership conflict"}` -- 6 attempts, 6 409s, run
  *   by hand by the CFO across all six of their rows.
  *
+ *   (409 provenance corrected on TRA-5088, 2026-10-04: that shape is the wire
+ *   response as recorded -- kept verbatim as a fixture below -- but it does
+ *   not exist in today's deployed routes/issues.js; the standing guard there
+ *   is the 403 `issue_write_assignee_run_lock`, which fires only when
+ *   `assigneeAgentId !== actorAgentId` AND `status === "in_progress"`. The
+ *   RESOLVE verb below mints neither.)
+ *
  * That 409 is NOT the authorization boundary, and `isBoundary403` never matched
  * it, so a row this script had ALREADY REPAIRED fell through to `WRITE_FAILED`
  * and coloured the fire exit 2 FAILED. The order that was documented as
@@ -451,7 +458,8 @@ export function gradeWriteBody(step, body, { klass = null } = {}) {
       'writes `assigneeAgentId`. That step is BANNED (TRA-4041): the status PATCH spawns a run that takes the ' +
         'issue checkout lock, so this write returns `409 Issue run ownership conflict` -- 6/6, measured ' +
         '2026-08-26 -- on a row the status PATCH had ALREADY repaired. It is unexecutable in either order and it ' +
-        'was never load-bearing: the status write alone clears the strand. The re-home is the platform\'s.',
+        'was never load-bearing: the status write alone clears the strand. The re-home travels inside the ' +
+        'RESOLVE verb (TRA-5112), never on this PATCH surface.',
     );
   }
 

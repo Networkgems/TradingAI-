@@ -168,6 +168,19 @@
  *   read gets NO printed command (the drain's PATCH fallback owns that
  *   corner). The drain (`drain-blocked-empty.mjs`) sends this same verb.
  *
+ *   ⚠ 409 PROVENANCE CORRECTED (TRA-5088, graded against the deployed bytes
+ *   of `@paperclipai/server/dist/routes/issues.js`, 2026-10-03): the
+ *   `409 {"error":"Issue run ownership conflict"}` shape above is the wire
+ *   response as RECORDED 6/6 on 2026-08-26 (the drain keeps it verbatim as a
+ *   fixture), but no such string exists in today's deployed routes/issues.js.
+ *   The guard that IS in the bytes is
+ *   `denyIssueWrite(..., "issue_write_assignee_run_lock")` — a 403, and it
+ *   fires only when `issue.assigneeAgentId !== actorAgentId` AND
+ *   `issue.status === "in_progress"`: a CONSEQUENCE of having already
+ *   reassigned, never a property of the row. Do not hunt the current server
+ *   source for a 409/conflict guard — it is not there, and the resolve verb
+ *   mints neither shape.
+ *
  * ⛔ THE CAUSE IS A BRANCH, NOT A SENTENCE (TRA-2396). Two different writers
  * produce `blocked` + empty, and they need OPPOSITE repairs:
  *
@@ -888,10 +901,14 @@ export function deriveRestoreTarget({ item, blockers, pendingInteractions }) {
  *
  * ⛔ There is NO assignee write (TRA-4041). `assigneeAgentId` is still returned
  * here — it is a READ off the payload and the report names it — but it is not a
- * step. The status PATCH spawns a run that takes the issue checkout lock, so
- * every subsequent PATCH on that row returns `409 Issue run ownership conflict`
- * (measured 6/6). Step 1 alone clears the strand; step 2 was unexecutable and
- * unnecessary.
+ * step. The status PATCH spawns a run that takes the issue checkout lock, and
+ * the follow-up PATCH died on every row (6/6, recorded as `409 Issue run
+ * ownership conflict` on 2026-08-26 — a shape ABSENT from today's deployed
+ * routes/issues.js, whose standing guard is the 403
+ * `issue_write_assignee_run_lock`, firing only post-reassignment on an
+ * `in_progress` row; TRA-5088). Step 1 alone clears the strand; step 2 was
+ * unexecutable and unnecessary — and the assignee hand-back now travels inside
+ * the RESOLVE verb (TRA-5112), never as a PATCH step.
  */
 /**
  * Is this row a routine spawn whose non-terminal rest is SUPPRESSING its own
@@ -1556,6 +1573,11 @@ export function renderReport(result) {
               'there keeps its own routine off. This is the drain\'s disposition for the class, printed here so the ' +
               'command and the block below cannot disagree.',
           );
+          L.push(
+            '       `done` deliberately does NOT hand back: the handler computes handBackAgentId only for the ' +
+              '(`restored`,`todo`) pair, so no assignee write happens and none is wanted — a closed leaf needs ' +
+              'no queue (TRA-5088).',
+          );
           // TRA-4817 — a `done` restore CITES its discharge evidence; it never
           // asserts "already terminal" off a payload whose previousStatus says
           // the opposite (measured: `in_progress` + completedAt null on the row
@@ -1600,13 +1622,21 @@ export function renderReport(result) {
             'ONE transaction and mints no run-lock conflict (field: 8/8 2026-10-03, CFO 14/14 TRA-5107, CTO ' +
             '16/16 TRA-5103).',
         );
-        L.push(
-          `       VERIFY on \`assigneeAgentId\` reading returnOwnerAgentId \`${rep.assigneeAgentId}\` again (activity ` +
-            '`issue.recovery_action_resolved`, recorded outcome `handed_back`) — never on `activeRecoveryAction ' +
-            '== null` alone, which reads identically for never-stranded, recovered, and cleared-but-still-dead. ' +
-            `The status word is NOT the predicate either: on a row a run picks up at once it reads back ` +
-            '`in_progress` and that is still a clean drain (TRA-3758).',
-        );
+        if (repStatus === 'done') {
+          L.push(
+            '       VERIFY on `status` reading `done` with `activeRecoveryAction == null` — NOT on ' +
+              '`assigneeAgentId` changing: `done` hands nothing back, so the owner field staying put is the ' +
+              'correct outcome of this resolve, not a failed drain (TRA-5088).',
+          );
+        } else {
+          L.push(
+            `       VERIFY on \`assigneeAgentId\` reading returnOwnerAgentId \`${rep.assigneeAgentId}\` again (activity ` +
+              '`issue.recovery_action_resolved`, recorded outcome `handed_back`) — never on `activeRecoveryAction ' +
+              '== null` alone, which reads identically for never-stranded, recovered, and cleared-but-still-dead. ' +
+              `The status word is NOT the predicate either: on a row a run picks up at once it reads back ` +
+              '`in_progress` and that is still a clean drain (TRA-3758).',
+          );
+        }
         L.push(
           `       \`sourceIssueStatus\` is the CLASS constant (\`todo\` durable / \`done\` suppressing leaf), ` +
             'hard-coded — never `evidence.previousStatus`, which reads `in_progress` on cascade strands by ' +
@@ -3083,7 +3113,9 @@ async function rollupMaskControl() {
  * through the issue API — permanent; 112/176 rows in the TRA-3479 census).
  *
  * `{"assigneeAgentId":"<id>"}` was the second sanctioned verb until 2026-08-26
- * and stays BANNED (its printed recipe 409'd 6/6 on the run lock, TRA-4041).
+ * and stays BANNED (its printed recipe died 6/6 as recorded, TRA-4041; today's
+ * deployed guard on that surface is the 403 `issue_write_assignee_run_lock`,
+ * not a 409 — TRA-5088).
  * On the sanctioned RESOLVE line: `outcome` is pinned to `restored` (the other
  * outcomes are adjudications a report must not hand out copy-pasteable),
  * `sourceIssueStatus` is pinned to the two class constants — `in_progress`,
@@ -3236,6 +3268,11 @@ async function selftest() {
         f.discharge && f.discharge.state === 'NONE' &&
         /NO discharge evidence found in-thread/.test(out) &&
         /rests on the CLASS RULE alone/.test(out) &&
+        // TRA-5088 — the done arm SAYS it hands nothing back, and its VERIFY
+        // must not demand the assignee change that a no-hand-back resolve
+        // never makes (that predicate would fail every clean done-drain).
+        /deliberately does NOT hand back/.test(out) &&
+        /NOT on `assigneeAgentId` changing/.test(out) &&
         // and the report must never claim the target was read off the payload
         !/restore target and return owner were both READ/.test(out),
       detail: cmd[0] ? cmd[0].trim() : 'NO RESTORE-RESOLVE EMITTED',
