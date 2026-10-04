@@ -1530,6 +1530,10 @@ export function foldTradierRateLimitReading(
       minuteBucket: bucket,
       // Reset on a new minute rather than decaying: the field names a FIXED
       // minute, which is the window Tradier meters in.
+      // ⚠️ TRA-5067 — this line runs ONLY on the refusal path, so the STORED value
+      // freezes at the last refusal forever (measured: `1` for 95 minutes of
+      // quiet on bqb1 `104bc8ed`). Publication derives the live value at read
+      // time in `publishTradierRefusalByClass`; never surface this field raw.
       refusalsThisMinute: prior && prior.minuteBucket === bucket ? prior.refusalsThisMinute + 1 : 1,
     });
     state.recentRefusals.push({
@@ -1558,6 +1562,51 @@ export function foldTradierRateLimitReading(
     pruneMinuteMap(state.meteredMinuteHighWater, ACCOUNT_MINUTE_HISTORY);
     pruneMinuteMap(state.meteredMinuteReadings, ACCOUNT_MINUTE_HISTORY);
   }
+}
+
+/**
+ * TRA-5067 — the published (read-time) shape of a per-class refusal summary.
+ *
+ * The STORED `TradierClassRefusalState` is written only on the refusal path, so
+ * its `refusalsThisMinute` freezes at the last refusal's value and cannot fall —
+ * measured on bqb1 `104bc8ed` it read `1` for 95 minutes after the last refusal,
+ * beside an equally frozen `minuteBucket`. "One refusal in the current minute"
+ * (a mild storm) and "quiet for an hour and a half" (healthy) rendered
+ * identically, and the two have different remedies (TRA-4919). So the published
+ * copy derives the minute fields at read time:
+ *   • `refusalsThisMinute` is 0 whenever the stored bucket is not the current one;
+ *   • `minuteBucketAgeMinutes` makes the staleness itself readable, so no reader
+ *     ever has to recompute `floor(now/60000)` to know whether `minuteBucket` is
+ *     live.
+ * `refusalsSinceBoot` and the `lastRefusal*` fields pass through untouched — they
+ * are since-boot / last-event facts and correct as stored. (`headerlessResponsesByClass`
+ * was audited in the same pass: it is a since-boot monotone count per class, not a
+ * `*ThisMinute`, so it has no decay to miss.)
+ */
+export interface PublishedTradierClassRefusalState extends TradierClassRefusalState {
+  /** Whole fixed minutes between `minuteBucket` and now. 0 = the bucket is
+   *  current and `refusalsThisMinute` is a live count; ≥1 = the minute rolled
+   *  over with no refusal and `refusalsThisMinute` was derived to 0. */
+  minuteBucketAgeMinutes: number;
+}
+
+/** TRA-5067 — derive the published refusal map from stored state at `nowMs`.
+ *  Pure, so both arms (live minute / rolled-over minute) are unit-testable. */
+export function publishTradierRefusalByClass(
+  state: TradierMeterState,
+  nowMs: number,
+  windowMs: number = BAR_PULL_RATE_WINDOW_MS,
+): Record<string, PublishedTradierClassRefusalState> {
+  const currentBucket = Math.floor(nowMs / windowMs);
+  const out: Record<string, PublishedTradierClassRefusalState> = {};
+  for (const [cls, r] of state.refusalByClass) {
+    out[cls] = {
+      ...r,
+      refusalsThisMinute: r.minuteBucket === currentBucket ? r.refusalsThisMinute : 0,
+      minuteBucketAgeMinutes: currentBucket - r.minuteBucket,
+    };
+  }
+  return out;
 }
 
 const tradierMeter = createTradierMeterState();
@@ -1596,7 +1645,9 @@ export function getTradierUpstreamRateLimitState(): {
   /** TRA-4919 — cap on the ring, so a reader can tell a quiet box from a truncated
    *  one rather than inheriting the constant. */
   recentRefusalsCap: number;
-  refusalByClass: Record<string, TradierClassRefusalState>;
+  /** TRA-5067 — DERIVED at read time: `refusalsThisMinute` is zeroed once the
+   *  minute rolls over, and `minuteBucketAgeMinutes` names the staleness. */
+  refusalByClass: Record<string, PublishedTradierClassRefusalState>;
   headerlessResponsesByClass: Record<string, number>;
   /** Distinct non-null `allowed` values across buckets. >1 ⇒ separately metered. */
   distinctAllowedValues: readonly number[];
@@ -1642,8 +1693,9 @@ export function getTradierUpstreamRateLimitState(): {
         : null,
     };
   }
-  const refusalByClass: Record<string, TradierClassRefusalState> = {};
-  for (const [cls, r] of state.refusalByClass) refusalByClass[cls] = { ...r };
+  // TRA-5067 — the stored `refusalsThisMinute` freezes at the last refusal; the
+  // published copy must derive it against NOW or quiet reads as a standing storm.
+  const refusalByClass = publishTradierRefusalByClass(state, now);
   const headerlessResponsesByClass: Record<string, number> = {};
   for (const [cls, n] of state.headerlessByClass) headerlessResponsesByClass[cls] = n;
   const distinct = [...new Set(allowedValues)].sort((a, b) => a - b);

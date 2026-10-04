@@ -30,6 +30,8 @@ import {
   // TRA-4919
   createTradierMeterState,
   foldTradierRateLimitReading,
+  // TRA-5067
+  publishTradierRefusalByClass,
   meteredAccountStats,
   METERED_AGREEMENT_MIN_MINUTES,
 } from './yahoo-feed.js';
@@ -961,6 +963,65 @@ describe('TRA-4919 — a refusal must ADD information, never destroy it', () => 
     expect(u.recentRefusalsCap).toBeGreaterThan(0);
     expect(u.responsesObserved).toBeGreaterThanOrEqual(0);
     expect(u.sawAnyResponse).toBe(u.responsesObserved > 0);
+  });
+});
+
+// ─── TRA-5067 ────────────────────────────────────────────────────────────────
+//
+// `refusalsThisMinute` is written only on the refusal path, so the STORED value
+// cannot fall: on bqb1 `104bc8ed` it read `1` for 95 minutes after the last
+// refusal, beside a `minuteBucket` frozen at the same instant. The published
+// copy derives the minute fields against NOW at serialisation time.
+describe('TRA-5067 — refusalsThisMinute decays at the serialisation boundary', () => {
+  const W = 60_000;
+  const headers = (map: Record<string, string>) => ({
+    get: (name: string) => map[name.toLowerCase()] ?? null,
+  });
+  const reading = (
+    map: Record<string, string>,
+    cls: 'quotes' | 'timesales' | 'history',
+    status: number,
+    atMs: number,
+    refusalReason: string | null = null,
+  ) => parseTradierRateLimitHeaders(headers(map), cls, status, atMs, refusalReason);
+
+  // AC1 — a read ≥2 minutes after the last refusal reports 0, sinceBoot unchanged.
+  it('reports 0 once the minute rolls over with no refusal — refusalsSinceBoot untouched', () => {
+    const s = createTradierMeterState();
+    foldTradierRateLimitReading(
+      s, reading({}, 'timesales', 400, 10 * W + 5_000, 'Invalid parameter, ^TNX: symbol not found.'), W,
+    );
+    // The stored copy is frozen at the write — that is the measured defect, kept
+    // here as the baseline the derivation exists to correct.
+    expect(s.refusalByClass.get('timesales')?.refusalsThisMinute).toBe(1);
+
+    const pub = publishTradierRefusalByClass(s, 12 * W + 5_000, W);
+    expect(pub['timesales']?.refusalsThisMinute).toBe(0);          // decayed
+    expect(pub['timesales']?.refusalsSinceBoot).toBe(1);           // untouched
+    expect(pub['timesales']?.lastRefusalAtMs).toBe(10 * W + 5_000);
+    // …and the staleness is self-evident, not something a reader must re-derive.
+    expect(pub['timesales']?.minuteBucketAgeMinutes).toBe(2);
+  });
+
+  // AC2 — the negative control: the fix must not become "always report 0".
+  it('a read INSIDE a minute that carried refusals still reports the true count', () => {
+    const s = createTradierMeterState();
+    foldTradierRateLimitReading(s, reading({}, 'timesales', 400, 10 * W + 1_000, 'symbol not found'), W);
+    foldTradierRateLimitReading(s, reading({}, 'timesales', 400, 10 * W + 2_000, 'symbol not found'), W);
+    const pub = publishTradierRefusalByClass(s, 10 * W + 30_000, W);
+    expect(pub['timesales']?.refusalsThisMinute).toBe(2);
+    expect(pub['timesales']?.minuteBucketAgeMinutes).toBe(0);
+  });
+
+  it('derives per class independently — a quiet class decays while a storming one counts', () => {
+    const s = createTradierMeterState();
+    foldTradierRateLimitReading(s, reading({}, 'timesales', 400, 10 * W, 'symbol not found'), W);
+    foldTradierRateLimitReading(s, reading({}, 'quotes', 429, 12 * W + 1_000, 'rate limited'), W);
+    const pub = publishTradierRefusalByClass(s, 12 * W + 30_000, W);
+    expect(pub['timesales']?.refusalsThisMinute).toBe(0);   // 2 minutes quiet
+    expect(pub['timesales']?.minuteBucketAgeMinutes).toBe(2);
+    expect(pub['quotes']?.refusalsThisMinute).toBe(1);      // live this minute
+    expect(pub['quotes']?.minuteBucketAgeMinutes).toBe(0);
   });
 });
 
