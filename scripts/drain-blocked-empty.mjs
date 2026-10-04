@@ -59,6 +59,50 @@
  * `returnOwnerAgentId` is the platform's to make. This file READS that id, names
  * it in the audit comment, and does not write it.
  *
+ * THE VERB (TRA-5112, 2026-10-04) — RESOLVE wherever the action is live
+ * ---------------------------------------------------------------------
+ * The combined status PATCH above clears the strand (6/6) but it LAUNDERS the
+ * recovery action (TRA-3196): the action is left unresolved, returnOwnerAgentId
+ * is not writable through the issue API, and the owner hop is never reversed —
+ * 112 of 176 rows in the TRA-3479 census lost the field permanently. The
+ * platform's own hand-back verb does the whole repair in ONE transaction
+ * (schema re-read from /api/openapi.json 2026-10-03 and again 2026-10-04):
+ *
+ *   POST /api/issues/{id}/recovery-actions/resolve
+ *   { actionId, outcome: "restored", sourceIssueStatus: <class status>, resolutionNote }
+ *
+ * It restores the status AND assigneeAgentId (back to returnOwnerAgentId),
+ * resolves the action (recorded outcome `handed_back`, activity
+ * `issue.recovery_action_resolved`), wakes the owner, and mints no
+ * checkout-lock conflict — the TRA-4041 409 is a status-PATCH artifact. Field
+ * evidence: 8/8 clean 2026-10-03; CFO 14/14 on TRA-5107; CTO 16/16 at
+ * 2026-10-04T13:34:55Z (run 8f36b61c, the TRA-5103 sweep fire). Same
+ * 1-write-per-row cost under THE BUDGET below.
+ *
+ * So this drain sends the RESOLVE body whenever the row's active recovery
+ * action carries a readable `id` — which is every DRAIN-eligible row measured
+ * so far, since eligibility is read off that same action. The combined PATCH
+ * survives ONLY as the fallback for a row whose action id could not be read
+ * (no resolve can be pinned to it); the audit comment on that path names the
+ * reason, and the "re-home is the platform's" rule above still holds there.
+ * On the resolve path the platform makes the re-home inside the verb we call.
+ *
+ * ⛔ `sourceIssueStatus` is the CLASS CONSTANT — `todo` for a DURABLE_STRAND,
+ * `done` for a SUPPRESSING_LEAF (TRA-4063) — hard-coded, NEVER derived from
+ * `evidence.previousStatus`: that field reads `in_progress` on cascade strands
+ * by selection artifact and is never the restore target (TRA-4818). The wire
+ * gate (`gradeWriteBody`, step `resolve`) refuses every other value.
+ *
+ * PLATFORM-OWNED, CARRIED AS SIGNAL ONLY (TRA-5112, from TRA-5109): (1) a
+ * zero-token `acpx_turn_failed` death whose summary matches "hit your session
+ * limit" should grade retry-later at the stated reset, not strand-and-reassign;
+ * (2) 29 runs were dispatched into a known-exhausted session inside 21 minutes
+ * (2026-10-03T19:05–19:27Z, band #2 after TRA-5085) — a short circuit-breaker
+ * after N consecutive session-limit deaths turns 29 strands into ~2. Neither
+ * is implementable in this repo. This drain bounds strand LIFETIME only;
+ * nothing here prevents re-minting (7 of the CFO 14 re-stranded within hours
+ * of a verified correct restore).
+ *
  * THE BUDGET (TRA-4043, MEASURED 2026-08-26)
  * ------------------------------------------
  * A single heartbeat run may make at most 20 cross-issue writes; attempt 21
@@ -425,6 +469,38 @@ export function gradeWriteBody(step, body, { klass = null } = {}) {
     return { ok: true };
   }
 
+  // TRA-5112 — the resolve wire body: exactly {actionId, outcome,
+  // sourceIssueStatus, resolutionNote}, graded by COMPOSING the status and
+  // comment graders so the TRA-4063 class gate and the ASCII gate hold on this
+  // verb too. `sourceIssueStatus` goes through the SAME class rule as a status
+  // write — which is what makes TRA-4818 structural: `in_progress` (the value
+  // `evidence.previousStatus` actually carries on cascade strands) is refused
+  // at the wire, so the hard-coding cannot be quietly "improved" away.
+  if (step === 'resolve') {
+    const want = ['actionId', 'outcome', 'resolutionNote', 'sourceIssueStatus'];
+    if (keys.length !== 4 || want.some((k) => !keys.includes(k))) {
+      return bad(`expected exactly {"actionId","outcome","sourceIssueStatus","resolutionNote"} (TRA-5112), got {${keys.join(',')}}`);
+    }
+    if (typeof body.actionId !== 'string' || !body.actionId.trim()) {
+      return bad(
+        'carries no actionId. An un-pinned resolve asks the platform to guess which action is meant; a row ' +
+          'whose action id could not be read takes the combined-PATCH fallback instead, never a guessed resolve.',
+      );
+    }
+    if (body.outcome !== 'restored') {
+      return bad(
+        `outcome \`${body.outcome}\` is not sanctioned. Only \`restored\` hands the row back to its ` +
+          'returnOwnerAgentId; `false_positive`/`blocked`/`cancelled` are adjudications this unattended drain ' +
+          'has no authority to make.',
+      );
+    }
+    const c = gradeWriteBody('comment', { body: body.resolutionNote }, { klass });
+    if (!c.ok) return bad(c.why);
+    const s = gradeWriteBody('status', { status: body.sourceIssueStatus }, { klass });
+    if (!s.ok) return bad(s.why);
+    return { ok: true };
+  }
+
   if (step === 'status') {
     if (keys.length !== 1 || keys[0] !== 'status') return bad(`expected exactly {"status"}, got {${keys.join(',')}}`);
 
@@ -619,12 +695,36 @@ export function dischargeSentence(f, fold = (x) => x) {
  * `evidence.previousStatus`, agent ids) are folded at their interpolation
  * sites, same as the origin routine fields: they are the same shape of risk
  * as the title, just not yet the measured offender.
+ *
+ * TRA-5112 — `verb` names the wire this text rides on: `resolve` (the default
+ * path, POST /recovery-actions/resolve as resolutionNote) or `patch` (the
+ * fallback for a row whose action id could not be read, as the PATCH comment).
+ * The repair paragraph is verb-specific because the two verbs do DIFFERENT
+ * things to returnOwnerAgentId, and an audit trail that describes the wrong
+ * one is how TRA-3196 stayed invisible.
  */
-export function drainComment(f, runId, disp = null, origin = null) {
+export function drainComment(f, runId, disp = null, origin = null, verb = 'resolve') {
   const rep = f.repair;
   const d = disp || classifyDisposition(f);
   const fold = foldTracker();
   const withFoldNote = (body) => (fold.changed ? `${body}\n\n${FOLD_NOTE}` : body);
+  const repairLines = (status) =>
+    verb === 'resolve'
+      ? `Repair applied -- ONE write, the platform's own hand-back verb (TRA-5112):\n` +
+        `- POST /recovery-actions/resolve {actionId \`${fold(f.recoveryActionId || 'unknown')}\`, outcome \`restored\`, ` +
+        `sourceIssueStatus \`${status}\`}. ONE transaction: restores the status AND hands assigneeAgentId back to ` +
+        `\`${fold(rep.assigneeAgentId)}\` (returnOwnerAgentId), resolves the recovery action (recorded outcome ` +
+        `handed_back), and mints no checkout-lock conflict. The old combined status PATCH cleared the strand but ` +
+        `LAUNDERED the action (TRA-3196) -- left active/unresolved with the owner hop unreversed.\n` +
+        `- sourceIssueStatus is the CLASS constant, never \`evidence.previousStatus\` (which reads ` +
+        `\`${fold(rep.restoredFrom)}\` here, a selection artifact on cascade strands and never the restore ` +
+        `target, TRA-4818).\n`
+      : `Repair applied -- ONE write, the combined-PATCH FALLBACK (TRA-4041/TRA-4043): this row's active recovery ` +
+        `action carries NO readable id, so the TRA-5112 resolve verb could not be pinned to it and an un-pinned ` +
+        `resolve would be a guess. The status PATCH clears the strand but cannot reverse the owner hop; ` +
+        `returnOwnerAgentId \`${fold(rep.assigneeAgentId)}\` is READ and named here, not written -- the re-home ` +
+        `is the platform's.\n` +
+        `- PATCH status -> \`${status}\`.\n`;
   if (d.klass === ROW_CLASS.SUPPRESSING_LEAF) {
     return withFoldNote(
       `Automated strand drain (TRA-3541), SUPPRESSING LEAF branch (TRA-4041 / TRA-4063). This row was \`blocked\` ` +
@@ -636,17 +736,15 @@ export function drainComment(f, runId, disp = null, origin = null) {
       `(absent would NOT have counted), \`originKind\` \`${fold(f.originKind)}\`, pendingInteractions 0 (a KNOWN zero, ` +
       `not an unread route), \`evidence.previousStatus\` \`${fold(rep.restoredFrom)}\`, \`returnOwnerAgentId\` ` +
       `\`${fold(rep.assigneeAgentId)}\`.\n\n` +
-      `Repair applied -- ONE write (TRA-4041):\n` +
-      `- PATCH status -> \`done\`. THIS IS THE \`done\` BRANCH, taken deliberately and taken only for this class. ` +
-      `The generic restore for this cohort is \`todo\`, and \`todo\` here would be the defect: it is non-terminal, ` +
-      `so the origin routine would keep treating this fire as live and would never run again.\n` +
+      repairLines('done') +
+      `- THIS IS THE \`done\` BRANCH, taken deliberately and taken only for this class. The generic restore for ` +
+      `this cohort is \`todo\`, and \`todo\` here would be the defect: it is non-terminal, so the origin routine ` +
+      `would keep treating this fire as live and would never run again.\n` +
       `- ${dischargeSentence(f, fold)}\n` +
-      `- \`blockedByIssueIds\` deliberately NOT re-sent.\n` +
-      `- assigneeAgentId deliberately NOT written. The recovery payload names \`${fold(rep.assigneeAgentId)}\` as the ` +
-      `returnOwnerAgentId; the status write above spawns a run that takes this issue's checkout lock, so any ` +
-      `further PATCH returns 409 Issue run ownership conflict (6/6, measured). The re-home is the platform's.\n\n` +
+      `- \`blockedByIssueIds\` deliberately NOT re-sent.\n\n` +
       `If this classification is wrong, the recoverable direction is to reopen this row -- not to re-drain it. ` +
-      `This comment rides in the SAME PATCH as the status write (TRA-4043): one atomic cross-issue write, so a budget cut-off can never leave this row half-written.\n\n` +
+      `This comment rides IN the one write (PATCH comment or resolve resolutionNote -- TRA-4043/TRA-5112): one ` +
+      `atomic cross-issue write, so a budget cut-off can never leave this row half-written.\n\n` +
       `Drained by scripts/drain-blocked-empty.mjs${runId ? ` (run ${runId})` : ''}.`
     );
   }
@@ -658,17 +756,13 @@ export function drainComment(f, runId, disp = null, origin = null) {
     `Read live immediately before this write: status \`blocked\`, \`blockedBy\` empty, pendingInteractions 0 ` +
     `(a KNOWN zero, not an unread route), \`evidence.previousStatus\` \`${fold(rep.restoredFrom)}\`, ` +
     `\`returnOwnerAgentId\` \`${fold(rep.assigneeAgentId)}\`.\n\n` +
-    `Repair applied -- ONE write (TRA-4041):\n` +
-    `- PATCH status -> \`todo\` (NOT \`done\`: \`todo\` is queue-visible and still counts as an unresolved ` +
-    `blocker upstream, so any parent stays correctly blocked and no unrun work is destroyed)\n` +
-    `- \`blockedByIssueIds\` deliberately NOT re-sent.\n` +
-    `- assigneeAgentId deliberately NOT written. The recovery payload names \`${fold(rep.assigneeAgentId)}\` as the ` +
-    `returnOwnerAgentId, and until 2026-08-26 this drain PATCHed it as a second step. That step cannot succeed: ` +
-    `the status write above spawns a run that takes this issue's checkout lock, so any further PATCH returns ` +
-    `409 Issue run ownership conflict (6/6, measured). It is also unnecessary -- the status write alone clears ` +
-    `the recovery action. If this row is homed on the wrong seat, that re-home is the platform's to make.\n\n` +
+    repairLines('todo') +
+    `- \`todo\`, NOT \`done\`: \`todo\` is queue-visible and still counts as an unresolved blocker upstream, so ` +
+    `any parent stays correctly blocked and no unrun work is destroyed.\n` +
+    `- \`blockedByIssueIds\` deliberately NOT re-sent.\n\n` +
     `No content judgement was made on the underlying work; the strand is cleared and the ticket is queue-visible ` +
-    `again. This comment rides in the SAME PATCH as the status write (TRA-4043): one atomic cross-issue write, so a budget cut-off can never leave this row half-written.\n\n` +
+    `again. This comment rides IN the one write (PATCH comment or resolve resolutionNote -- TRA-4043/TRA-5112): ` +
+    `one atomic cross-issue write, so a budget cut-off can never leave this row half-written.\n\n` +
     `Drained by scripts/drain-blocked-empty.mjs${runId ? ` (run ${runId})` : ''}.`
   );
 }
@@ -885,18 +979,31 @@ export async function drainRow(
     }
   }
 
-  // TRA-4043 — ONE write: the comment rides in the same PATCH as the status,
-  // so the row either drains whole or is untouched. It still mints a live
-  // status, spawns a run and takes the checkout lock (TRA-4041), so nothing
-  // may follow it.
-  const wireBody = { status: disp.status, comment: drainComment(f, runId, disp, origin) };
-  const graded = gradeWriteBody('drain', wireBody, { klass: disp.klass });
+  // TRA-5112 — the verb. A row whose active recovery action carries a readable
+  // id takes the platform's own hand-back verb: ONE transaction that restores
+  // status AND returnOwnerAgentId, resolves the action (outcome handed_back),
+  // and mints no checkout-lock conflict. The combined PATCH is the FALLBACK,
+  // kept only for a row whose action id could not be read — a resolve that is
+  // not pinned to an actionId is a guess, and this script does not guess.
+  //
+  // TRA-4043 still governs both: ONE write, the audit text riding inside it
+  // (resolutionNote on the resolve, comment on the PATCH), so the row either
+  // drains whole or is untouched.
+  const useResolve = typeof f.recoveryActionId === 'string' && !!f.recoveryActionId.trim();
+  const auditText = drainComment(f, runId, disp, origin, useResolve ? 'resolve' : 'patch');
+  const wireBody = useResolve
+    ? // sourceIssueStatus is the CLASS constant off `disp` — never
+      // `evidence.previousStatus` (TRA-4818); gradeWriteBody enforces it.
+      { actionId: f.recoveryActionId, outcome: 'restored', sourceIssueStatus: disp.status, resolutionNote: auditText }
+    : { status: disp.status, comment: auditText };
+  const stepName = useResolve ? 'resolve' : 'drain';
+  const graded = gradeWriteBody(stepName, wireBody, { klass: disp.klass });
   if (!graded.ok) {
     // Not a skip. The caller built a body this file does not sanction, which
     // is a code defect, and continuing would write it.
-    throw new Error(`REFUSED to send an unsanctioned drain body -- ${graded.why}`);
+    throw new Error(`REFUSED to send an unsanctioned ${stepName} body -- ${graded.why}`);
   }
-  steps.push({ step: 'drain', body: wireBody, sent: apply });
+  steps.push({ step: stepName, body: wireBody, sent: apply });
 
   if (apply) {
     let err = null;
@@ -908,7 +1015,8 @@ export async function drainRow(
       // The live 429 below is authoritative in both directions.
       if (budget) budget.spent += 1;
       try {
-        await transport.patchIssue(f.id, wireBody);
+        if (useResolve) await transport.resolveRecoveryAction(f.id, wireBody);
+        else await transport.patchIssue(f.id, wireBody);
         err = null;
         break;
       } catch (e) {
@@ -1047,6 +1155,22 @@ export async function drainRow(
   } else if (Array.isArray(after.blockedBy) && after.blockedBy.length !== 0) {
     problems.push(`blockedBy is no longer empty (${after.blockedBy.length} entr(ies)) -- this row was re-blocked`);
   }
+  // TRA-5112 — on the resolve path the hand-back IS part of the repair, so it
+  // is part of the verify: a resolve whose 2xx did not move assigneeAgentId
+  // back to returnOwnerAgentId re-created the TRA-3196 laundering shape with a
+  // cleaner-looking tape. PATCH-fallback rows are exempt — that verb never
+  // writes the assignee (TRA-4041) and asserting it would fail every genuinely
+  // drained fallback row.
+  if (useResolve && rep.assigneeAgentId) {
+    if (!Object.prototype.hasOwnProperty.call(after, 'assigneeAgentId')) {
+      problems.push("the re-read carries no 'assigneeAgentId' key, so the hand-back cannot be verified -- absent is not handed back");
+    } else if (after.assigneeAgentId !== rep.assigneeAgentId) {
+      problems.push(
+        `assigneeAgentId reads \`${after.assigneeAgentId}\`, expected returnOwnerAgentId \`${rep.assigneeAgentId}\` -- ` +
+          'the resolve returned ok but the hand-back did not land (the TRA-3196 shape this verb exists to prevent)',
+      );
+    }
+  }
   if (problems.length) return { outcome: OUTCOME.NOT_VERIFIED, steps, disp, why: problems.join('; ') };
 
   return {
@@ -1056,7 +1180,9 @@ export async function drainRow(
     why:
       `verified by re-read: status \`${after.status}\`, activeRecoveryAction null. Class ${disp.klass}, wrote ` +
       `\`${disp.status}\`${disp.klass === ROW_CLASS.SUPPRESSING_LEAF ? ' (the TRA-4063 `done` branch, taken)' : ''}. ` +
-      `Return owner ${rep.assigneeAgentId} was READ and NOT written (TRA-4041).`,
+      (useResolve
+        ? `Hand-back verified: assigneeAgentId reads returnOwnerAgentId ${rep.assigneeAgentId} (resolve verb, TRA-5112).`
+        : `Return owner ${rep.assigneeAgentId} was READ and NOT written (TRA-4041 PATCH fallback: no readable actionId).`),
   };
 }
 
@@ -1270,9 +1396,15 @@ export function renderDrain(out) {
     // the one row where that intent was wrong.
     const klass = r.disp ? r.disp.klass : 'UNKNOWN';
     const target = r.disp && r.disp.status ? r.disp.status : 'NOTHING';
+    // TRA-5112 — the verb is named per row: the two verbs do different things
+    // to returnOwnerAgentId, and a report that renders them alike re-hides the
+    // laundering split this retrofit exists to surface.
+    const viaResolve = r.steps.length > 0 && r.steps[0].step === 'resolve';
     L.push(
       `${mark} ${r.identifier}  -> ${target}  [${klass}]  ` +
-        `(return owner ${r.repair.assigneeAgentId} READ, not written -- TRA-4041)`,
+        (viaResolve
+          ? `(RESOLVE verb: hand-back to ${r.repair.assigneeAgentId} rides in the write -- TRA-5112)`
+          : `(return owner ${r.repair.assigneeAgentId} READ, not written -- TRA-4041 PATCH fallback)`),
     );
     L.push(`         ${r.why}`);
     for (const s of r.steps) L.push(`         ${s.sent ? 'sent' : 'plan'} ${s.step}  ${JSON.stringify(s.body).slice(0, 120)}`);
@@ -1357,6 +1489,12 @@ const strandRow = (
     // first run (TRA-4063). The omission has to be its own flag.
     omitOriginKind = false,
     omitBlocks = false,
+    // TRA-5112 — the action id is part of the DEFAULT shape (live payloads
+    // carry one; recovery action fc93ac5d on TRA-2102 is the measured
+    // reference), so the default fixture exercises the RESOLVE path. The
+    // PATCH fallback is pinned by controls that set this flag explicitly.
+    omitActionId = false,
+    actionId = 'ra-fixture',
   } = {},
 ) => ({
   id,
@@ -1370,6 +1508,7 @@ const strandRow = (
   originId,
   ...(omitBlocks ? {} : { blocks }),
   activeRecoveryAction: {
+    ...(omitActionId ? {} : { id: actionId }),
     kind,
     cause: 'issue_continuation_needed',
     status: 'active',
@@ -1428,6 +1567,10 @@ function fakeTransport(
     // 403, then attempts succeed. Infinity models a run that never gets
     // context.
     runContext403Times = 0,
+    // TRA-5112 — model a resolve the platform ACCEPTS without landing the
+    // hand-back: status moves, action clears, assignee stays. A 2xx-trusting
+    // drain reads that as repaired; the hand-back verify must not.
+    resolveSkipsHandback = false,
   } = {},
 ) {
   // TRA-4041 — ids whose checkout lock has been taken by the run the status
@@ -1539,12 +1682,54 @@ function fakeTransport(
       }
       return { ok: true };
     },
+    // TRA-5112 — the hand-back verb. Shares the failure injections with the
+    // PATCH (run-context 403, boundary 403, budget 429) so every fail-closed
+    // control exercises the verb the drain actually sends. Two deliberate
+    // differences, both field-measured: it takes NO checkout lock (the
+    // TRA-4041 409 is a status-PATCH artifact — 16/16 clean), and it moves
+    // assigneeAgentId back to returnOwnerAgentId in the same transaction.
+    resolveRecoveryAction: async (id, body) => {
+      stats.attempts += 1;
+      if (runContextLeft > 0) {
+        runContextLeft -= 1;
+        throw new Error(
+          'HTTP 403 on POST -- {"error":"Cross-issue influence requires an established run context",' +
+            '"details":{"code":"cross_issue_influence_run_context_required"}}',
+        );
+      }
+      if (on403 === 'status') {
+        throw new Error('HTTP 403 — {"error":"Issue is outside this actor\'s authorization boundary"}');
+      }
+      if (capAt != null && writes.length >= capAt) {
+        throw new Error(
+          'HTTP 429 on POST -- {"error":"This run has spent its cross-issue write budget (Per-run cross-issue ' +
+            `cap of ${capAt} writes)","details":{"code":"cross_issue_influence_cap_exceeded","cap":${capAt},` +
+            `"count":${writes.length + 1},"mode":"enforce"}}`,
+        );
+      }
+      writes.push({ verb: 'RESOLVE', id, body });
+      const row = byId.get(id);
+      written.add(id);
+      if (!lieOnPatch) {
+        const ra = row.activeRecoveryAction || null;
+        row.status = body.sourceIssueStatus;
+        if (!keepRecovery) row.activeRecoveryAction = null;
+        const back = ra ? ra.returnOwnerAgentId || ra.previousOwnerAgentId || null : null;
+        if (!resolveSkipsHandback && back) row.assigneeAgentId = back;
+      }
+      return { ok: true, outcome: 'handed_back' };
+    },
   };
 }
 
 const CONTROLS = [
   {
-    name: 'POSITIVE — an eligible strand drains in ONE combined write: PATCH {status,comment} (TRA-4043). No POST, no third key, no third write (TRA-4041)',
+    // TRA-5112 — THE control this retrofit exists for. A row with a readable
+    // actionId drains through the platform's hand-back verb, in ONE write,
+    // with the class-constant sourceIssueStatus and the audit text riding as
+    // resolutionNote. No PATCH touches the row, so nothing launders
+    // returnOwnerAgentId (TRA-3196).
+    name: 'POSITIVE (TRA-5112) — an eligible strand with a readable actionId drains in ONE RESOLVE write: {actionId,outcome:restored,sourceIssueStatus:todo,resolutionNote}. No PATCH, no laundering (TRA-3196)',
     build: () => fakeTransport([strandRow('s1', 'TRA-8001')]),
     apply: true,
     assert: (out, t) => {
@@ -1554,13 +1739,47 @@ const CONTROLS = [
         out.results.length === 1 &&
         out.results[0].outcome === OUTCOME.DRAINED &&
         t.writes.length === 1 &&
+        w.verb === 'RESOLVE' &&
+        Object.keys(w.body).sort().join(',') === 'actionId,outcome,resolutionNote,sourceIssueStatus' &&
+        w.body.actionId === 'ra-fixture' &&
+        w.body.outcome === 'restored' &&
+        w.body.sourceIssueStatus === 'todo' &&
+        typeof w.body.resolutionNote === 'string' &&
+        /TRA-3541/.test(w.body.resolutionNote) &&
+        /handed_back/.test(w.body.resolutionNote) &&
+        // TRA-4818 — previousStatus is in_progress on this fixture and must
+        // never reach the wire as the restore target
+        w.body.sourceIssueStatus !== 'in_progress' &&
+        // the banned keys, pinned as never sent on any write
+        t.writes.every((x) => !('assigneeAgentId' in x.body) && !('status' in x.body)) &&
+        // ...and the hand-back was verified, not assumed
+        /Hand-back verified/.test(out.results[0].why)
+      );
+    },
+    detail: (out, t) => `${t.writes.length} write(s): ${t.writes.map((w) => `${w.verb} ${Object.keys(w.body).join('+')}`).join(' -> ')}`,
+  },
+  {
+    // TRA-5112 — the fallback arm. A row whose action id could not be read
+    // cannot pin a resolve, so it keeps the combined PATCH — and the audit
+    // comment SAYS why, so a reader of the thread can tell the deliberate
+    // fallback from a silent regression to the laundering verb.
+    name: 'TRA-5112 PATCH FALLBACK — a strand whose action id is UNREADABLE keeps the combined PATCH {status,comment}, and the comment names the reason',
+    build: () => fakeTransport([strandRow('s1', 'TRA-8001', { omitActionId: true })]),
+    apply: true,
+    assert: (out, t) => {
+      const w = t.writes[0];
+      return (
+        out.verdict === 'DRAINED' &&
+        out.results[0].outcome === OUTCOME.DRAINED &&
+        t.writes.length === 1 &&
         w.verb === 'PATCH' &&
         Object.keys(w.body).sort().join(',') === 'comment,status' &&
         w.body.status === 'todo' &&
-        typeof w.body.comment === 'string' &&
+        /NO readable id/.test(w.body.comment) &&
+        /FALLBACK/.test(w.body.comment) &&
         /TRA-3541/.test(w.body.comment) &&
-        // the banned step, pinned as never sent
-        t.writes.every((x) => !('assigneeAgentId' in x.body))
+        t.writes.every((x) => x.verb !== 'RESOLVE' && !('assigneeAgentId' in x.body)) &&
+        /READ and NOT written/.test(out.results[0].why)
       );
     },
     detail: (out, t) => `${t.writes.length} write(s): ${t.writes.map((w) => `${w.verb} ${Object.keys(w.body).join('+')}`).join(' -> ')}`,
@@ -1579,7 +1798,7 @@ const CONTROLS = [
     detail: (out) => `verdict ${out.verdict}, 0 rows exercised`,
   },
   {
-    name: 'DRY RUN — the default sends NOTHING, and still names the one combined write it would make',
+    name: 'DRY RUN — the default sends NOTHING, and still names the one RESOLVE write it would make',
     build: () => fakeTransport([strandRow('s1', 'TRA-8001')]),
     apply: false,
     assert: (out, t) =>
@@ -1587,21 +1806,23 @@ const CONTROLS = [
       t.stats.attempts === 0 &&
       out.results.length === 1 &&
       out.results[0].outcome === OUTCOME.PLANNED &&
-      out.results[0].steps.map((s) => s.step).join(',') === 'drain' &&
+      out.results[0].steps.map((s) => s.step).join(',') === 'resolve' &&
       out.results[0].steps.every((s) => s.sent === false),
     detail: (out, t) => `${t.writes.length} write(s) sent; steps planned: ${out.results[0].steps.map((s) => s.step).join(',')}`,
   },
   {
-    name: 'NEVER done — the status body is `todo` even when evidence.previousStatus is `done`',
+    name: 'NEVER the read value (TRA-4818) — sourceIssueStatus is `todo` even when evidence.previousStatus is `done`',
     build: () => fakeTransport([strandRow('s1', 'TRA-8001', { previousStatus: 'done' })]),
     apply: true,
-    // `deriveRepair` restores from evidence but WRITES todo; this asserts the
-    // wire body, not the derivation, because the wire is what destroys work.
+    // `deriveRepair` restores from evidence but WRITES the class constant; this
+    // asserts the wire body, not the derivation, because the wire is what
+    // destroys work (or re-strands it, when previousStatus is in_progress).
     assert: (out, t) => {
-      const statusWrites = t.writes.filter((w) => w.body.status);
-      return statusWrites.length === 1 && statusWrites[0].body.status === 'todo' && out.results[0].repair.restoredFrom === 'done';
+      const sw = t.writes.filter((w) => w.body.sourceIssueStatus || w.body.status);
+      const target = sw[0] && (sw[0].body.sourceIssueStatus || sw[0].body.status);
+      return sw.length === 1 && target === 'todo' && out.results[0].repair.restoredFrom === 'done';
     },
-    detail: (out, t) => `restoredFrom=${out.results[0]?.repair?.restoredFrom}, wrote ${JSON.stringify(t.writes.find((w) => w.body.status)?.body)}`,
+    detail: (out, t) => `restoredFrom=${out.results[0]?.repair?.restoredFrom}, wrote ${JSON.stringify(t.writes[0]?.body)?.slice(0, 120)}`,
   },
   {
     name: 'NEVER a blocker key — gradeWriteBody REFUSES any body carrying blockedByIssueIds, on every step',
@@ -1700,11 +1921,12 @@ const CONTROLS = [
     },
   },
   {
-    name: 'The REAL comment bodies this script ships are ASCII-clean — BOTH templates (durable and suppressing leaf)',
+    name: 'The REAL comment bodies this script ships are ASCII-clean — BOTH templates (durable and suppressing leaf), BOTH verbs (resolve and PATCH fallback)',
     unit: () => {
       const base = {
         identifier: 'TRA-8001',
         recoveryKind: 'stranded_assigned_issue',
+        recoveryActionId: 'ra-unit',
         blocksIdentifiers: [],
         repair: { restoredFrom: 'in_progress', assigneeAgentId: AGENT_BACK, status: 'todo' },
       };
@@ -1723,17 +1945,32 @@ const CONTROLS = [
       const b = gradeWriteBody('comment', { body: named });
       const c = gradeWriteBody('comment', { body: drainComment(leaf, 'run-1', classifyDisposition(leaf), { unread: 'HTTP 500' }) });
       const d = gradeWriteBody('comment', { body: drainComment(leaf, 'run-1', classifyDisposition(leaf), null) });
+      // TRA-5112 — the PATCH-fallback variants of both templates stay ASCII
+      // too, and the fallback SAYS why it is not the resolve verb.
+      const fbDurable = drainComment(durable, 'run-1', classifyDisposition(durable), null, 'patch');
+      const fbLeaf = drainComment(leaf, 'run-1', classifyDisposition(leaf), null, 'patch');
+      const e = gradeWriteBody('comment', { body: fbDurable });
+      const g = gradeWriteBody('comment', { body: fbLeaf });
       return {
         ok:
-          a.ok && b.ok && c.ok && d.ok &&
+          a.ok && b.ok && c.ok && d.ok && e.ok && g.ok &&
           // the leaf body must SAY it took the done branch and NAME the routine
           /SUPPRESSING LEAF/.test(named) &&
           /`done` BRANCH, taken deliberately/.test(named) &&
           named.includes(ROUTINE_ID) &&
           /concurrencyPolicy `skip_if_active`/.test(named) &&
           // ...and must not claim `todo` anywhere as its own write
-          !/PATCH status -> `todo`/.test(named),
-        detail: a.ok && b.ok && c.ok && d.ok ? 'both templates ASCII; leaf names class, routine and policy' : (a.why || b.why || c.why || d.why),
+          !/PATCH status -> `todo`/.test(named) &&
+          // the resolve template names the verb and the hand-back
+          /recovery-actions\/resolve/.test(named) &&
+          /handed_back/.test(named) &&
+          // the fallback template names ITS reason and does not claim a resolve
+          /NO readable id/.test(fbDurable) &&
+          !/handed_back/.test(fbDurable),
+        detail:
+          a.ok && b.ok && c.ok && d.ok && e.ok && g.ok
+            ? 'both templates ASCII on both verbs; leaf names class, routine and policy; fallback names its reason'
+            : (a.why || b.why || c.why || d.why || e.why || g.why),
       };
     },
   },
@@ -1807,20 +2044,25 @@ const CONTROLS = [
     // whose suppressing leaf has a non-ASCII origin title plans BOTH writes
     // and refuses NOTHING. Before the fix this exact case exited WRITE_FAILED
     // ("REFUSED to send an unsanctioned comment body") without sending a byte.
-    name: 'TRA-4145 END TO END — dry run over a leaf whose origin title carries U+2014 plans the combined drain write with NO refusal',
+    name: 'TRA-4145 END TO END — dry run over a leaf whose origin title carries U+2014 plans the resolve write with NO refusal',
     build: () =>
       fakeTransport(
         [strandRow('s1', 'TRA-8001', { originKind: 'routine_execution', originId: ROUTINE_ID })],
         { routineTitle: 'TRA-2134 SANDBOX multi-strategy options runner (CSP/CC/long) — $0 notional' },
       ),
     apply: false,
-    assert: (out, t) =>
-      t.writes.length === 0 &&
-      out.results.length === 1 &&
-      out.results[0].outcome === OUTCOME.PLANNED &&
-      out.results[0].steps.map((s) => s.step).join(',') === 'drain' &&
-      /ASCII-FOLDED/.test(out.results[0].steps[0].body.comment) &&
-      !/—/.test(out.results[0].steps[0].body.comment),
+    assert: (out, t) => {
+      const note = out.results[0]?.steps[0]?.body.resolutionNote;
+      return (
+        t.writes.length === 0 &&
+        out.results.length === 1 &&
+        out.results[0].outcome === OUTCOME.PLANNED &&
+        out.results[0].steps.map((s) => s.step).join(',') === 'resolve' &&
+        typeof note === 'string' &&
+        /ASCII-FOLDED/.test(note) &&
+        !/—/.test(note)
+      );
+    },
     detail: (out) =>
       `outcome ${out.results[0]?.outcome}, steps ${out.results[0]?.steps.map((s) => s.step).join(',') || 'none'}: ${out.results[0]?.why || ''}`,
   },
@@ -1997,14 +2239,14 @@ const CONTROLS = [
     detail: (out, t) => `wrote to ${[...new Set(t.writes.map((w) => w.id))].join(',')}, notSelected ${out.plan.counts.notSelected}`,
   },
   {
-    name: 'TRA-4043 ATOMIC ROW — exactly ONE step, `drain`, carrying comment AND status together: no order exists for a budget cut-off to truncate',
+    name: 'TRA-4043 ATOMIC ROW — exactly ONE step, `resolve`, carrying the note AND the restore together: no order exists for a budget cut-off to truncate',
     build: () => fakeTransport([strandRow('s1', 'TRA-8001')]),
     apply: true,
     assert: (out, t) => {
       const steps = out.results[0].steps.map((s) => s.step);
       return (
         steps.length === 1 &&
-        steps[0] === 'drain' &&
+        steps[0] === 'resolve' &&
         !steps.includes('assignee') &&
         t.stats.attempts === 1 &&
         t.writes.length === 1
@@ -2040,8 +2282,8 @@ const CONTROLS = [
     // The negative control for the fake itself. Without a run lock in the
     // transport, the deleted third step would still pass every control here --
     // which is exactly how it survived from 2026-08-13 to 2026-08-26.
-    name: 'TRA-4041 THE FAKE HAS TEETH — the status PATCH takes the run lock, so a SECOND PATCH on that row 409s',
-    build: () => fakeTransport([strandRow('s1', 'TRA-8001')]),
+    name: 'TRA-4041 THE FAKE HAS TEETH — the status PATCH takes the run lock, so a SECOND PATCH on that row 409s (exercised on the PATCH-fallback arm; the resolve verb takes no lock, 16/16)',
+    build: () => fakeTransport([strandRow('s1', 'TRA-8001', { omitActionId: true })]),
     apply: true,
     assert: async (out, t) => {
       let second = 'NO THROW';
@@ -2055,8 +2297,8 @@ const CONTROLS = [
     detail: () => 'a post-drain PATCH on the drained row throws 409, as the live platform does',
   },
   {
-    name: 'TRA-4041 RUN_LOCKED — a 409 on the combined write is its OWN outcome: not FOREIGN (no twin arm helps), not FAILED',
-    build: () => fakeTransport([strandRow('s1', 'TRA-8001')], { on409: 'status' }),
+    name: 'TRA-4041 RUN_LOCKED — a 409 on the combined write is its OWN outcome: not FOREIGN (no twin arm helps), not FAILED (PATCH-fallback arm; the resolve verb mints no lock conflict)',
+    build: () => fakeTransport([strandRow('s1', 'TRA-8001', { omitActionId: true })], { on409: 'status' }),
     apply: true,
     assert: (out, t) =>
       out.results[0].outcome === OUTCOME.RUN_LOCKED &&
@@ -2088,15 +2330,18 @@ const CONTROLS = [
     apply: true,
     assert: (out, t) => {
       const rendered = renderDrain(out).join('\n');
-      const w = t.writes.find((x) => x.body.status);
+      const w = t.writes[0];
+      const target = w && (w.body.sourceIssueStatus || w.body.status);
+      const note = w && (w.body.resolutionNote || w.body.comment);
       return (
         out.verdict === 'DRAINED' &&
         out.results[0].outcome === OUTCOME.DRAINED &&
         out.results[0].disp.klass === ROW_CLASS.SUPPRESSING_LEAF &&
         t.writes.length === 1 &&
-        // the write itself -- `done`, and NOT `todo`, with the audit comment
-        // riding in the same body (TRA-4043)
-        w.body.status === 'done' &&
+        // the write itself -- `done`, and NOT `todo`, through the resolve verb
+        // (TRA-5112), with the audit text riding in the same body (TRA-4043)
+        w.verb === 'RESOLVE' &&
+        target === 'done' &&
         out.plan.counts.suppressingLeaf === 1 &&
         out.plan.counts.durableStrand === 0 &&
         // the class is NAMED in the report, with the routine it keeps alive
@@ -2104,12 +2349,12 @@ const CONTROLS = [
         /-> done {2}\[SUPPRESSING_LEAF\]/.test(rendered) &&
         rendered.includes(ROUTINE_ID) &&
         // ...and the ledger says which branch it took
-        /`done` BRANCH, taken deliberately/.test(w.body.comment) &&
-        /concurrencyPolicy `skip_if_active`/.test(w.body.comment)
+        /`done` BRANCH, taken deliberately/.test(note) &&
+        /concurrencyPolicy `skip_if_active`/.test(note)
       );
     },
     detail: (out, t) =>
-      `class ${out.results[0].disp.klass}, wrote ${JSON.stringify(t.writes.find((w) => w.body.status)?.body)}`,
+      `class ${out.results[0].disp.klass}, wrote ${JSON.stringify(t.writes[0]?.body)?.slice(0, 160)}`,
   },
   {
     // The negative direction, on the SAME transport. Without it, a classifier
@@ -2121,12 +2366,12 @@ const CONTROLS = [
     assert: (out, t) =>
       out.verdict === 'DRAINED' &&
       out.results[0].disp.klass === ROW_CLASS.DURABLE_STRAND &&
-      t.writes.find((w) => w.body.status).body.status === 'todo' &&
+      (t.writes[0].body.sourceIssueStatus || t.writes[0].body.status) === 'todo' &&
       out.plan.counts.durableStrand === 1 &&
       out.plan.counts.suppressingLeaf === 0 &&
-      t.writes.every((w) => w.body.status !== 'done'),
+      t.writes.every((w) => (w.body.sourceIssueStatus || w.body.status) !== 'done'),
     detail: (out, t) =>
-      `class ${out.results[0].disp.klass}, wrote ${JSON.stringify(t.writes.find((w) => w.body.status)?.body)}`,
+      `class ${out.results[0].disp.klass}, wrote ${JSON.stringify(t.writes[0]?.body)?.slice(0, 160)}`,
   },
   {
     // A spawn WITH a dependent. The discriminator is `blocks`, not
@@ -2143,7 +2388,7 @@ const CONTROLS = [
     apply: true,
     assert: (out, t) =>
       out.results[0].disp.klass === ROW_CLASS.DURABLE_STRAND &&
-      t.writes.find((w) => w.body.status).body.status === 'todo' &&
+      (t.writes[0].body.sourceIssueStatus || t.writes[0].body.status) === 'todo' &&
       /it GATES TRA-9001:todo/.test(out.results[0].disp.why),
     detail: (out) => out.results[0].disp.why.slice(0, 120),
   },
@@ -2223,15 +2468,16 @@ const CONTROLS = [
       ),
     apply: true,
     assert: (out, t) => {
-      const w = t.writes.find((x) => x.body.status);
+      const w = t.writes[0];
+      const note = w && (w.body.resolutionNote || w.body.comment);
       return (
         out.verdict === 'DRAINED' &&
-        w.body.status === 'done' &&
-        /UNREAD/.test(w.body.comment) &&
-        /HTTP 500/.test(w.body.comment)
+        (w.body.sourceIssueStatus || w.body.status) === 'done' &&
+        /UNREAD/.test(note) &&
+        /HTTP 500/.test(note)
       );
     },
-    detail: () => 'routine unread => comment says UNREAD, the `done` write is unchanged',
+    detail: () => 'routine unread => audit note says UNREAD, the `done` write is unchanged',
   },
   {
     // TRA-3758, live: the write does not always STORE `todo`.
@@ -2282,6 +2528,64 @@ const CONTROLS = [
           'blocker key, done-on-durable, no class, missing comment',
       };
     },
+  },
+  {
+    // TRA-5112 — the wire gate for the RESOLVE body. Composed of the same two
+    // graders, so the TRA-4063 class rule and the ASCII rule hold on the new
+    // verb — and TRA-4818 is structural: `in_progress`, the value
+    // `evidence.previousStatus` actually carries on cascade strands, is
+    // refused at the wire on BOTH classes.
+    name: 'TRA-5112 RESOLVE BODY GATE — exactly {actionId,outcome,sourceIssueStatus,resolutionNote}; outcome restored only; sourceIssueStatus is the CLASS constant, never previousStatus (TRA-4818)',
+    unit: () => {
+      const D = { klass: ROW_CLASS.DURABLE_STRAND };
+      const L = { klass: ROW_CLASS.SUPPRESSING_LEAF };
+      const base = { actionId: 'ra-1', outcome: 'restored', resolutionNote: 'drained -- see TRA-3541' };
+      const good = gradeWriteBody('resolve', { ...base, sourceIssueStatus: 'todo' }, D);
+      const leafGood = gradeWriteBody('resolve', { ...base, sourceIssueStatus: 'done' }, L);
+      const prevStatus = gradeWriteBody('resolve', { ...base, sourceIssueStatus: 'in_progress' }, D);
+      const leafTodo = gradeWriteBody('resolve', { ...base, sourceIssueStatus: 'todo' }, L);
+      const durDone = gradeWriteBody('resolve', { ...base, sourceIssueStatus: 'done' }, D);
+      const noClass = gradeWriteBody('resolve', { ...base, sourceIssueStatus: 'todo' });
+      const badOutcome = gradeWriteBody('resolve', { ...base, outcome: 'false_positive', sourceIssueStatus: 'todo' }, D);
+      const noAction = gradeWriteBody('resolve', { outcome: 'restored', sourceIssueStatus: 'todo', resolutionNote: 'x', actionId: '' }, D);
+      const smuggle = gradeWriteBody('resolve', { ...base, sourceIssueStatus: 'todo', assigneeAgentId: 'a' }, D);
+      const blocker = gradeWriteBody('resolve', { ...base, sourceIssueStatus: 'todo', blockedByIssueIds: [] }, D);
+      const ascii = gradeWriteBody('resolve', { ...base, resolutionNote: 'drained — em dash', sourceIssueStatus: 'todo' }, D);
+      return {
+        ok:
+          good.ok &&
+          leafGood.ok &&
+          !prevStatus.ok && /re-strands the leaf/.test(prevStatus.why) &&
+          !leafTodo.ok && /Only `done` is sanctioned for this class/.test(leafTodo.why) &&
+          !durDone.ok && /DESTROYS unrun work/.test(durDone.why) &&
+          !noClass.ok && /carries no row class/.test(noClass.why) &&
+          !badOutcome.ok && /no authority/.test(badOutcome.why) &&
+          !noAction.ok && /no actionId/.test(noAction.why) &&
+          !smuggle.ok && /409 Issue run ownership conflict|expected exactly/.test(smuggle.why) &&
+          !blocker.ok && /blocker write-key/.test(blocker.why) &&
+          !ascii.ok && /non-ASCII/.test(ascii.why),
+        detail:
+          'good todo (durable) ok, done (leaf) ok | refused: in_progress (TRA-4818), todo-on-leaf, ' +
+          'done-on-durable, no class, outcome false_positive, empty actionId, smuggled assignee, blocker key, ' +
+          'non-ASCII note',
+      };
+    },
+  },
+  {
+    // TRA-5112 — the hand-back is PART of the verify. A resolve the platform
+    // accepts without moving assigneeAgentId back to returnOwnerAgentId has
+    // re-created the TRA-3196 laundering shape behind a 2xx, and reporting it
+    // DRAINED would bury exactly the field this retrofit exists to preserve.
+    name: 'TRA-5112 HAND-BACK VERIFY — a resolve that clears the strand but does NOT restore assigneeAgentId is NOT_VERIFIED, never DRAINED',
+    build: () => fakeTransport([strandRow('s1', 'TRA-8001')], { resolveSkipsHandback: true }),
+    apply: true,
+    assert: (out) =>
+      out.verdict === 'FAILED' &&
+      DRAIN_EXIT[out.verdict] === 2 &&
+      out.results[0].outcome === OUTCOME.NOT_VERIFIED &&
+      /hand-back did not land/.test(out.results[0].why) &&
+      /TRA-3196/.test(out.results[0].why),
+    detail: (out) => out.results[0].why.slice(0, 130),
   },
   {
     // TRA-4043 Defect 1, the reservation. 25 drainable rows against a cap of
@@ -2401,6 +2705,9 @@ async function selftest() {
   // and nothing else, which is precisely the state this file was in the day it
   // planned `-> todo` for a live detector's spawn.
   const seenClasses = new Set();
+  // TRA-5112 — and the WIRE VERBS get one. A suite whose every write happens
+  // to go through one verb proves that verb; the other one rots silently.
+  const seenVerbs = new Set();
 
   for (const c of CONTROLS) {
     let ok = false;
@@ -2419,6 +2726,7 @@ async function selftest() {
           if (r.disp) seenClasses.add(r.disp.klass);
         }
         for (const r of out.plan ? out.plan.rows : []) if (r.disp) seenClasses.add(r.disp.klass);
+        for (const w of t.writes) seenVerbs.add(w.verb);
         ok = await c.assert(out, t);
         detail = c.detail ? c.detail(out, t) : '';
       }
@@ -2443,10 +2751,14 @@ async function selftest() {
     OUTCOME.RUN_CONTEXT_DEFERRED,
   ];
   const wantClasses = [ROW_CLASS.DURABLE_STRAND, ROW_CLASS.SUPPRESSING_LEAF, ROW_CLASS.UNCLASSIFIABLE];
+  // TRA-5112 — both wire verbs must land in some control: RESOLVE (the
+  // default) and PATCH (the no-readable-actionId fallback).
+  const wantVerbs = ['RESOLVE', 'PATCH'];
   for (const [label, want, seen] of [
     ['verdict', wantVerdicts, seenVerdicts],
     ['row outcome', wantOutcomes, seenOutcomes],
     ['row class', wantClasses, seenClasses],
+    ['wire verb', wantVerbs, seenVerbs],
   ]) {
     const missing = want.filter((v) => !seen.has(v));
     if (missing.length) failed += 1;
@@ -2456,7 +2768,7 @@ async function selftest() {
     );
   }
 
-  console.log(`\n${CONTROLS.length + 3 - failed}/${CONTROLS.length + 3} controls pass`);
+  console.log(`\n${CONTROLS.length + 4 - failed}/${CONTROLS.length + 4} controls pass`);
   return failed === 0 ? 0 : 1;
 }
 
@@ -2525,6 +2837,10 @@ export function liveTransport() {
     getInteractions: async (id) => unwrap(await get(`${BASE}/api/issues/${id}/interactions`), 'interactions'),
     postComment: async (id, body) => json('POST', `${BASE}/api/issues/${id}/comments`, body),
     patchIssue: async (id, body) => json('PATCH', `${BASE}/api/issues/${id}`, body),
+    // TRA-5112 — the hand-back verb (schema re-read from /api/openapi.json
+    // 2026-10-04: actionId uuid, outcome enum, sourceIssueStatus enum,
+    // resolutionNote nullable; outcome+sourceIssueStatus required).
+    resolveRecoveryAction: async (id, body) => json('POST', `${BASE}/api/issues/${id}/recovery-actions/resolve`, body),
   };
 }
 

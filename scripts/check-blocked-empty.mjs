@@ -146,6 +146,28 @@
  *   why the pass predicate is `activeRecoveryAction == null`, NOT `status ===
  *   'todo'` — the strand is the recovery action, not the status word.
  *
+ *   ⛔ AMENDED A THIRD TIME (TRA-5112, 2026-10-04): THE BARE STATUS PATCH IS
+ *   RETIRED AS THE PRINTED REPAIR. It clears the strand, but it LAUNDERS
+ *   returnOwnerAgentId (TRA-3196): the recovery action is left unresolved,
+ *   the owner hop is never reversed, and the field is not writable through
+ *   the issue API — 112/176 rows in the TRA-3479 census lost it permanently.
+ *   The sanctioned repair is now the platform's own hand-back verb, printed
+ *   on the `RESTORE-RESOLVE` sentinel line:
+ *
+ *        POST /api/issues/{id}/recovery-actions/resolve
+ *          {"actionId":"<read off the payload>","outcome":"restored",
+ *           "sourceIssueStatus":"todo"}        ← `done` only for a suppressing
+ *                                                leaf (TRA-4063); NEVER the raw
+ *                                                evidence.previousStatus (TRA-4818)
+ *
+ *   ONE transaction: status AND assignee restored, action resolved (recorded
+ *   outcome `handed_back`), owner woken, no run-lock conflict (the TRA-4041
+ *   409 was a PATCH artifact — CTO 16/16 clean at the TRA-5103 sweep fire).
+ *   Verify on `assigneeAgentId` returning to returnOwnerAgentId, never on
+ *   `activeRecoveryAction == null` alone. A row whose action id cannot be
+ *   read gets NO printed command (the drain's PATCH fallback owns that
+ *   corner). The drain (`drain-blocked-empty.mjs`) sends this same verb.
+ *
  * ⛔ THE CAUSE IS A BRANCH, NOT A SENTENCE (TRA-2396). Two different writers
  * produce `blocked` + empty, and they need OPPOSITE repairs:
  *
@@ -1507,8 +1529,26 @@ export function renderReport(result) {
         // routine off. Measured 2026-09-16: 11 of 30 findings carried the marker.
         // The emitter now mirrors the drain's ordering, so there is one disposition.
         const repStatus = suppressesOwnRoutine(f) ? 'done' : rep.status;
-        L.push('     repair KNOWN (stranded_assigned_issue) — ONE step, and one step only:');
-        L.push(`       RESTORE-PATCH 1/1  PATCH /api/issues/${f.id} {"status":"${repStatus}"}`);
+        // TRA-5112 — the printed repair is the platform's own hand-back verb,
+        // never the bare status PATCH. The PATCH clears the strand (6/6) but
+        // LAUNDERS returnOwnerAgentId (TRA-3196): the recovery action is left
+        // unresolved and the owner hop is not reversed — 112 of 176 rows in
+        // the TRA-3479 census lost the field permanently. The resolve verb
+        // restores status AND assigneeAgentId in ONE transaction (recorded
+        // outcome `handed_back`) and mints no checkout-lock conflict (the
+        // TRA-4041 409 was a PATCH artifact; CTO 16/16 clean, TRA-5103).
+        if (!f.recoveryActionId) {
+          L.push('     repair KNOWN but NOT printable as a command (TRA-5112): the active recovery action carries');
+          L.push('       no readable `id`, so the resolve verb cannot be pinned to it — and the bare status PATCH');
+          L.push('       is no longer printed here: it launders returnOwnerAgentId (TRA-3196) and was the foot-gun');
+          L.push('       verbatim. Run drain:strands; its combined-PATCH fallback carries the audit machinery for');
+          L.push(`       exactly this corner. Restore target \`${repStatus}\`; returnOwnerAgentId \`${rep.assigneeAgentId}\` (${back}).`);
+        } else {
+        L.push('     repair KNOWN (stranded_assigned_issue) — ONE step, the RESOLVE verb, and one step only (TRA-5112):');
+        L.push(
+          `       RESTORE-RESOLVE 1/1  POST /api/issues/${f.id}/recovery-actions/resolve ` +
+            `{"actionId":"${f.recoveryActionId}","outcome":"restored","sourceIssueStatus":"${repStatus}"}`,
+        );
         L.push(`       ${rep.why}`);
         if (repStatus === 'done') {
           L.push(
@@ -1530,7 +1570,7 @@ export function renderReport(result) {
                   : d.beforePark === false
                     ? ' — AFTER the recovery park'
                     : '') +
-                '. Read it before landing the PATCH: if it is the fire\'s published verdict, only the terminal ' +
+                '. Read it before landing the resolve: if it is the fire\'s published verdict, only the terminal ' +
                 'status write was lost with the run and this `done` buries nothing.',
             );
           } else {
@@ -1553,16 +1593,31 @@ export function renderReport(result) {
             'reproduces the born-blocked state.',
         );
         L.push(
-          `       VERIFY by re-read on \`activeRecoveryAction == null\`, NOT on \`status === "${repStatus}"\`. The strand ` +
-            'IS the recovery action; on a row a run picks up at once the status reads back `in_progress` and that is ' +
-            'still a clean drain (TRA-4041, TRA-3758).',
+          '       ⛔ Do NOT repair with a bare status write instead (TRA-5112): that is the TRA-3196 foot-gun ' +
+            'verbatim — it clears the strand but LAUNDERS returnOwnerAgentId (the action is left unresolved, the ' +
+            'owner hop is never reversed, and the field is not writable through the issue API, so the loss is ' +
+            'permanent; 112/176 rows in the TRA-3479 census). The resolve above restores status AND assignee in ' +
+            'ONE transaction and mints no run-lock conflict (field: 8/8 2026-10-03, CFO 14/14 TRA-5107, CTO ' +
+            '16/16 TRA-5103).',
         );
         L.push(
-          `       NOTE, not a step — returnOwnerAgentId on the payload is \`${rep.assigneeAgentId}\` (${back}). This ` +
-            'file used to print a second PATCH restoring it. DO NOT RUN ONE: the status PATCH above spawns a run that ' +
-            'takes the issue checkout lock, so any further PATCH on this row returns 409 Issue run ownership conflict ' +
-            '(measured 6/6, TRA-4041). The re-home is the platform\'s to make, not an agent verb.',
+          `       VERIFY on \`assigneeAgentId\` reading returnOwnerAgentId \`${rep.assigneeAgentId}\` again (activity ` +
+            '`issue.recovery_action_resolved`, recorded outcome `handed_back`) — never on `activeRecoveryAction ' +
+            '== null` alone, which reads identically for never-stranded, recovered, and cleared-but-still-dead. ' +
+            `The status word is NOT the predicate either: on a row a run picks up at once it reads back ` +
+            '`in_progress` and that is still a clean drain (TRA-3758).',
         );
+        L.push(
+          `       \`sourceIssueStatus\` is the CLASS constant (\`todo\` durable / \`done\` suppressing leaf), ` +
+            'hard-coded — never `evidence.previousStatus`, which reads `in_progress` on cascade strands by ' +
+            'selection artifact and is never the restore target (TRA-4818).',
+        );
+        L.push(
+          `       Authorization: the verb is scoped to the recovery owner, the CURRENT assignee ` +
+            `(${f.assigneeName || f.assigneeAgentId || 'none'} — the seat this row routes to below), and the ` +
+            `board; it hands the row back to ${back}. Any other seat 403s; that is the twin arm's row, not a retry.`,
+        );
+        }
       } else if (rep) {
         L.push(`     no repair command (the TRA-2396 rule stands here): ${rep.why}`);
       }
@@ -1635,10 +1690,14 @@ export function renderReport(result) {
           f.recoveryReturnOwnerAgentId
         ) {
           if (f.pendingInteractions === 0) {
+            // TRA-5112/TRA-4574 — ONE disposition: the class decides the
+            // status here exactly as it does on the RESTORE-RESOLVE line
+            // above, or the two prints disagree on suppressing leaves.
+            const handBackStatus = suppressesOwnRoutine(f) ? 'done' : 'todo';
             L.push('     hand-back (YOU are the recovery owner — this verb is yours to run):');
             L.push(`       POST /api/issues/${f.id}/recovery-actions/resolve`);
             L.push(
-              `         {"actionId":"${f.recoveryActionId}","outcome":"restored","sourceIssueStatus":"todo"}`,
+              `         {"actionId":"${f.recoveryActionId}","outcome":"restored","sourceIssueStatus":"${handBackStatus}"}`,
             );
             L.push(
               `       Comment on the issue FIRST, then resolve. Writes assigneeAgentId back to ` +
@@ -2264,8 +2323,8 @@ const CASES = [
     },
   },
   {
-    name: 'TRA-4041 REPAIR — previousStatus + returnOwnerAgentId both READ => ONE RESTORE-PATCH, and the assignee step is ABSENT',
-    note: 'was the two-step recipe; step 2 409d 6/6 on the run lock',
+    name: 'TRA-5112 REPAIR — previousStatus + returnOwnerAgentId both READ => ONE RESTORE-RESOLVE, and the bare status PATCH is RETIRED',
+    note: 'was RESTORE-PATCH; that verb launders returnOwnerAgentId (TRA-3196)',
     expect: 'FINDINGS',
     opts: { now: NOW_STALE },
     build: () => transportFor(fakeBoard([recoveryStrand('s1', 'TRA-8630', 'agent-cfo', { returnOwner: 'agent-qt' })])),
@@ -2275,24 +2334,58 @@ const CASES = [
       return (
         f.repair.eligible === true &&
         f.repair.status === 'todo' &&
-        // still READ off the payload — it is printed as a note, just never as a verb
+        // still READ off the payload — the verb now EXECUTES the hand-back
         f.repair.assigneeAgentId === 'agent-qt' &&
         f.repair.restoredFrom === 'in_progress' &&
         f.recoveryReturnOwnerAgentId === 'agent-qt' &&
-        /RESTORE-PATCH 1\/1 {2}PATCH \/api\/issues\/s1 \{"status":"todo"\}/.test(out) &&
-        // EXACTLY one step. A 2/2 line, or any second RESTORE-PATCH, is the defect.
-        out.split('\n').filter((l) => /RESTORE-PATCH/.test(l)).length === 1 &&
-        !/RESTORE-PATCH 2\//.test(out) &&
-        // the unexecutable verb, pinned as ABSENT anywhere in the report
-        !/PATCH \/api\/issues\/\S+ \{"assigneeAgentId"/.test(out) &&
-        // the owner is still NAMED, as prose
-        /returnOwnerAgentId on the payload is `agent-qt`/.test(out) &&
-        /409 Issue run ownership conflict/.test(out) &&
-        // the verify predicate is the recovery action, not the status word
-        /activeRecoveryAction == null/.test(out) &&
-        // the two ways to get the status wrong, both pinned as ABSENT
+        /RESTORE-RESOLVE 1\/1 {2}POST \/api\/issues\/s1\/recovery-actions\/resolve \{"actionId":"ra-fixture","outcome":"restored","sourceIssueStatus":"todo"\}/.test(
+          out,
+        ) &&
+        // EXACTLY one step. A 2/2 line, or any second RESTORE line, is the defect.
+        out.split('\n').filter((l) => /RESTORE-RESOLVE/.test(l)).length === 1 &&
+        !/RESTORE-RESOLVE 2\//.test(out) &&
+        // the RETIRED verb, pinned as ABSENT anywhere in the report
+        !/RESTORE-PATCH/.test(out) &&
+        !/PATCH \/api\/issues/.test(out) &&
+        // the laundering warning and the hand-back verify are the point
+        /TRA-3196/.test(out) &&
+        /handed_back/.test(out) &&
+        /never on `activeRecoveryAction\s*== null` alone/.test(out.replace(/\n/g, ' ')) &&
+        // sourceIssueStatus is the class constant, never the read previousStatus
+        /TRA-4818/.test(out) &&
+        !/"sourceIssueStatus":"in_progress"/.test(out) &&
+        !/"sourceIssueStatus":"done"/.test(out) &&
+        // the two ways the OLD body got the status wrong, still pinned ABSENT
         !/\{"status":"done"\}/.test(out) &&
         !/\{"status":"in_progress"\}/.test(out)
+      );
+    },
+  },
+  {
+    // TRA-5112 — the no-actionId arm. An eligible row whose action carries no
+    // readable id can pin no resolve — and the bare status PATCH must NOT
+    // come back as the printed fallback: that string in a report is the
+    // TRA-3196 laundering incident. The drain owns this corner.
+    name: 'TRA-5112 REPAIR — an eligible row whose action id is UNREADABLE gets NO command, and the bare PATCH does not come back',
+    expect: 'FINDINGS',
+    opts: { now: NOW_STALE },
+    build: () =>
+      transportFor(fakeBoard([recoveryStrand('s1', 'TRA-8631', 'agent-cfo', { returnOwner: 'agent-qt', actionId: null })])),
+    assert: (r) => {
+      const out = renderReport(r).join('\n');
+      const f = r.findings[0];
+      return (
+        f.repair.eligible === true &&
+        f.recoveryActionId === null &&
+        /repair KNOWN but NOT printable as a command \(TRA-5112\)/.test(out) &&
+        /drain:strands/.test(out) &&
+        /TRA-3196/.test(out) &&
+        !/RESTORE-RESOLVE/.test(out) &&
+        !/RESTORE-PATCH/.test(out) &&
+        !/PATCH \/api\/issues/.test(out) &&
+        // the values are still NAMED as prose, so the corner stays auditable
+        /returnOwnerAgentId `agent-qt`/.test(out) &&
+        assertNoRepairCommand(out)
       );
     },
   },
@@ -2308,6 +2401,7 @@ const CASES = [
         f.repair.eligible === false &&
         f.restoreTarget.provenance === RESTORE.NONE &&
         !/RESTORE-PATCH/.test(out) &&
+        !/RESTORE-RESOLVE/.test(out) &&
         /no repair command \(the TRA-2396 rule stands here\)/.test(out)
       );
     },
@@ -2328,7 +2422,8 @@ const CASES = [
         f.restoreTarget.provenance === RESTORE.HOLD_FOR_CARD &&
         f.repair.eligible === false &&
         /rests at `in_review`/.test(f.repair.why) &&
-        !/RESTORE-PATCH/.test(out)
+        !/RESTORE-PATCH/.test(out) &&
+        !/RESTORE-RESOLVE/.test(out)
       );
     },
   },
@@ -2344,7 +2439,7 @@ const CASES = [
         f.pendingInteractions === null &&
         f.repair.eligible === false &&
         /UNKNOWN \(route unread\)/.test(f.repair.why) &&
-        !/RESTORE-PATCH/.test(renderReport(r).join('\n'))
+        !/RESTORE-(PATCH|RESOLVE)/.test(renderReport(r).join('\n'))
       );
     },
   },
@@ -2360,7 +2455,7 @@ const CASES = [
         f.restoreTarget.provenance === RESTORE.FROM_EVIDENCE &&
         f.repair.eligible === false &&
         /NO `returnOwnerAgentId`/.test(f.repair.why) &&
-        !/RESTORE-PATCH/.test(renderReport(r).join('\n'))
+        !/RESTORE-(PATCH|RESOLVE)/.test(renderReport(r).join('\n'))
       );
     },
   },
@@ -2409,7 +2504,7 @@ const CASES = [
     // "transferred" must be distinguishable from "unchanged" AND from
     // "cannot tell" (laundered returnOwnerAgentId, TRA-3196). And a runner who
     // is NOT the recovery owner never gets an executable resolve verb.
-    name: 'TRA-4832 OWNERSHIP — not-transferred + unreadable arms: the negative prints, and a non-owner runner gets NO verb',
+    name: 'TRA-4832 OWNERSHIP — not-transferred + unreadable arms: the negative prints, and a non-owner runner gets NO runner-scoped hand-back block',
     expect: 'FINDINGS',
     opts: { now: NOW_STALE, runnerAgentId: 'agent-qt' },
     build: () =>
@@ -2428,7 +2523,16 @@ const CASES = [
         byIdent['TRA-8712'].ownershipTransferred === null &&
         /ownership: NOT transferred/.test(out) &&
         /ownership: pre-strand owner UNREADABLE/.test(out) &&
-        !/recovery-actions\/resolve/.test(out)
+        // TRA-5112 — the ELIGIBLE row (s2) prints the RESTORE-RESOLVE repair
+        // regardless of runner (its executable audience is the CURRENT
+        // assignee it routes to, and the scope is printed beside it)...
+        /RESTORE-RESOLVE 1\/1 {2}POST \/api\/issues\/s2\/recovery-actions\/resolve/.test(out) &&
+        /Authorization: the verb is scoped to/.test(out) &&
+        // ...but the runner-scoped hand-back block stays owner-gated, and the
+        // INELIGIBLE row (s3, no returnOwner) gets no verb at all.
+        !/hand-back \(YOU are the recovery owner/.test(out) &&
+        !/\/api\/issues\/s3\/recovery-actions\/resolve/.test(out) &&
+        assertNoRepairCommand(out)
       );
     },
   },
@@ -2966,33 +3070,41 @@ async function rollupMaskControl() {
  * copy-paste, so the string must simply never be emitted.
  *
  * TRA-3451 narrows it rather than dropping it. TRA-4041 narrows it again, to
- * exactly ONE verb, on a line carrying the `RESTORE-PATCH` sentinel, with the
- * blocker key still banned EVERYWHERE including on that line:
+ * exactly ONE verb on a sentinel line. TRA-5112 RETIRES that verb outright:
+ * the sanctioned repair line is now the RESOLVE verb,
  *
- *   {"status":"todo"}                — never `done`, never a raw previousStatus
+ *   RESTORE-RESOLVE 1/1  POST /api/issues/<id>/recovery-actions/resolve
+ *     {"actionId":"<id>","outcome":"restored","sourceIssueStatus":"todo"|"done"}
  *
- * `{"assigneeAgentId":"<id>"}` was the second sanctioned verb until 2026-08-26.
- * It is now BANNED, and the ban is the point of this control rather than a
- * tidy-up: printing it emitted a recipe whose second step 409'd 6 times out of 6
- * (`Issue run ownership conflict` — the step-1 PATCH spawns a run that takes the
- * issue checkout lock). An unexecutable printed step is worse than no step, so
- * a future edit that re-introduces it must go red HERE, in the suite, and not in
- * somebody's hands at 06:15Z. The step counter is pinned to `1/1` for the same
- * reason: `2/2` cannot be printed without failing.
+ * and ANY `RESTORE-PATCH` line, and ANY `PATCH /api/issues` anywhere in any
+ * report, fails the suite. The bare status PATCH was the TRA-3196 foot-gun
+ * verbatim: it clears the strand but launders returnOwnerAgentId (the action
+ * is left unresolved, the owner hop unreversed, and the field is not writable
+ * through the issue API — permanent; 112/176 rows in the TRA-3479 census).
  *
- * Any other `PATCH /api/issues` anywhere in any report, or any sanctioned line
- * whose body is not that one verb, fails the suite. The sentinel is what keeps
- * this a whitelist instead of a hole.
+ * `{"assigneeAgentId":"<id>"}` was the second sanctioned verb until 2026-08-26
+ * and stays BANNED (its printed recipe 409'd 6/6 on the run lock, TRA-4041).
+ * On the sanctioned RESOLVE line: `outcome` is pinned to `restored` (the other
+ * outcomes are adjudications a report must not hand out copy-pasteable),
+ * `sourceIssueStatus` is pinned to the two class constants — `in_progress`,
+ * the raw `evidence.previousStatus` value, cannot be printed without failing
+ * (TRA-4818) — and the step counter is pinned to `1/1` so `2/2` cannot be
+ * printed without failing. The sentinel is what keeps this a whitelist
+ * instead of a hole.
  */
-const RESTORE_PATCH_LINE = /^\s*RESTORE-PATCH /;
-const SANCTIONED_VERB = /^\s*RESTORE-PATCH 1\/1 {2}PATCH \/api\/issues\/\S+ \{"status":"todo"\}(\s|$)/;
+const RESTORE_PATCH_LINE = /^\s*RESTORE-PATCH /; // RETIRED sentinel (TRA-5112) — any hit fails
+const RESTORE_RESOLVE_LINE = /^\s*RESTORE-RESOLVE /;
+const SANCTIONED_VERB =
+  /^\s*RESTORE-RESOLVE 1\/1 {2}POST \/api\/issues\/\S+\/recovery-actions\/resolve \{"actionId":"[^"]+","outcome":"restored","sourceIssueStatus":"(todo|done)"\}(\s|$)/;
 
 function assertNoRepairCommand(rendered) {
   if (/blockedByIssueIds/.test(rendered)) return false;
   const lines = String(rendered).split('\n');
-  const sanctioned = lines.filter((l) => RESTORE_PATCH_LINE.test(l));
-  const rest = lines.filter((l) => !RESTORE_PATCH_LINE.test(l)).join('\n');
-  if (/PATCH \/api\/issues/.test(rest)) return false;
+  // TRA-5112 — the retired PATCH repair, in sentinel or raw form, is banned
+  // everywhere: that string in a report IS the TRA-3196 laundering incident.
+  if (lines.some((l) => RESTORE_PATCH_LINE.test(l))) return false;
+  if (/PATCH \/api\/issues/.test(rendered)) return false;
+  const sanctioned = lines.filter((l) => RESTORE_RESOLVE_LINE.test(l));
   return sanctioned.every((l) => SANCTIONED_VERB.test(l));
 }
 
@@ -3049,21 +3161,46 @@ async function selftest() {
       `        ${sup.map(([, w, why]) => `${w ? 'YES' : 'no '} ${why}`).join(' | ')}`,
   );
 
-  // TRA-4041 NEGATIVE CONTROL. The whitelist above only proves the CURRENT
-  // report is clean. This proves the whitelist would REFUSE the exact string
-  // this ticket deleted — otherwise a regex that accidentally matched
-  // everything would read green on both halves.
+  // TRA-4041/TRA-5112 NEGATIVE CONTROL. The whitelist above only proves the
+  // CURRENT report is clean. This proves the whitelist would REFUSE the exact
+  // strings these tickets deleted — otherwise a regex that accidentally
+  // matched everything would read green on both halves.
   const reintroduced =
     '     repair KNOWN (stranded_assigned_issue):\n' +
     '       RESTORE-PATCH 1/1  PATCH /api/issues/s1 {"status":"todo"}\n' +
     '       RESTORE-PATCH 2/2  PATCH /api/issues/s1 {"assigneeAgentId":"agent-qt"}   # -> QuantTrader\n';
   const twoTwo =
     '       RESTORE-PATCH 1/2  PATCH /api/issues/s1 {"status":"todo"}\n';
-  const rejects = !assertNoRepairCommand(reintroduced) && !assertNoRepairCommand(twoTwo);
+  // TRA-5112 — even the ONE formerly-sanctioned PATCH line is now refused: the
+  // bare status PATCH is the TRA-3196 laundering foot-gun verbatim.
+  const retiredSanctioned =
+    '       RESTORE-PATCH 1/1  PATCH /api/issues/s1 {"status":"todo"}\n';
+  // ...and the RESOLVE sentinel is a whitelist, not a hole: the raw
+  // previousStatus value (TRA-4818), a non-restored outcome, a missing
+  // actionId, and an n/2 counter must each be refused.
+  const resolvePrev =
+    '       RESTORE-RESOLVE 1/1  POST /api/issues/s1/recovery-actions/resolve {"actionId":"ra-1","outcome":"restored","sourceIssueStatus":"in_progress"}\n';
+  const resolveOutcome =
+    '       RESTORE-RESOLVE 1/1  POST /api/issues/s1/recovery-actions/resolve {"actionId":"ra-1","outcome":"false_positive","sourceIssueStatus":"todo"}\n';
+  const resolveNoAction =
+    '       RESTORE-RESOLVE 1/1  POST /api/issues/s1/recovery-actions/resolve {"actionId":"","outcome":"restored","sourceIssueStatus":"todo"}\n';
+  const resolveTwoStep =
+    '       RESTORE-RESOLVE 1/2  POST /api/issues/s1/recovery-actions/resolve {"actionId":"ra-1","outcome":"restored","sourceIssueStatus":"todo"}\n';
+  const goodResolve =
+    '       RESTORE-RESOLVE 1/1  POST /api/issues/s1/recovery-actions/resolve {"actionId":"ra-1","outcome":"restored","sourceIssueStatus":"todo"}\n';
+  const rejects =
+    !assertNoRepairCommand(reintroduced) &&
+    !assertNoRepairCommand(twoTwo) &&
+    !assertNoRepairCommand(retiredSanctioned) &&
+    !assertNoRepairCommand(resolvePrev) &&
+    !assertNoRepairCommand(resolveOutcome) &&
+    !assertNoRepairCommand(resolveNoAction) &&
+    !assertNoRepairCommand(resolveTwoStep) &&
+    assertNoRepairCommand(goodResolve);
   if (!rejects) failed += 1;
   console.log(
-    `${rejects ? 'ok  ' : 'FAIL'}  TRA-4041 NEGATIVE — the whitelist REFUSES a re-introduced assignee PATCH, and refuses a \`n/2\` step counter\n` +
-      '        (the step that returned 409 Issue run ownership conflict 6/6 on 2026-08-26)',
+    `${rejects ? 'ok  ' : 'FAIL'}  TRA-4041/TRA-5112 NEGATIVE — the whitelist REFUSES the assignee PATCH, the n/2 counter, the RETIRED status PATCH, and every off-whitelist RESOLVE body (previousStatus/outcome/actionId), while the sanctioned RESOLVE passes\n` +
+      '        (the PATCH launders returnOwnerAgentId -- TRA-3196; in_progress is the TRA-4818 selection artifact)',
   );
 
   // TRA-4574 — THE TWO READERS MUST AGREE. `deriveRepair` hardcodes `todo` and the
@@ -3080,7 +3217,7 @@ async function selftest() {
     const r = await sweep(transportFor(fakeBoard([row])), { now: NOW_STALE });
     const out = renderReport(r).join('\n');
     const f = r.findings[0];
-    const cmd = out.split('\n').filter((l) => /RESTORE-PATCH/.test(l));
+    const cmd = out.split('\n').filter((l) => /RESTORE-RESOLVE/.test(l));
     return {
       ok:
         suppressesOwnRoutine(f) === true &&
@@ -3088,8 +3225,9 @@ async function selftest() {
         // the shared predicate still reports the GENERIC target; only the emitter overrides
         f.repair.status === 'todo' &&
         cmd.length === 1 &&
-        /PATCH \/api\/issues\/s1 \{"status":"done"\}/.test(cmd[0]) &&
-        !/\{"status":"todo"\}/.test(out) &&
+        /recovery-actions\/resolve \{"actionId":"ra-fixture","outcome":"restored","sourceIssueStatus":"done"\}/.test(cmd[0]) &&
+        !/"sourceIssueStatus":"todo"/.test(out) &&
+        !/RESTORE-PATCH/.test(out) &&
         /SUPPRESSING LEAF/.test(out) &&
         // and the prose must not still be arguing for the opposite write
         !/`todo`, never `done`/.test(out) &&
@@ -3100,7 +3238,7 @@ async function selftest() {
         /rests on the CLASS RULE alone/.test(out) &&
         // and the report must never claim the target was read off the payload
         !/restore target and return owner were both READ/.test(out),
-      detail: cmd[0] ? cmd[0].trim() : 'NO RESTORE-PATCH EMITTED',
+      detail: cmd[0] ? cmd[0].trim() : 'NO RESTORE-RESOLVE EMITTED',
     };
   })();
   if (!supRepair.ok) failed += 1;
@@ -3335,7 +3473,7 @@ async function main() {
  *
  * The DRAIN (`scripts/drain-blocked-empty.mjs`) needs more than the enumeration:
  * it has to write to EXACTLY the cohort this detector reports, executing the
- * `RESTORE-PATCH` pair `deriveRepair()` already derives. A drain carrying its
+ * `RESTORE-RESOLVE` repair `deriveRepair()` already derives. A drain carrying its
  * own copy of the predicate would silently repair a DIFFERENT population than
  * the one being graded, and the two would drift on the first edit to either. So
  * it imports `sweep()` itself, and this guard is what makes that safe.
