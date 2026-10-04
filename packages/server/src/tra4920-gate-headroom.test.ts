@@ -85,6 +85,7 @@ describe('TRA-4920 — loop-yield-gate headroom (AC3)', () => {
     const h = new LoopYieldGate({ blockBudgetMs: 5_000 }).headroom();
     expect(h.level).toBe('unmeasured');
     expect(h.perResumeMs).toBeNull();
+    expect(h.perResumeRawMs).toBeNull();
     expect(h.perResumeSamples).toBe(0);
     expect(h.projectedBlockMs).toBeNull();
     expect(h.utilization).toBeNull();
@@ -126,9 +127,17 @@ describe('TRA-4920 — loop-yield-gate headroom (AC3)', () => {
 
     // The projection is exactly maxQueueDepth x the measured constant — the
     // TRA-4524 linear-in-N mechanism, with the constant re-measured here rather
-    // than inherited.
+    // than inherited. The identity is asserted against the published RAW basis
+    // (TRA-5041): re-deriving the product from the 1-decimal `perResumeMs`
+    // double-rounds, and the two `Math.round`s disagree whenever the raw
+    // product lands within queueDepth·0.05ms of a .5 boundary — a machine- and
+    // load-dependent coin flip (`expected 387 to be 386`).
     expect(s.headroom.queueDepth).toBe(s.maxQueueDepth);
-    expect(s.headroom.projectedBlockMs).toBe(Math.round(s.maxQueueDepth * s.headroom.perResumeMs!));
+    expect(s.headroom.perResumeRawMs).not.toBeNull();
+    expect(s.headroom.projectedBlockMs).toBe(Math.round(s.maxQueueDepth * s.headroom.perResumeRawMs!));
+    // The rounded publication is the same basis at 1 decimal, so the snapshot
+    // stays self-consistent for every consumer, not just this assertion.
+    expect(s.headroom.perResumeMs).toBe(Math.round(s.headroom.perResumeRawMs! * 10) / 10);
   });
 
   it('reads `ok` when the projection is a small fraction of the budget, and fires nothing', async () => {

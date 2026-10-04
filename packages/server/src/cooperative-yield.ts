@@ -164,6 +164,15 @@ export interface GateHeadroom {
    * has to be doing the work before the constant exists.
    */
   perResumeMs: number | null;
+  /**
+   * TRA-5041 — the UNROUNDED mean (ms): the exact basis `projectedBlockMs` is
+   * computed from. `perResumeMs` is this rounded to 1 decimal; re-deriving the
+   * product from the ROUNDED value double-rounds (the discarded ≤0.05ms becomes
+   * ≤0.05·queueDepth in the product), so the linear-in-N identity is only
+   * checkable from the snapshot via this field:
+   * `projectedBlockMs === Math.round(queueDepth * perResumeRawMs)`.
+   */
+  perResumeRawMs: number | null;
   /** Worst single completed run's per-resume cost (ms). */
   perResumeMaxMs: number | null;
   perResumeSamples: number;
@@ -367,6 +376,7 @@ export class LoopYieldGate {
       warnAt: GATE_HEADROOM_WARN_AT,
       pageAt: GATE_HEADROOM_PAGE_AT,
       perResumeMs: perResumeMs === null ? null : Math.round(perResumeMs * 10) / 10,
+      perResumeRawMs: perResumeMs,
       perResumeMaxMs: this.perResumeSamples > 0 ? Math.round(this.perResumeMaxMs * 10) / 10 : null,
       perResumeSamples: this.perResumeSamples,
       queueDepth: this.maxQueueDepth,
