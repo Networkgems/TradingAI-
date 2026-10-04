@@ -45,6 +45,40 @@ fallback the ticket names, and it recovers all five window-B boots (each was fol
 **Residual:** a boot that is never logged into stays dark. Lifting that needs an admin to register
 the same task with `-LogonType S4U` plus an `AtStartup` trigger; the launcher needs no change.
 
+## TRA-5105: the residual bit, measured, and the operator upgrade that closes it
+
+The residual above is not hypothetical. After the unattended NinjaRMM reboot on **2026-10-04**
+(System 1074 at 07:31:50Z, 33-second reboot, nobody logged on afterwards), the task's own PT5M
+trigger fired **70 consecutive times** from 07:35:59Z to 13:20:59Z and Task Scheduler refused every
+one with event Id **332** — *user "(NONE)" was not logged on*. Cost: **5.81h host-UP darkness, 95%
+of the dark window**. 2026-10-03 was the same signature at 1.79h. The 70 refusals are also the
+proof of the fix's shape: **the trigger already fires unattended — only the principal refuses it.**
+
+The fix is operator-gated in both variants, so it lives in a script a human runs at the host:
+
+```powershell
+# as PRIMEROGA\eetienne, elevated if possible (elevation buys the BootTrigger):
+powershell -ExecutionPolicy Bypass -File scripts/host/upgrade-paperclip-autostart-unattended.ps1
+```
+
+It flips the principal to `LogonType=Password` (prompting locally for the credential, which is
+stored with the task and never leaves the host) and adds an `AtStartup` trigger, falling back to
+Password-only if the boot trigger is refused without elevation — the repeating `TimeTrigger` then
+still bounds post-boot recovery at ~5 min. `Password` is preferred over `S4U` deliberately: S4U
+gets a non-interactive session with no loaded profile, unproven for the
+`node ← npx ← paperclipai onboard` chain and the ACP adapters it spawns, and a server that boots
+but cannot execute runs is *worse* than dark. Why no agent can do this itself: the agent has no
+password, and `-LogonType S4U` registration is denied non-admin (re-measured 2026-10-04).
+
+Known failure codes after the upgrade: `0x80070569` = account lacks the *Log on as a batch job*
+right (admin must grant it); `0x8007052E` = stored credential went stale after a Windows password
+change (re-run the script). `0x800710E0` remains the benign IgnoreNew shape.
+
+**Acceptance is a real unattended boot, not a config diff** — the task read `State=Running` all
+through the 5.81h outage. Reboot with nobody logged on, then assert: (a) a `heartbeat_runs` row
+within ~10 min of `LastBootUpTime`, (b) zero Id-332 events for this task in that window, (c) one
+ACP-lane agent run completing with `error_code IS NULL`.
+
 ## Why not `paperclipai service install`
 
 Because it does not exist here. Measured 2026-10-02:
