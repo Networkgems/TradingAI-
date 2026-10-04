@@ -133,3 +133,78 @@ export function parseDeployOrder(description) {
 
   return { ok: true, order: { commit, host: fields.host.trim(), deadline, deadlineMs } };
 }
+
+/**
+ * TRA-5052 — CAN THE SANCTIONED PATH ACCEPT A DEPLOY AT THE INSTANT THE DEADLINE NAMES?
+ *
+ * A `deadline` used to be graded only against ancestry and the clock, so an order whose
+ * deadline sits INSIDE the RTH freeze (13:25–20:00Z Mon–Fri) graded PENDING — benign —
+ * right up to the deadline and then paged as STRANDED the moment it passed. But the only
+ * approved executor, `scripts/render-redeploy.mjs`, REFUSES at that instant (exit 4): the
+ * deadline was never reachable through the sanctioned path, which is an AUTHORING defect
+ * wanting a different person to do a different thing than a stranded deploy does.
+ * Measured 2026-10-02: 4 of 5 live block-carrying orders named 13:25:00Z — the FIRST
+ * frozen instant, one minute past the last usable one — as house style, by two authors,
+ * across five days. The honest weekday boundary is 13:24Z; the same instant on a weekend
+ * is OPEN, so a blanket "reject 13:25Z" would be wrong, and so would a day-blind rule
+ * (TRA-2313 is two of us reading the one freeze annotation backwards).
+ *
+ * ⛔ THE PREDICATES ARE INJECTED, NOT RE-DERIVED. A second copy of 13:25–20:00Z is a
+ * second thing to get backwards. Callers pass `freezeState` / `embargoState` /
+ * `activeCadenceCeiling` and the tables from `scripts/render-redeploy.mjs` itself — the
+ * executor's own gates, byte-for-byte (that module is import-safe: its `main()` is gated
+ * on `invokedDirectly`). This lib stays import-free, as `check-slot-loss.mjs` requires.
+ *
+ * ⛔ FAILS CLOSED. Missing predicates, an unreadable deadline, or a gate whose answer
+ * needs state this function cannot read all grade `unread`, never `open` — "I could not
+ * check the gate" and "the gate is open" must not share a code. The cadence ceiling is
+ * the structurally unreadable one: a `CADENCE_CEILINGS` row covering the deadline makes
+ * reachability depend on whether that window's quota is already SPENT, which is Render
+ * deploy history, not table membership, so an active row reads `unread` here.
+ *
+ * @returns {{ gate: 'open'|'refused'|'unread', detail: string|null }}
+ */
+export function gradeDeadlineGates(deadlineMs, { freezeState, embargoState, activeCadenceCeiling, embargoes, cadenceCeilings } = {}) {
+  if (!Number.isFinite(deadlineMs)) {
+    return { gate: 'unread', detail: 'unreadable deadline instant — "could not check the gate" is not "the gate is open"' };
+  }
+  if (
+    typeof freezeState !== 'function' || typeof embargoState !== 'function' ||
+    typeof activeCadenceCeiling !== 'function' || !Array.isArray(embargoes) || !Array.isArray(cadenceCeilings)
+  ) {
+    return { gate: 'unread', detail: 'gate predicates not injected — "could not check the gate" is not "the gate is open"' };
+  }
+
+  const when = new Date(deadlineMs);
+  const iso = when.toISOString();
+
+  if (freezeState(when)?.frozen) {
+    return {
+      gate: 'refused',
+      detail:
+        `deadline ${iso} is INSIDE the RTH freeze (13:25–20:00Z Mon–Fri) — scripts/render-redeploy.mjs exits 4 at ` +
+        'that instant, so the sanctioned path cannot act at the boundary this order names; the last deployable ' +
+        'weekday minute is 13:24Z, and the weekend is OPEN',
+    };
+  }
+
+  const embargo = embargoState(when, embargoes)?.active ?? null;
+  if (embargo) {
+    return {
+      gate: 'refused',
+      detail: `deadline ${iso} is inside the dated embargo ${embargo.from} → ${embargo.to} (${embargo.ticket}) — scripts/render-redeploy.mjs exits 5 there`,
+    };
+  }
+
+  const ceiling = activeCadenceCeiling(when, cadenceCeilings);
+  if (ceiling) {
+    return {
+      gate: 'unread',
+      detail:
+        `a CADENCE_CEILINGS row (${ceiling.ticket}; max ${ceiling.max}/window) covers deadline ${iso} — whether that ` +
+        "window's quota is already spent is Render deploy history this predicate does not read, so the gate is UNREAD, not open",
+    };
+  }
+
+  return { gate: 'open', detail: null };
+}

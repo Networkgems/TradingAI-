@@ -341,16 +341,23 @@ event whose absence is the defect. Every deploy-train carrier therefore carries 
 ```deploy-order
 commit: 65fdb95
 host: tradingai-bqb1
-deadline: 2026-08-13T13:25:00Z
+deadline: 2026-08-13T13:24:00Z
 ```
 ````
 
 `deadline` **must** end in `Z`. Crons are evaluated in **ET** and these windows are written in UTC;
-a bare local time is rejected, never guessed. A carrier that mentions deploying but orders nothing
+a bare local time is rejected, never guessed. ⛔ **And it must name an instant the sanctioned path
+can act at** (TRA-5052): this example used to read `13:25:00Z` — the FIRST frozen instant of the
+weekday RTH freeze, one minute past the last usable one — and 4 of 5 live orders copied exactly
+that as house style. 13:24Z is the honest weekday boundary; the freeze is open post-close and all
+weekend (a Saturday 13:25Z is fine), and most trains want a post-close deadline rather than a
+boundary-tight one anyway. A weekday deadline inside the freeze now grades `UNMEETABLE_WINDOW`
+(exit 7) — non-green, non-paging — instead of idling as PENDING and then paging as STRANDED the
+minute it passes. A carrier that mentions deploying but orders nothing
 opts out with `<!-- deploy-order: none -->` — there is no way to leave the population by accident.
 
 ```bash
-pnpm check:deploy-train-window       # 0 clean · 1 STRANDED · 3 BLIND · 4 UNGRADED · 5 LATE · 6 HARNESS
+pnpm check:deploy-train-window       # 0 clean · 1 STRANDED · 3 BLIND · 4 UNGRADED · 5 LATE · 6 HARNESS · 7 UNMEETABLE
 pnpm check:deploy-train-window:controls
 ```
 
@@ -385,8 +392,12 @@ column, and it is the one this ticket is actually about — on 08-13 both orders
 measured when `RENDER_API_KEY` + `RENDER_SERVICE_ID` are in the environment (`--render-key` /
 `--render-service`), and whether the arm is ON or OFF is **printed with its reason** — `UNREAD` is
 never OK. A missed window exits **5 LATE**: nothing is stranded, so it must not page as one, and the
-window was missed, so it must not pass as clean. Precedence `HARNESS > BLIND > STRANDED > LATE >
-UNGRADED > CLEAN`.
+window was missed, so it must not pass as clean. An unmet order whose deadline sits inside the RTH
+freeze or a dated embargo exits **7 UNMEETABLE** — the sanctioned executor would refuse at that
+instant, so it is a badly written order wanting a re-issue, not a stranded deploy wanting a page
+(TRA-5052); a deadline covered by an active `CADENCE_CEILINGS` row reads BLIND, because whether the
+window's quota is spent is deploy history, and "could not check the gate" must not read as "open".
+Precedence `HARNESS > BLIND > STRANDED > UNMEETABLE > LATE > UNGRADED > CLEAN`.
 
 ⛔ **A failing CONTROL is `6 HARNESS`, not `3 BLIND`, and it no longer silences the live scan**
 (TRA-4977). A control failure used to `return` exit 3 *before* the live sweep ran, so **one stale

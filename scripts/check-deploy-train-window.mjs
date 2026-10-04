@@ -53,13 +53,19 @@
  *     ```deploy-order
  *     commit: 65fdb95
  *     host: tradingai-bqb1
- *     deadline: 2026-08-13T13:25:00Z
+ *     deadline: 2026-08-13T13:24:00Z
  *     ```
  *
  * `deadline` MUST be an absolute UTC instant ending in `Z`. A bare local time is
  * REJECTED rather than silently interpreted — routine crons are evaluated in ET and the
  * windows are written in UTC, and that is exactly the mix that produces a confidently
- * wrong deadline. A carrier that a human would call a deploy train and that carries no
+ * wrong deadline. ⛔ AND IT MUST NAME AN INSTANT THE SANCTIONED PATH CAN ACT AT: this
+ * example used to read `13:25:00Z`, the FIRST frozen instant of the weekday RTH freeze,
+ * and 4 of 5 live orders copied exactly that as house style (TRA-5052). 13:24Z is the
+ * honest weekday boundary; the freeze is open all weekend, and most trains want a
+ * post-close deadline rather than a boundary-tight one anyway. A deadline inside the
+ * freeze grades UNMEETABLE_WINDOW (exit 7), never CLEAN and never STRANDED.
+ * A carrier that a human would call a deploy train and that carries no
  * parseable block is `UNGRADEABLE` — NON-ZERO (exit 4), never a pass. That is the only
  * thing that makes the template rule bite: an author who skips the block gets a visible
  * un-graded row, not silence.
@@ -187,10 +193,19 @@
  *                  instrument reporting itself broken, which is a DIFFERENT message to a
  *                  DIFFERENT person than "I cannot grade your deploy", and the live scan
  *                  still runs and still prints underneath it.
+ *   7  UNMEETABLE — at least one live order's deadline names an instant the sanctioned
+ *                  deploy path itself REFUSES (inside the RTH freeze, or a dated
+ *                  embargo), so the order was never meetable at its own boundary
+ *                  (TRA-5052). An authoring defect, not an incident: it must not read
+ *                  as green (the old PENDING did, right up to the deadline) and it must
+ *                  not page as STRANDED (which the old grading did the minute after) —
+ *                  it needs a different person to do a different thing: re-issue the
+ *                  order with a reachable deadline.
  *
- * Precedence when several apply: HARNESS > BLIND > STRANDED > LATE > UNGRADED > CLEAN. A
- * broken instrument outranks everything it says, a blind leg outranks a clean one, a
- * stranded order outranks a missed window, and both outrank a backlog.
+ * Precedence when several apply: HARNESS > BLIND > STRANDED > UNMEETABLE > LATE >
+ * UNGRADED > CLEAN. A broken instrument outranks everything it says, a blind leg
+ * outranks a clean one, a stranded order outranks a missed window, and both outrank a
+ * backlog.
  *
  * ⛔ WHY A CONTROL FAILURE GETS ITS OWN CODE AND NO LONGER SILENCES THE LIVE SCAN (TRA-4977
  * AC4) — THE DECISION, AND BOTH HALVES OF IT
@@ -235,6 +250,7 @@ export const EXIT_BLIND = 3;
 export const EXIT_UNGRADED = 4;
 export const EXIT_LATE = 5;
 export const EXIT_HARNESS = 6;
+export const EXIT_UNMEETABLE = 7;
 
 /**
  * THE ONE PLACE THE RUN'S EXIT CODE IS DECIDED (TRA-4977 AC4). Pure, so the precedence is
@@ -288,8 +304,40 @@ import {
   parseDeployOrder,
   lineOrdersDeploy,
   classifyCarrier,
+  gradeDeadlineGates,
 } from './lib/deploy-order.mjs';
-export { findOrderBlocks, parseDeployOrder, lineOrdersDeploy, classifyCarrier };
+export { findOrderBlocks, parseDeployOrder, lineOrdersDeploy, classifyCarrier, gradeDeadlineGates };
+
+// TRA-5052: the deadline-window gates. The predicates and the tables are THE EXECUTOR'S
+// OWN — imported from scripts/render-redeploy.mjs rather than re-derived, because a
+// second copy of 13:25–20:00Z is a second thing to get backwards (TRA-2313 is two of us
+// reading the one freeze annotation backwards). The import is safe: render-redeploy's
+// main() is gated on `invokedDirectly`, and scripts/tra2325-embargo-gate-check.mjs
+// already imports it for the same predicates.
+import {
+  freezeState,
+  embargoState,
+  activeCadenceCeiling,
+  EMBARGOES,
+  CADENCE_CEILINGS,
+} from './render-redeploy.mjs';
+
+/**
+ * The LIVE wiring of the deadline gates: the real predicates over the real tables. It is
+ * `gradeCarrier`'s DEFAULT, not an opt-in — a live call site that forgets to pass it
+ * still grades the window, and the UNMEETABLE controls run through this same chain, so a
+ * planted mutation that drops the freeze check (in the predicate, this wiring, or
+ * `gradeCarrier`'s use of it) turns them red.
+ */
+export function defaultDeadlineGates(deadlineMs) {
+  return gradeDeadlineGates(deadlineMs, {
+    freezeState,
+    embargoState,
+    activeCadenceCeiling,
+    embargoes: EMBARGOES,
+    cadenceCeilings: CADENCE_CEILINGS,
+  });
+}
 
 /**
  * THE ANCESTRY PREDICATE, total over the three states ancestry actually has.
@@ -502,18 +550,31 @@ export function gradeTiming({ order, deploys, knownSha, ancestryOracle = libGrad
  * a carrier this check could not see into. They are separate fields because they carry
  * separate exit codes, and collapsing them lets a backlog of eighteen bury one incident.
  *
- * @returns {{ verdict, finding: boolean, ungraded: boolean, timing: 'unread'|'n/a', detail: string }}
- *   verdict ∈ SATISFIED | PENDING | STRANDED | UNGRADEABLE | AMBIGUOUS | NOT_TRAIN | BLIND
+ * TRA-5052: the deadline is graded against the GATES THE SANCTIONED EXECUTOR WILL APPLY,
+ * not only against the clock. An unmet order whose deadline the executor REFUSES (RTH
+ * freeze, dated embargo) is UNMEETABLE_WINDOW — `unmeetable`, its own exit code (7),
+ * never `finding` — because a deadline that was never reachable through the sanctioned
+ * path is a badly written order, not a stranded deploy, and the two want different
+ * people doing different things. A gate whose answer needs state this run cannot read
+ * (an active CADENCE_CEILINGS row: the quota is deploy history) grades BLIND, never
+ * "meetable". A SATISFIED order keeps its verdict — the bytes are on the box — and the
+ * window defect is carried as a printed `windowNote` instead: all four live 13:25Z
+ * orders were satisfied early, by habit, and re-paging settled history would train the
+ * alarm into noise.
+ *
+ * @returns {{ verdict, finding: boolean, unmeetable: boolean, ungraded: boolean, timing: 'unread'|'n/a', detail: string }}
+ *   verdict ∈ SATISFIED | PENDING | STRANDED | UNMEETABLE_WINDOW | UNGRADEABLE | AMBIGUOUS | NOT_TRAIN | BLIND
  */
-export function gradeCarrier({ description, nowMs, liveSha, knownSha, ancestryOracle = libGradedAncestry, deploys = null, historyHost = null }) {
+export function gradeCarrier({ description, nowMs, liveSha, knownSha, ancestryOracle = libGradedAncestry, deploys = null, historyHost = null, deadlineGates = defaultDeadlineGates }) {
   const cls = classifyCarrier(description);
   if (cls.kind === 'not-train') {
-    return { verdict: 'NOT_TRAIN', finding: false, late: false, ungraded: false, timing: 'n/a', detail: cls.reason, span: cls.span };
+    return { verdict: 'NOT_TRAIN', finding: false, unmeetable: false, late: false, ungraded: false, timing: 'n/a', detail: cls.reason, span: cls.span };
   }
   if (cls.kind === 'ambiguous') {
     return {
       verdict: 'AMBIGUOUS',
       finding: false,
+      unmeetable: false,
       late: false,
       ungraded: true,
       timing: 'n/a',
@@ -527,6 +588,7 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, ancestryOr
     return {
       verdict: 'UNGRADEABLE',
       finding: false,
+      unmeetable: false,
       late: false,
       ungraded: true,
       timing: 'n/a',
@@ -541,6 +603,7 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, ancestryOr
     return {
       verdict: 'BLIND',
       finding: false,
+      unmeetable: false,
       late: false,
       ungraded: false,
       timing: 'n/a',
@@ -549,6 +612,12 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, ancestryOr
       span: cls.span,
     };
   }
+
+  // TRA-5052: grade the INSTANT THE DEADLINE NAMES against the executor's own gates. A
+  // non-function injection reads `unread` (fail closed), the same as the lib's own guard.
+  const gates = typeof deadlineGates === 'function'
+    ? deadlineGates(order.deadlineMs)
+    : { gate: 'unread', detail: 'no deadline-gate predicate injected — "could not check the gate" is not "the gate is open"' };
 
   const pastDeadline = nowMs >= order.deadlineMs;
   if (ancestry === 'present') {
@@ -568,6 +637,7 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, ancestryOr
     return {
       verdict: 'SATISFIED',
       finding: false,
+      unmeetable: false,
       // A missed window is NOT a stranded order: the bytes are on the box. It gets its
       // own flag and its own exit code so it can neither page as an incident nor hide
       // inside a pass.
@@ -575,7 +645,44 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, ancestryOr
       ungraded: false,
       timing,
       timingDetail,
+      // The bytes are on the box, so a gate defect in the deadline is writer-side
+      // hygiene, PRINTED but never paged — see the TRA-5052 block in the docblock.
+      windowNote: gates.gate === 'open' ? null : gates.detail,
       detail: `${short(order.commit)} is an ancestor of live ${short(liveSha)}`,
+      order,
+      span: cls.span,
+    };
+  }
+
+  // The order is NOT met. Before the clock is consulted at all, ask whether the deadline
+  // was ever an instant the sanctioned path would act at — PENDING-then-STRANDED on a
+  // frozen deadline converts an authoring error into a page (TRA-5052).
+  if (gates.gate === 'refused') {
+    return {
+      verdict: 'UNMEETABLE_WINDOW',
+      finding: false,
+      unmeetable: true,
+      late: false,
+      ungraded: false,
+      timing: 'n/a',
+      detail:
+        `${short(order.commit)} is NOT live and the ${order.deadline} deadline ${pastDeadline ? 'has PASSED' : 'is ahead'} — but ` +
+        `${gates.detail}. An order whose deadline the sanctioned path refuses is a BADLY WRITTEN ORDER, not a stranded ` +
+        'deploy: re-issue it with a reachable deadline (13:24Z is the honest weekday boundary; post-close and weekend ' +
+        'instants are open) instead of paging the executor.',
+      order,
+      span: cls.span,
+    };
+  }
+  if (gates.gate === 'unread') {
+    return {
+      verdict: 'BLIND',
+      finding: false,
+      unmeetable: false,
+      late: false,
+      ungraded: false,
+      timing: 'n/a',
+      detail: `cannot decide whether the ${order.deadline} deadline is reachable through the sanctioned path — ${gates.detail}`,
       order,
       span: cls.span,
     };
@@ -585,6 +692,7 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, ancestryOr
     return {
       verdict: 'PENDING',
       finding: false,
+      unmeetable: false,
       late: false,
       ungraded: false,
       timing: 'n/a',
@@ -597,6 +705,7 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, ancestryOr
   return {
     verdict: 'STRANDED',
     finding: true,
+    unmeetable: false,
     late: false,
     ungraded: false,
     timing: 'n/a',
@@ -713,7 +822,7 @@ export function readableDescription(issue) {
 export function gradeCarrierRow({ issue, ...rest }) {
   const readable = readableDescription(issue);
   if (!readable.ok) {
-    return { verdict: 'BLIND', finding: false, late: false, ungraded: false, timing: 'n/a', detail: readable.reason, span: null };
+    return { verdict: 'BLIND', finding: false, unmeetable: false, late: false, ungraded: false, timing: 'n/a', detail: readable.reason, span: null };
   }
   return gradeCarrier({ description: readable.description, ...rest });
 }
@@ -933,6 +1042,86 @@ const CONTROLS = [
           nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
         }),
         (r) => r.verdict === 'PENDING' && r.finding === false,
+      ),
+  },
+  // ── TRA-5052: the deadline-window gates ───────────────────────────────────
+  // The freeze controls run through the DEFAULT wiring — the REAL `freezeState` and
+  // tables imported from render-redeploy.mjs. That is the mutation detector the ticket
+  // demands: drop the freeze check anywhere in the chain (the lib predicate, the
+  // wiring, or gradeCarrier's use of it) and the POSITIVE below reads PENDING/STRANDED
+  // instead of UNMEETABLE_WINDOW, i.e. red. The fixture dates are in the past, and
+  // EMBARGOES/CADENCE_CEILINGS rows are only ever written for future windows, so the
+  // real tables cannot drift under these fixtures.
+  {
+    name: 'UNMEETABLE POSITIVE — a WEEKDAY deadline at 13:25:00Z (the FIRST frozen instant) is UNMEETABLE_WINDOW both before and after it passes: it neither idles as PENDING nor pages as STRANDED',
+    run: () =>
+      expect(
+        [
+          gradeCarrier({ description: orderBlock(NOT_IN_LIVE, '2026-10-02T13:25:00Z'), nowMs: Date.parse('2026-10-02T10:00:00Z'), liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle }),
+          gradeCarrier({ description: orderBlock(NOT_IN_LIVE, '2026-10-02T13:25:00Z'), nowMs: Date.parse('2026-10-02T14:00:00Z'), liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle }),
+        ],
+        (r) =>
+          r[0].verdict === 'UNMEETABLE_WINDOW' && r[0].finding === false && r[0].unmeetable === true &&
+          r[1].verdict === 'UNMEETABLE_WINDOW' && r[1].finding === false && r[1].unmeetable === true,
+      ),
+  },
+  {
+    name: 'UNMEETABLE NEGATIVE — the SAME 13:25:00Z instant on a SATURDAY is OPEN and grades normally: PENDING ahead, STRANDED past (a blanket "reject 13:25Z" is wrong, and so is a day-blind one)',
+    run: () =>
+      expect(
+        [
+          gradeCarrier({ description: orderBlock(NOT_IN_LIVE, '2026-10-03T13:25:00Z'), nowMs: Date.parse('2026-10-03T10:00:00Z'), liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle }),
+          gradeCarrier({ description: orderBlock(NOT_IN_LIVE, '2026-10-03T13:25:00Z'), nowMs: Date.parse('2026-10-03T14:00:00Z'), liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle }),
+        ],
+        (r) => r[0].verdict === 'PENDING' && r[1].verdict === 'STRANDED' && r[1].finding === true,
+      ),
+  },
+  {
+    name: 'UNMEETABLE BOUNDARY — 13:24:00Z on a weekday is the LAST OPEN MINUTE and grades normally: the freeze is closed-AT 13:25Z (TRA-2313 is that annotation read backwards)',
+    run: () =>
+      expect(
+        gradeCarrier({ description: orderBlock(NOT_IN_LIVE, '2026-10-02T13:24:00Z'), nowMs: Date.parse('2026-10-02T14:00:00Z'), liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle }),
+        (r) => r.verdict === 'STRANDED' && r.unmeetable !== true,
+      ),
+  },
+  {
+    name: 'UNMEETABLE does NOT reopen a SATISFIED order — the bytes are on the box, so a frozen deadline is a printed windowNote, never a page (all four live 13:25Z orders were satisfied early, by habit)',
+    run: () =>
+      expect(
+        gradeCarrier({ description: orderBlock(IN_LIVE, '2026-10-02T13:25:00Z'), nowMs: Date.parse('2026-10-02T14:00:00Z'), liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle }),
+        (r) => r.verdict === 'SATISFIED' && r.unmeetable !== true && typeof r.windowNote === 'string' && r.windowNote.includes('RTH freeze'),
+      ),
+  },
+  {
+    name: 'UNMEETABLE — a deadline inside a dated EMBARGOES row is refused the same way (the exit-5 gate), graded off a planted table through the real embargoState',
+    run: () =>
+      expect(
+        gradeCarrier({
+          description: orderBlock(NOT_IN_LIVE, '2026-10-06T21:00:00Z'),
+          nowMs: Date.parse('2026-10-06T22:30:00Z'), liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
+          deadlineGates: (ms) => gradeDeadlineGates(ms, {
+            freezeState, embargoState, activeCadenceCeiling,
+            embargoes: [{ from: '2026-10-06T20:30:00Z', to: '2026-10-06T22:00:00Z', ticket: 'TRA-5052 control fixture' }],
+            cadenceCeilings: [],
+          }),
+        }),
+        (r) => r.verdict === 'UNMEETABLE_WINDOW' && r.finding === false && r.detail.includes('embargo'),
+      ),
+  },
+  {
+    name: 'UNMEETABLE FAILS CLOSED — a deadline covered by an active CADENCE_CEILINGS row is BLIND (the quota is deploy history this run cannot read), never "meetable" and never STRANDED',
+    run: () =>
+      expect(
+        gradeCarrier({
+          description: orderBlock(NOT_IN_LIVE, '2026-10-06T21:00:00Z'),
+          nowMs: Date.parse('2026-10-06T22:30:00Z'), liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
+          deadlineGates: (ms) => gradeDeadlineGates(ms, {
+            freezeState, embargoState, activeCadenceCeiling,
+            embargoes: [],
+            cadenceCeilings: [{ from: '2026-10-05T20:00:00Z', to: '2026-10-09T20:00:00Z', ticket: 'TRA-5052 control fixture', max: 1 }],
+          }),
+        }),
+        (r) => r.verdict === 'BLIND' && r.finding === false && r.detail.includes('CADENCE_CEILINGS'),
       ),
   },
   {
@@ -1297,19 +1486,22 @@ const CONTROLS = [
           finalExit({ controlsFailed: 0, liveExit: EXIT_LATE }),
           finalExit({ controlsFailed: 0, liveExit: EXIT_UNGRADED }),
           finalExit({ controlsFailed: 0, liveExit: EXIT_ERROR }),
+          finalExit({ controlsFailed: 0, liveExit: EXIT_UNMEETABLE }),
+          finalExit({ controlsFailed: 1, liveExit: EXIT_UNMEETABLE }),
         ],
         (r) =>
           r[0] === EXIT_HARNESS && r[1] === EXIT_HARNESS && r[2] === EXIT_HARNESS &&
           r[3] === EXIT_CLEAN && r[4] === EXIT_FINDINGS && r[5] === EXIT_BLIND &&
-          r[6] === EXIT_LATE && r[7] === EXIT_UNGRADED && r[8] === EXIT_ERROR,
+          r[6] === EXIT_LATE && r[7] === EXIT_UNGRADED && r[8] === EXIT_ERROR &&
+          r[9] === EXIT_UNMEETABLE && r[10] === EXIT_HARNESS,
       ),
   },
   {
-    name: 'HARNESS vs BLIND — the two codes are DISTINCT and neither is 0 (sharing one was the AC4 defect)',
+    name: 'HARNESS vs BLIND — the codes are DISTINCT and none shares another\'s (sharing one was the AC4 defect; UNMEETABLE joining STRANDED or CLEAN would be TRA-5052\'s)',
     run: () =>
       expect(
-        [EXIT_CLEAN, EXIT_FINDINGS, EXIT_ERROR, EXIT_BLIND, EXIT_UNGRADED, EXIT_LATE, EXIT_HARNESS],
-        (r) => new Set(r).size === r.length && EXIT_HARNESS !== EXIT_BLIND && EXIT_HARNESS !== EXIT_CLEAN,
+        [EXIT_CLEAN, EXIT_FINDINGS, EXIT_ERROR, EXIT_BLIND, EXIT_UNGRADED, EXIT_LATE, EXIT_HARNESS, EXIT_UNMEETABLE],
+        (r) => new Set(r).size === r.length && EXIT_HARNESS !== EXIT_BLIND && EXIT_HARNESS !== EXIT_CLEAN && EXIT_UNMEETABLE !== EXIT_FINDINGS && EXIT_UNMEETABLE !== EXIT_CLEAN,
       ),
   },
 ];
@@ -1639,9 +1831,11 @@ async function liveSweep() {
     console.log(`[train]   VERDICT = ${g.verdict}${timingTag(g)}`);
     console.log(`[train]   ${g.detail}`);
     if (g.timingDetail) console.log(`[train]   timing: ${g.timingDetail}`);
+    if (g.windowNote) console.log(`[train]   window: ${g.windowNote}`);
     if (g.span) console.log(`[train]   span: ${g.span}`);
     if (g.verdict === 'BLIND') return EXIT_BLIND;
     if (g.finding) return EXIT_FINDINGS;
+    if (g.unmeetable) return EXIT_UNMEETABLE;
     if (g.late) return EXIT_LATE;
     if (g.ungraded) return EXIT_UNGRADED;
     return EXIT_CLEAN;
@@ -1827,6 +2021,7 @@ async function liveSweep() {
   // ── report ─────────────────────────────────────────────────────────────────
   const trains = rows.filter((r) => r.verdict !== 'NOT_TRAIN');
   const stranded = rows.filter((r) => r.finding);
+  const unmeetable = rows.filter((r) => r.unmeetable);
   const late = rows.filter((r) => r.late);
   const ungraded = rows.filter((r) => r.ungraded);
   const graded = trains.filter((r) => !r.ungraded && r.verdict !== 'BLIND');
@@ -1835,7 +2030,7 @@ async function liveSweep() {
   if (flag('json')) {
     console.log(
       JSON.stringify(
-        { liveSha, timingArm: deploys != null, population: counts, carriers: rows.length, trains: trains.length, stranded, late, ungraded, blind },
+        { liveSha, timingArm: deploys != null, population: counts, carriers: rows.length, trains: trains.length, stranded, unmeetable, late, ungraded, blind },
         null,
         2,
       ),
@@ -1853,6 +2048,7 @@ async function liveSweep() {
     console.log(`[train]   ${r.verdict.padEnd(11)} ${String(r.identifier).padEnd(10)} ${provenance(r)}  stamped ${r.firedAt ?? 'unknown'}`);
     console.log(`[train]       ${r.detail}${timingTag(r)}`);
     if (r.timingDetail) console.log(`[train]       timing: ${r.timingDetail}`);
+    if (r.windowNote) console.log(`[train]       window: ${r.windowNote}`);
     if (r.span && r.verdict !== 'SATISFIED') console.log(`[train]       span: ${r.span}`);
   };
 
@@ -1914,7 +2110,8 @@ async function liveSweep() {
   }
 
   // Precedence: a blind leg outranks a clean one, a stranded order outranks a missed
-  // window, and both outrank a backlog.
+  // window, and both outrank a backlog. An unmeetable order sits between them: it is a
+  // live defect (unlike LATE's settled history) but not an incident (unlike STRANDED).
   console.log('');
   if (blind.length > 0) {
     console.log(`[train] VERDICT = BLIND — ${blind.length} carrier(s) could not be read at all.`);
@@ -1924,6 +2121,14 @@ async function liveSweep() {
     console.log(`[train] VERDICT = STRANDED — ${stranded.length} deploy order(s) past deadline and NOT live.`);
     console.log('[train] This is the incident this check exists for. Each is named above with its commit.');
     return EXIT_FINDINGS;
+  }
+  if (unmeetable.length > 0) {
+    console.log(`[train] VERDICT = UNMEETABLE_WINDOW — ${unmeetable.length} unmet order(s) name a deadline the sanctioned`);
+    console.log('[train] deploy path itself REFUSES (RTH freeze / dated embargo). Nothing is stranded and this must');
+    console.log('[train] not page: it is an AUTHORING defect (TRA-5052) — re-issue each order with a reachable');
+    console.log('[train] deadline. 13:24Z is the honest weekday boundary; the freeze is open post-close and all');
+    console.log('[train] weekend, so most trains do not need a boundary-tight deadline at all.');
+    return EXIT_UNMEETABLE;
   }
   if (late.length > 0) {
     console.log(`[train] VERDICT = LATE — ${late.length} order(s) are live, but did not become live until AFTER`);
