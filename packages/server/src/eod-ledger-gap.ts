@@ -61,22 +61,46 @@ import type { EodTailCalendar } from './pnl-reconciliation.js';
  * writer pinned to three). That reasoning is sound and still holds for a WRITER.
  *
  * This constant is a different kind of object. It is not a derived working set —
- * it is the RULING: a closed, adjudicated historical fact about three specific
- * dates, authorised once, never to grow. If a fourth session goes absent it must
- * NOT be absorbed here; it is a new incident and the detector below is built to
- * make it fire. That is the entire point of keeping the exclusion a three-
- * element allow-list rather than a date range, a `>=` bound, or a suppression
- * window: a range would swallow the next incident, and a bound would swallow
- * every incident after it. This list can only ever fail closed.
+ * it is the RULING: a closed, adjudicated historical fact about specific dates,
+ * each authorised once by its own ruling, never to grow by anything other than a
+ * fresh ruling. If another session goes absent it must NOT be absorbed here; it
+ * is a new incident and the detector below is built to make it fire. That is the
+ * entire point of keeping the exclusion a per-date allow-list rather than a date
+ * range, a `>=` bound, or a suppression window: a range would swallow the next
+ * incident, and a bound would swallow every incident after it. This list can
+ * only ever fail closed.
+ *
+ * TWO RULINGS feed it, and they stay separate records because their causes are
+ * different measurements:
+ *   - TRA-2888 (CFO, 2026-08-04): 07-30/07-31/08-03, ENOSPC on inodes —
+ *     `EOD_DOCUMENTED_GAP` below.
+ *   - TRA-3975 D1 (board ruling recorded by the CEO under the TRA-5122
+ *     delegation, 2026-10-04): 2026-08-07, the TRA-3267 `isMarketDay()`
+ *     UTC-weekday defect, unbackfillable under TRA-2888 —
+ *     `EOD_LOST_SESSION_DOCUMENTED_GAP` below, which also carries the ruling's
+ *     HARD CONDITION: the gap must stay visible on every surface this exclusion
+ *     turns green. See `disclosureRequirement`.
  */
-export const EOD_DOCUMENTED_GAP_DATES: readonly string[] = Object.freeze([
+export const EOD_ENOSPC_GAP_DATES: readonly string[] = Object.freeze([
   '2026-07-30',
   '2026-07-31',
   '2026-08-03',
 ]);
 
-/** The ruling that authorised recording the gap as permanent. */
+/** TRA-3975 D1 (2026-10-04) — the TRA-3267 lost session. One date, never a range. */
+export const EOD_LOST_SESSION_GAP_DATES: readonly string[] = Object.freeze(['2026-08-07']);
+
+/** The union the detector excludes — both rulings, each date individually adjudicated. */
+export const EOD_DOCUMENTED_GAP_DATES: readonly string[] = Object.freeze([
+  ...EOD_ENOSPC_GAP_DATES,
+  ...EOD_LOST_SESSION_GAP_DATES,
+]);
+
+/** The ruling that authorised recording the ENOSPC gap as permanent. */
 export const EOD_DOCUMENTED_GAP_TICKET = 'TRA-2888';
+
+/** The ruling that authorised documenting the 2026-08-07 lost session. */
+export const EOD_LOST_SESSION_GAP_TICKET = 'TRA-3975';
 
 /**
  * The gap, as a structured record published on
@@ -105,7 +129,10 @@ export interface EodDocumentedGap {
 
 export const EOD_DOCUMENTED_GAP: EodDocumentedGap = Object.freeze({
   ticket: EOD_DOCUMENTED_GAP_TICKET,
-  dates: EOD_DOCUMENTED_GAP_DATES,
+  // The TRA-2888 record names ITS OWN three dates, not the union: its `cause`
+  // is the ENOSPC measurement and must not be read as covering 2026-08-07,
+  // whose cause is a different measurement on a separate record.
+  dates: EOD_ENOSPC_GAP_DATES,
   scope:
     'Fleet-wide, not live-book-only. Re-measured independently on bqb1 2026-08-05T03:17Z (build 237c147e): of the 47 books whose history spans the window (a row on/before 2026-07-29 AND a row on/after 2026-08-04), 47 of 47 are missing all three dates, with zero partials -- every book steps 2026-07-29 -> 2026-08-04. No book anywhere holds a row on any of the three. (The parent ruling cited 61; 61 is the count of engines with any rows at all, 47 is the count whose history actually spans the window and can be graded on it. The finding is unchanged.)',
   cause:
@@ -123,9 +150,85 @@ export const EOD_DOCUMENTED_GAP: EodDocumentedGap = Object.freeze({
   ]),
 });
 
+/**
+ * TRA-3975 D1 (board ruling recorded by the CEO under the TRA-5122 delegation,
+ * 2026-10-04) — the 2026-08-07 lost session, documented.
+ *
+ * ── Why this is a SECOND record and not a fourth date on TRA-2888's ──────────
+ *
+ * `eodDocumentedGap.cause` is a measurement (ENOSPC on inodes) and 2026-08-07's
+ * cause is a different measurement (the TRA-3267 `isMarketDay()` UTC-weekday
+ * defect). One record whose `cause` covers only three of its four dates would
+ * lie about the fourth. The DATES pool into `EOD_DOCUMENTED_GAP_DATES` because
+ * the exclusion mechanics are identical; the RECORDS stay separate because the
+ * evidence is not.
+ *
+ * ── The ruling's hard condition, and why it is wired into the payload ────────
+ *
+ * Documenting this gap flips four previously-red axes green — exactly the shape
+ * where a consistency fix deletes the truthful surface. The ruling therefore
+ * conditions D1 on the gap being PUBLISHED ON THE SAME SURFACE THAT READS
+ * GREEN, membership and cardinality visible: `liveEodInteriorNotAcknowledgedOk`
+ * must read as "ok, with 1 documented gap (2026-08-07, TRA-3267, unbackfillable
+ * under TRA-2888)", never as a bare `true`. `summarizeEodInteriorAbsence`
+ * implements that as `liveEodInteriorDocumentedGapBooks` plus the
+ * `*NotAcknowledgedDisclosure` strings, computed from the same per-book
+ * `interiorAbsentDocumented` arrays the exclusion is derived from — so a green
+ * without the disclosure is not constructible, which is the property the ruling
+ * demands ("if any axis goes green without the gap being visible on its
+ * surface, that is a defect against this ruling, not a success").
+ */
+export interface EodLostSessionDocumentedGap {
+  /** The ruling ticket (the adjudication). */
+  ticket: string;
+  /** The incident ticket (the measured, fixed, closed writer defect). */
+  incidentTicket: string;
+  dates: readonly string[];
+  rulingDate: string;
+  rulingAuthority: string;
+  /** Fleet-wide and TOTAL — zero collateral suppression, measured. */
+  scope: string;
+  /** MEASURED — the property that qualified this date for this list. */
+  cause: string;
+  /** Were these sessions written and then lost, or never written at all? */
+  capture: string;
+  /** Is reconstructing the row authorised? Permanently false. */
+  backfillAuthorised: false;
+  backfillFlag: string;
+  /** The independent artifact the MEASURED-cause claim rests on. */
+  durableArtifact: string;
+  /** The ruling's hard condition — the disclosure that must ride every green. */
+  disclosureRequirement: string;
+  /** The cost the ruling accepted with eyes open (TRA-3975 finding F3). */
+  positiveControlRetired: string;
+}
+
+export const EOD_LOST_SESSION_DOCUMENTED_GAP: EodLostSessionDocumentedGap = Object.freeze({
+  ticket: EOD_LOST_SESSION_GAP_TICKET,
+  incidentTicket: 'TRA-3267',
+  dates: EOD_LOST_SESSION_GAP_DATES,
+  rulingDate: '2026-10-04',
+  rulingAuthority:
+    'Board ruling of record, recorded by the CEO under the explicit TRA-5122 delegation of board decision authority (2026-10-04), adjudicating TRA-3975: disposition D1 (DOCUMENT), with the disclosure condition below.',
+  scope:
+    'Fleet-wide and TOTAL, with ZERO collateral suppression -- measured on live bqb1 2026-10-04 (and 2026-08-24, identically): 63 of 63 books whose span covers 2026-08-07 are missing the row; both neighbours are intact (2026-08-06: 63/63 rows, 2026-08-10: 63/63). The 4 books not affected have spanStart 2026-08-11..2026-08-13, i.e. the date is outside their span entirely -- not one healthy (book, date) pair is suppressed by this exclusion. That measured zero is what distinguishes this from the enock absence, whose documented-gap route was REJECTED by TRA-2943 precisely because it would have suppressed 28 sessions across 61 healthy books.',
+  cause:
+    'MEASURED, to the line: TRA-3267 -- isMarketDay() derived day-of-week from host-local (UTC) time while its holiday lookup used ET, so the 21:00 ET Friday archive pass read 2026-08-07 as "Saturday" and skipped all 63 books (and booked a phantom Sunday). Fixed in d4246e0, live on bqb1 since 2026-08-12, verified clean over the 2026-08-14 and 2026-08-21 Fridays and three post-fix weekends. TRA-3267 closed done 2026-08-24. This is the documented-gap bar the enock record could not meet: its cause reads NOT MEASURED.',
+  capture:
+    'NEVER CAPTURED. The archive pass skipped the books at the only moment the figures existed; no source holds them. Unbackfillable under TRA-2888 anti-fabrication: catchUpMissedEodReports fills the dated report FILE only and is gated out of saveSnapshot, and a fabricated row would rewrite the telescoped opening chain. ENABLE_EOD_ROW_BACKFILL stays false; eodInteriorAbsentOkRetirement.forbiddenRemedies names arming it as refused.',
+  backfillAuthorised: false,
+  backfillFlag: 'ENABLE_EOD_ROW_BACKFILL',
+  durableArtifact:
+    'GET /api/health/eod-archive-participation publishes the lost_session anomaly for etDay 2026-08-07: run 2026-08-07#1786150815192, recordedMarketDay:false vs calendarMarketDay:true, participated:0, skippedNotMarketDay:63. RETAIN_MS is 120 days, so the artifact survives to ~2026-12-05; this record carries its content so the measurement outlives the retention window.',
+  disclosureRequirement:
+    'THE RULING\'S HARD CONDITION, verbatim in effect: the documented-gap set must be published on the same surface that reads green, with its membership and its cardinality visible. liveEodInteriorNotAcknowledgedOk on the live books must read as "ok, with 1 documented gap (2026-08-07, TRA-3267, unbackfillable under TRA-2888)" -- never as a bare true. Read liveEodInteriorNotAcknowledgedDisclosure and liveEodInteriorDocumentedGapBooks beside the boolean; a green without the gap visible on its surface is a defect against the ruling, not a success.',
+  positiveControlRetired:
+    'COST ACCEPTED BY THE RULING (TRA-3975 finding F3): 2026-08-07 was the TRA-2931 acknowledgement axis\'s live positive control -- enock reading exactly ["2026-08-07"] on eodInteriorNotAcknowledgedBooks proved the subtraction removes its 10 visible dates AND does not swallow a date outside its set. Documenting the date retires that live control; the mechanism check now lives in the eod-ledger-gap tests (a 29th enock date or any date on a second book still fires), and the next genuinely new absent date re-creates a live control by existing.',
+});
+
 /** Prose form of the ruling, spread into the endpoint's top-level `caveats`. */
 export const PNL_EOD_DOCUMENTED_GAP_NOTE =
-  'TRA-2888: 2026-07-30, 2026-07-31 and 2026-08-03 are a PERMANENT, UNRECOVERABLE gap in the EOD ledger, FLEET-WIDE. These sessions were NEVER CAPTURED -- not lost in transit. /data was at ENOSPC (out of INODES, not bytes -- appends survived, file creates failed, every disk axis read green) from 2026-07-30 through 2026-08-04T21:20Z; the 21:00 ET archive fired on time and every EOD report/snapshot write died with ENOSPC across 47 books on both nights. No source holds these figures. Re-measured on bqb1 2026-08-05T03:17Z build 237c147e: of 47 books whose history spans the window, 47 of 47 miss all three dates, zero partials -- every book steps 2026-07-29 -> 2026-08-04. Back-fill is NOT authorised and ENABLE_EOD_ROW_BACKFILL stays false; if anyone proposes arming it, this ruling is the answer. RETIRED by this ruling: the TRA-2829 acceptance line "liveEodTailStaleBooks is empty" -- it is already true and discriminates nothing, because the tail cohort is (newestRow, lastSettledSession] and the three absent sessions left it when the 2026-08-04 rows advanced the anchor. It went green by EVICTION, not repair. Grade the SET OF USERNAMES in `eodInteriorAbsentBooks` instead: that cohort is enumerated from the exchange calendar and diffed against rows present, so it cannot be emptied by a later row. Do NOT grade the fleet boolean `eodInteriorAbsentOk` -- this ticket originally pointed there and TRA-2943 has since RETIRED it as pinned-false; read `eodInteriorAbsentOkRetirement` for the ruling and the identity it is pinned by. NOTE the three dates are excluded from that verdict as this documented gap and are published separately -- fleet-level under `eodInteriorDocumentedGapBooks`, per book under `engines[].eodInterior.interiorAbsentDocumented`; the exclusion is a three-element allow-list, never a range or a cutoff, so a NEW interior hole still goes red -- one already does (`enock`; the route shows 10 clamped post-baseline dates, but the INCIDENT is thirty absent sessions -- see `eodInteriorAbsentOkRetirement.adjudicated` -- and was invisible to every field published before this ticket). This ruling does NOT discharge the TRA-2829 provenance ceiling: the live book\'s post-baseline `optionsDailyPnlSource` is `journal-repair`, not `journal`. A resumed ledger confirms the ledger resumed, nothing more.';
+  'TRA-2888: 2026-07-30, 2026-07-31 and 2026-08-03 are a PERMANENT, UNRECOVERABLE gap in the EOD ledger, FLEET-WIDE. These sessions were NEVER CAPTURED -- not lost in transit. /data was at ENOSPC (out of INODES, not bytes -- appends survived, file creates failed, every disk axis read green) from 2026-07-30 through 2026-08-04T21:20Z; the 21:00 ET archive fired on time and every EOD report/snapshot write died with ENOSPC across 47 books on both nights. No source holds these figures. Re-measured on bqb1 2026-08-05T03:17Z build 237c147e: of 47 books whose history spans the window, 47 of 47 miss all three dates, zero partials -- every book steps 2026-07-29 -> 2026-08-04. Back-fill is NOT authorised and ENABLE_EOD_ROW_BACKFILL stays false; if anyone proposes arming it, this ruling is the answer. RETIRED by this ruling: the TRA-2829 acceptance line "liveEodTailStaleBooks is empty" -- it is already true and discriminates nothing, because the tail cohort is (newestRow, lastSettledSession] and the three absent sessions left it when the 2026-08-04 rows advanced the anchor. It went green by EVICTION, not repair. Grade the SET OF USERNAMES in `eodInteriorAbsentBooks` instead: that cohort is enumerated from the exchange calendar and diffed against rows present, so it cannot be emptied by a later row. Do NOT grade the fleet boolean `eodInteriorAbsentOk` -- this ticket originally pointed there and TRA-2943 has since RETIRED it as pinned-false; read `eodInteriorAbsentOkRetirement` for the ruling and the identity it is pinned by. NOTE the three dates are excluded from that verdict as this documented gap and are published separately -- fleet-level under `eodInteriorDocumentedGapBooks`, per book under `engines[].eodInterior.interiorAbsentDocumented`; the exclusion is a per-date allow-list, never a range or a cutoff -- this ruling\'s three ENOSPC dates, plus 2026-08-07 under the separate TRA-3975 D1 ruling (2026-10-04, cause TRA-3267, see `eodLostSessionDocumentedGap`) -- so a NEW interior hole still goes red -- one already does (`enock`; the route shows 10 clamped post-baseline dates, but the INCIDENT is thirty absent sessions -- see `eodInteriorAbsentOkRetirement.adjudicated` -- and was invisible to every field published before this ticket). This ruling does NOT discharge the TRA-2829 provenance ceiling: the live book\'s post-baseline `optionsDailyPnlSource` is `journal-repair`, not `journal`. A resumed ledger confirms the ledger resumed, nothing more.';
 
 /**
  * TRA-2943 (CFO ruling 2026-08-05, adjudicating TRA-2942) — the adjudicated
@@ -330,24 +433,23 @@ export const PNL_EOD_INTERIOR_RETIREMENT_NOTE =
  * missing on them and there is nothing to acknowledge. Listing them would make
  * this record disagree with the calendar the detector enumerates from.
  *
- * ── Why 2026-08-07 is NOT here ───────────────────────────────────────────────
+ * ── Why 2026-08-07 is NOT here — it is DOCUMENTED, not acknowledged ──────────
  *
  * Sixty-three books red on one date is exactly the pressure that makes someone
- * reach for an acknowledgement list. 2026-08-07 is an undocumented absence whose
- * adjudication is owned by TRA-3975, and it must stay red on all 63 books,
- * `enock` included. TRA-2928 constraint 7, stated as a rule rather than a note:
- * this list holds `enock` only, and only inside 2026-06-15..2026-07-24.
- *
- * TRA-3267 (the `isMarketDay()` UTC-weekday defect that dropped the row) closed
- * `done` 2026-08-24 on the WRITER: `d4246e0` is live and two post-fix Fridays
- * (08-14, 08-21) and three post-fix weekends came back clean. Closing it did not
- * repair 08-07 and was never going to — TRA-2888 anti-fabrication forbids writing
- * the row. So the residue moved to TRA-3975 rather than being left pointing at a
- * closed ticket. Read that ticket before touching this block: it holds the live
- * measurement (08-07 is the SOLE date on this axis, on all four of
- * `eodInteriorAbsentOk` / `eodInteriorNotAcknowledgedOk` and both `live*`
- * cohorts) and the two candidate dispositions. Neither is implementable here
- * without a fresh ruling.
+ * reach for an acknowledgement list, and this list refused it: it holds `enock`
+ * only, and only inside 2026-06-15..2026-07-24 (TRA-2928 constraint 7). The
+ * date's adjudication was owned by TRA-3975, and on 2026-10-04 the board ruled
+ * disposition D1: 2026-08-07 is a DOCUMENTED GAP (`EOD_LOST_SESSION_DOCUMENTED_GAP`,
+ * on the documented-gap path beside TRA-2888's ENOSPC dates), because unlike the
+ * `enock` record its cause is MEASURED — TRA-3267, the `isMarketDay()`
+ * UTC-weekday defect, fixed (`d4246e0`, live 2026-08-12, closed 2026-08-24) —
+ * and unbackfillable under TRA-2888. It never touched this allow-list: the
+ * documented exclusion removes it from `interiorAbsentNet` before this record is
+ * consulted, so the pair-list is still `enock`-only and span-bounded, exactly as
+ * constraint 7 demands. The ruling's hard condition — the gap stays VISIBLE on
+ * every surface the exclusion turns green — is carried by
+ * `liveEodInteriorDocumentedGapBooks` and the `*NotAcknowledgedDisclosure`
+ * strings below.
  */
 export interface EodAcknowledgedAbsencePair {
   book: string;
@@ -446,12 +548,12 @@ export const EOD_INTERIOR_ACKNOWLEDGED_ABSENCE: EodInteriorAcknowledgedAbsence =
   matching:
     'Per (book, date) pair, allow-list only -- never a range, never a >= bound, never a bare date list. A 29th absent date on enock, or any date on any second book, is outside this record and goes red on eodInteriorNotAcknowledgedBooks immediately.',
   gateableAxis:
-    'eodInteriorNotAcknowledgedOk / eodInteriorNotAcknowledgedBooks. Computed by subtracting these pairs from interiorAbsentNet, which is itself unchanged. RED today (2026-08-07, TRA-3975, 63 books) -- and that red is CORRECT and must not be acknowledged here. 2026-08-07 is now the SOLE date on this axis across all 63 books, and it also pins liveEodInteriorNotAcknowledgedOk false on both live books (admin, v0nni) -- i.e. the reachable red TRA-2943 nominated as the surviving gradeable signal has been reached. The writer defect that dropped the row (TRA-3267) shipped and closed 2026-08-24; the row itself cannot be backfilled (TRA-2888), so the remaining question is document-vs-adopt-the-standing-red and it is a ruling, tracked on TRA-3975.',
+    'eodInteriorNotAcknowledgedOk / eodInteriorNotAcknowledgedBooks. Computed by subtracting these pairs from interiorAbsentNet, which is itself unchanged. The 2026-08-07 red this axis carried from 2026-08-12 was ADJUDICATED on 2026-10-04: TRA-3975 ruled D1, documenting the date on the documented-gap path (eodLostSessionDocumentedGap -- cause MEASURED, TRA-3267; unbackfillable under TRA-2888), so it leaves interiorAbsentNet upstream of this record and the axis greens WITHOUT this allow-list growing. NEVER read the green bare: the ruling conditions it on the gap staying visible on the same surface -- read liveEodInteriorNotAcknowledgedDisclosure / liveEodInteriorDocumentedGapBooks beside the boolean. A new absent date on any book still fires this axis immediately.',
   deliberatelyNotAcknowledged: Object.freeze([
     Object.freeze({
       dates: Object.freeze(['2026-08-07']),
       ticket: 'TRA-3975',
-      why: 'An undocumented absence awaiting adjudication, not an acknowledged one: isMarketDay() derived day-of-week from host-local (UTC) time while its holiday lookup used ET, so the 21:00 ET archive dropped every Friday row fleet-wide and booked a phantom Sunday. The WRITER is fixed and closed (TRA-3267, d4246e0, live 2026-08-12; verified clean over 2026-08-14 and 2026-08-21 Fridays and the 08-15/16, 08-22/23 weekends), but the dropped row cannot be written after the fact (TRA-2888), so this date stays RED on all affected books, enock included, until TRA-3975 rules on document-vs-standing-red. TRA-2928 constraint 7.',
+      why: 'ADJUDICATED 2026-10-04: TRA-3975 ruled D1 -- a DOCUMENTED GAP (eodLostSessionDocumentedGap), never an acknowledged one, because its cause is MEASURED: isMarketDay() derived day-of-week from host-local (UTC) time while its holiday lookup used ET, so the 21:00 ET archive dropped every Friday row fleet-wide (TRA-3267, fixed in d4246e0, live 2026-08-12, closed 2026-08-24). The row stays unwritten forever (TRA-2888). It is excluded on the documented-gap path upstream of this record, so it never entered this allow-list and TRA-2928 constraint 7 (enock-only, span-bounded) still holds verbatim. The ruling\'s hard condition: the gap stays visible beside every green it produces -- see eodLostSessionDocumentedGap.disclosureRequirement.',
     }),
     Object.freeze({
       dates: Object.freeze(['2026-06-19', '2026-07-03']),
@@ -459,16 +561,16 @@ export const EOD_INTERIOR_ACKNOWLEDGED_ABSENCE: EodInteriorAcknowledgedAbsence =
       why: 'Juneteenth and Independence-Day-observed on this repo\'s own MARKET_HOLIDAYS table (scheduler.ts). Not sessions, so no row is missing and there is nothing to acknowledge. Listing them would make this record disagree with the calendar the detector enumerates from.',
     }),
     Object.freeze({
-      dates: EOD_DOCUMENTED_GAP_DATES,
+      dates: EOD_ENOSPC_GAP_DATES,
       ticket: EOD_DOCUMENTED_GAP_TICKET,
-      why: 'Already the DOCUMENTED gap, with a measured cause, on a separate and deliberately fleet-wide code path. They are removed from interiorAbsentNet before this record is ever consulted, so they can never appear in either arm of this axis. The two lists are disjoint and a test asserts it.',
+      why: 'Already the DOCUMENTED gap, with a measured cause (ENOSPC on inodes), on a separate and deliberately fleet-wide code path. They are removed from interiorAbsentNet before this record is ever consulted, so they can never appear in either arm of this axis. The two lists are disjoint and a test asserts it.',
     }),
   ]),
 });
 
 /** Prose form, spread into the endpoint's top-level `caveats`. */
 export const PNL_EOD_INTERIOR_ACKNOWLEDGED_NOTE =
-  'TRA-2931 (ruling TRA-2928 D2): `eodInteriorNotAcknowledgedOk` / `eodInteriorNotAcknowledgedBooks` is the GATEABLE interior-absence axis. Grade it. `eodInteriorAbsentOk` stays RETIRED and pinned false (TRA-2943) and this ticket did not and could not change that -- it is additive only. WHAT IT DOES: subtracts the ACKNOWLEDGED absence -- published as `eodInteriorAcknowledgedAbsence`, an allow-list of 28 (book, date) PAIRS, `enock` only, spanning 2026-06-15..2026-07-24 -- from `interiorAbsentNet`, and grades the remainder. Everything else is untouched: `interiorAbsentRaw`, `interiorAbsentDocumented`, `interiorAbsentNet`, `interiorAbsentOk`, `eodInteriorAbsentBooks` and `eodInteriorAbsentRawBookCount` all hold exactly the values they held before this axis existed, and `enock` is still named in `eodInteriorAbsentBooks` with all of its dates. NOTHING IS SUPPRESSED. IT IS AN ACKNOWLEDGEMENT, NOT A DOCUMENTED GAP: its `cause` reads NOT MEASURED and points at TRA-2903, the archive-participation ticket, as the OPEN question -- unlike `eodDocumentedGap`, whose cause is measured (ENOSPC on inodes). The two are separate objects on separate code paths and nothing in the acknowledged record can be read from, or written into, `EOD_DOCUMENTED_GAP_DATES`. THE UNIT IS A PAIR, NEVER A RANGE: a 29th absent date on `enock`, or any date on any second book, fires immediately. TWENTY-EIGHT AND NOT THE TEN ON THE WIRE: `spanStart = max(firstRow, baselineDate)` clamps at the env-pinned 2026-07-12, so 18 of the 28 are inert today and exist so this axis does not re-red when that env moves. 2026-06-19 and 2026-07-03 are NOT in the list -- they are NYSE holidays, not sessions. THIS AXIS IS RED TODAY AND THAT IS CORRECT: 2026-08-07 has no EOD row on any book (TRA-3267 -- `isMarketDay()` read day-of-week from host-local UTC while its holiday lookup used ET, dropping every Friday row fleet-wide). That WRITER defect is fixed and closed (`d4246e0`, live since 2026-08-12, verified clean over the 2026-08-14 and 2026-08-21 Fridays and three post-fix weekends), but the row it dropped can never be written after the fact (TRA-2888), so 2026-08-07 is an UNADJUDICATED absence, NOT an acknowledged one; it is deliberately excluded from the allow-list and must stay red until TRA-3975 rules on it -- either documenting it (its cause IS measured, unlike `enock`\'s) or adopting the standing red the way TRA-2943 did. Do not read the closure of TRA-3267 as licence to green this axis. It is also this axis\'s live positive control: it exercises the real mechanism path on real rows in both directions at once -- `enock` reading exactly `["2026-08-07"]` proves the acknowledgement subtracts its 10 visible dates AND that it does not swallow a date outside its set.';
+  'TRA-2931 (ruling TRA-2928 D2): `eodInteriorNotAcknowledgedOk` / `eodInteriorNotAcknowledgedBooks` is the GATEABLE interior-absence axis. Grade it. `eodInteriorAbsentOk` stays RETIRED and pinned false (TRA-2943) and this ticket did not and could not change that -- it is additive only. WHAT IT DOES: subtracts the ACKNOWLEDGED absence -- published as `eodInteriorAcknowledgedAbsence`, an allow-list of 28 (book, date) PAIRS, `enock` only, spanning 2026-06-15..2026-07-24 -- from `interiorAbsentNet`, and grades the remainder. Everything else is untouched: `interiorAbsentRaw`, `interiorAbsentDocumented`, `interiorAbsentNet`, `interiorAbsentOk`, `eodInteriorAbsentBooks` and `eodInteriorAbsentRawBookCount` all hold exactly the values they held before this axis existed, and `enock` is still named in `eodInteriorAbsentBooks` with all of its dates. NOTHING IS SUPPRESSED. IT IS AN ACKNOWLEDGEMENT, NOT A DOCUMENTED GAP: its `cause` reads NOT MEASURED and points at TRA-2903, the archive-participation ticket, as the OPEN question -- unlike `eodDocumentedGap`, whose cause is measured (ENOSPC on inodes). The two are separate objects on separate code paths and nothing in the acknowledged record can be read from, or written into, `EOD_DOCUMENTED_GAP_DATES`. THE UNIT IS A PAIR, NEVER A RANGE: a 29th absent date on `enock`, or any date on any second book, fires immediately. TWENTY-EIGHT AND NOT THE TEN ON THE WIRE: `spanStart = max(firstRow, baselineDate)` clamps at the env-pinned 2026-07-12, so 18 of the 28 are inert today and exist so this axis does not re-red when that env moves. 2026-06-19 and 2026-07-03 are NOT in the list -- they are NYSE holidays, not sessions. THE 2026-08-07 RED THIS AXIS CARRIED FROM 2026-08-12 WAS ADJUDICATED 2026-10-04: TRA-3975 ruled D1 -- the date is a DOCUMENTED GAP (published as `eodLostSessionDocumentedGap`), because unlike `enock`\'s its cause IS measured: TRA-3267, `isMarketDay()` read day-of-week from host-local UTC while its holiday lookup used ET, dropping every Friday row fleet-wide; fixed (`d4246e0`, live 2026-08-12, closed 2026-08-24); the row itself stays unwritten forever (TRA-2888). It is excluded on the DOCUMENTED path upstream of this record -- the allow-list did NOT grow, stays `enock`-only and span-bounded (TRA-2928 constraint 7), and a new absent date on any book still fires `eodInteriorNotAcknowledgedBooks` immediately. THE GREEN IS CONDITIONAL, NEVER BARE: the ruling requires the gap visible on the same surface -- read `liveEodInteriorNotAcknowledgedDisclosure` and `liveEodInteriorDocumentedGapBooks` beside the boolean, and treat a green without them as a defect against the ruling. COST ON THE RECORD (TRA-3975 F3): documenting the date retires this axis\'s live positive control (`enock` reading exactly `["2026-08-07"]` proved the subtraction removes its 10 visible dates AND does not swallow an outside date); the mechanism check now lives in the eod-ledger-gap tests.';
 
 /** Per-book split of `interiorAbsentNet` into the acknowledged arm and the graded arm. */
 export interface EodInteriorAcknowledgedSplit {
@@ -707,6 +809,10 @@ export interface EodInteriorAbsenceBook {
  */
 export function summarizeEodInteriorAbsence(books: ReadonlyArray<EodInteriorAbsenceBook>): {
   eodDocumentedGap: EodDocumentedGap;
+  /** TRA-3975 D1 — the 2026-08-07 record, beside the TRA-2888 one it pools dates with. */
+  eodLostSessionDocumentedGap: EodLostSessionDocumentedGap;
+  /** The FULL exclusion set (both rulings) — membership and cardinality on the wire. */
+  eodDocumentedGapDates: readonly string[];
   eodInteriorAbsentOkRetirement: EodInteriorAbsentOkRetirement;
   eodInteriorBookCount: number;
   eodInteriorGradeableBookCount: number;
@@ -722,8 +828,14 @@ export function summarizeEodInteriorAbsence(books: ReadonlyArray<EodInteriorAbse
   eodInteriorNotAcknowledgedOk: boolean | null;
   eodInteriorNotAcknowledgedBooks: Array<{ username: string; dates: string[]; gradeableCount: number }>;
   eodInteriorNotAcknowledgedBookCount: number;
+  /** TRA-3975 hard condition — the verdict with its documented gaps IN the sentence. */
+  eodInteriorNotAcknowledgedDisclosure: string;
   liveEodInteriorNotAcknowledgedOk: boolean | null;
   liveEodInteriorNotAcknowledgedBooks: Array<{ username: string; dates: string[]; gradeableCount: number }>;
+  /** TRA-3975 hard condition — the live documented-gap membership, beside the live green. */
+  liveEodInteriorDocumentedGapBooks: Array<{ username: string; dates: string[] }>;
+  /** TRA-3975 hard condition — never read `liveEodInteriorNotAcknowledgedOk` without this. */
+  liveEodInteriorNotAcknowledgedDisclosure: string;
 } {
   const fold = (cohort: ReadonlyArray<EodInteriorAbsenceBook>): boolean | null =>
     cohort.some(b => b.interior.interiorAbsentOk === false)
@@ -762,8 +874,36 @@ export function summarizeEodInteriorAbsence(books: ReadonlyArray<EodInteriorAbse
         gradeableCount: b.interior.interiorGradeableCount,
       }));
 
+  const documentedGapBooks = (cohort: ReadonlyArray<EodInteriorAbsenceBook>) =>
+    cohort
+      .filter(b => b.interior.interiorAbsentDocumented.length > 0)
+      .map(b => ({ username: b.username, dates: b.interior.interiorAbsentDocumented }));
+
+  // TRA-3975 hard condition: the verdict and its documented gaps travel in ONE
+  // string, derived from the same per-book `interiorAbsentDocumented` arrays
+  // the exclusion itself is derived from — a green that forgot its gaps is not
+  // constructible from this payload.
+  const notAcknowledgedDisclosure = (cohort: ReadonlyArray<EodInteriorAbsenceBook>): string => {
+    const fold = notAcknowledgedFold(cohort);
+    const gapBooks = documentedGapBooks(cohort);
+    const dates = [...new Set(gapBooks.flatMap(b => b.dates))].sort();
+    const head = fold === true ? 'ok' : fold === false ? 'RED' : 'NOT MEASURED';
+    if (dates.length === 0) return `${head}, with 0 documented gap dates in span`;
+    return (
+      `${head}, with ${dates.length} documented gap date(s) in span (${dates.join(', ')}) ` +
+      `across ${gapBooks.length} book(s) -- rulings: TRA-2888 (ENOSPC: 2026-07-30/31, 2026-08-03) ` +
+      `and TRA-3975 D1 (2026-08-07, cause TRA-3267, unbackfillable under TRA-2888). ` +
+      `Never read the boolean beside this as a bare pass.`
+    );
+  };
+
   return {
     eodDocumentedGap: EOD_DOCUMENTED_GAP,
+    // TRA-3975 D1 — the second documented-gap record and the union exclusion
+    // set, published so the fleet surface carries both rulings' membership and
+    // cardinality beside every verdict they influence.
+    eodLostSessionDocumentedGap: EOD_LOST_SESSION_DOCUMENTED_GAP,
+    eodDocumentedGapDates: EOD_DOCUMENTED_GAP_DATES,
     // TRA-2943 — the retirement travels WITH the field it retires. A reader who
     // pulls this payload and finds `eodInteriorAbsentOk: false` finds the ruling,
     // the identity it is pinned by, and what to grade instead in the same object.
@@ -803,7 +943,10 @@ export function summarizeEodInteriorAbsence(books: ReadonlyArray<EodInteriorAbse
     eodInteriorNotAcknowledgedOk: notAcknowledgedFold(books),
     eodInteriorNotAcknowledgedBooks: notAcknowledgedNamed(books),
     eodInteriorNotAcknowledgedBookCount: notAcknowledgedNamed(books).length,
+    eodInteriorNotAcknowledgedDisclosure: notAcknowledgedDisclosure(books),
     liveEodInteriorNotAcknowledgedOk: notAcknowledgedFold(live),
     liveEodInteriorNotAcknowledgedBooks: notAcknowledgedNamed(live),
+    liveEodInteriorDocumentedGapBooks: documentedGapBooks(live),
+    liveEodInteriorNotAcknowledgedDisclosure: notAcknowledgedDisclosure(live),
   };
 }

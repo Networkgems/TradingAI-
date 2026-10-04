@@ -353,10 +353,12 @@ export const PNL_DRIFT_GRADEABLE = false;
  * `eodInteriorNotAcknowledgedBooks` grade the same absence with the adjudicated
  * `enock` pairs subtracted, so a gate has a predicate instead of the retirement's
  * human instruction to "read the set of usernames". It is deliberately NOT in
- * this list. Note it is RED today and correctly so — 2026-08-07, TRA-3975 (the
- * writer defect TRA-3267 that dropped the row is fixed and closed; the row itself
- * is unbackfillable under TRA-2888, so the absence is awaiting adjudication, and
- * 2026-08-07 is the SOLE date holding this axis and both `live*` cohorts red).
+ * this list. The 2026-08-07 red it carried from 2026-08-12 was adjudicated on
+ * 2026-10-04: TRA-3975 ruled D1, documenting the date on the documented-gap
+ * path (`eodLostSessionDocumentedGap` — cause measured, TRA-3267; row
+ * unbackfillable under TRA-2888). The resulting green is CONDITIONAL on the
+ * gap staying visible: read `liveEodInteriorNotAcknowledgedDisclosure` /
+ * `liveEodInteriorDocumentedGapBooks` beside the boolean, never the bare bool.
  */
 export const PNL_UNGRADEABLE_FIELDS = [
   'ok',
