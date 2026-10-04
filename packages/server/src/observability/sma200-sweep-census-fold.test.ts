@@ -20,7 +20,7 @@ import type { EngineState } from '../signal-engine.js';
 const NOW = Date.UTC(2026, 8, 16, 1, 0, 0);
 
 /** A census whose counters are internally consistent with its verdict. */
-function census(over: Record<string, number> = {}) {
+function census(over: Record<string, unknown> = {}) {
   return {
     startedAt: NOW - 60_000,
     finishedAt: NOW - 30_000,
@@ -196,5 +196,74 @@ describe('summarizeSma200Sweeps (TRA-4457 — publishing the sweep census)', () 
     // …so `servedFallback: 100` is a LOWER BOUND over a partial fleet, and the
     // reader is told so rather than reading it as the whole fleet's number.
     expect(r.totals.servedFallback).toBe(100);
+  });
+
+  // ── TRA-5111 — the per-symbol starvation fold ────────────────────────────
+  it('darkSymbols is "evaluated NOWHERE": a sibling book clears an engine-level starve', () => {
+    const r = summarizeSma200Sweeps(
+      [
+        // Book A: budget starved AAA and BBB.
+        engine(census({
+          considered: 3, evaluated: 1,
+          starvedBreakerOpen: 2, starvedFallbackBudget: 2,
+          evaluatedSymbols: ['CCC'],
+          starvedBreakerOpenSymbols: ['AAA', 'BBB'],
+          starvedFallbackBudgetSymbols: ['AAA', 'BBB'],
+          starvedShortHistorySymbols: [], fallbackUnavailableSymbols: [], fetchFailedSymbols: [],
+        }), 'SWEPT'),
+        // Book B: evaluated AAA — so AAA had its look and only BBB is dark.
+        engine(census({
+          considered: 2, evaluated: 2,
+          evaluatedSymbols: ['AAA', 'CCC'],
+          starvedBreakerOpenSymbols: [], starvedFallbackBudgetSymbols: [],
+          starvedShortHistorySymbols: [], fallbackUnavailableSymbols: [], fetchFailedSymbols: [],
+        }), 'SWEPT'),
+      ],
+      NOW,
+    );
+    // Engine-level union keeps BOTH names — it is a per-book fact…
+    expect(r.starvation.starvedFallbackBudgetSymbols).toEqual(['AAA', 'BBB']);
+    // …but only the name NO book evaluated is dark, which is the fleet fact
+    // the AC7 arrival arithmetic (TRA-4921) keys on.
+    expect(r.starvation.darkSymbols).toEqual(['BBB']);
+    expect(r.starvation.darkCount).toBe(1);
+    expect(r.starvation.evaluatedDistinct).toBe(2);
+    expect(r.starvation.listsUnpublished).toBe(0);
+  });
+
+  it('ABSENT ≠ EMPTY: a pre-TRA-5111 census counts as listsUnpublished, not as "nothing starved"', () => {
+    const r = summarizeSma200Sweeps(
+      [
+        // Carries the TRA-5065 counters but none of the per-symbol lists.
+        engine(census({ considered: 400, starvedBreakerOpen: 400, servedFallback: 0 }), 'BLIND'),
+        engine(census({
+          considered: 1, evaluated: 0, starvedShortHistory: 1,
+          evaluatedSymbols: [],
+          starvedBreakerOpenSymbols: [], starvedFallbackBudgetSymbols: [],
+          starvedShortHistorySymbols: ['DDD'], fallbackUnavailableSymbols: [], fetchFailedSymbols: [],
+        }), 'SWEPT'),
+      ],
+      NOW,
+    );
+    expect(r.starvation.listsUnpublished).toBe(1);
+    expect(r.starvation.starvedShortHistorySymbols).toEqual(['DDD']);
+    expect(r.starvation.darkSymbols).toEqual(['DDD']);
+  });
+
+  it('fetchFailed symbols are part of the no-look population', () => {
+    const r = summarizeSma200Sweeps(
+      [
+        engine(census({
+          considered: 2, evaluated: 1, fetchFailed: 1,
+          evaluatedSymbols: ['CCC'],
+          starvedBreakerOpenSymbols: [], starvedFallbackBudgetSymbols: [],
+          starvedShortHistorySymbols: [], fallbackUnavailableSymbols: [],
+          fetchFailedSymbols: ['EEE'],
+        }), 'SWEPT'),
+      ],
+      NOW,
+    );
+    expect(r.starvation.fetchFailedSymbols).toEqual(['EEE']);
+    expect(r.starvation.darkSymbols).toEqual(['EEE']);
   });
 });

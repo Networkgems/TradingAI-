@@ -192,6 +192,18 @@ describe('TRA-5065 — the sma200 sweep falls back to Tradier', () => {
     // them out of the starve total and read as a healthier sweep.
     expect(stats?.starvedBreakerOpen).toBe(stats?.starvedFallbackBudget);
     expect((stats?.evaluated ?? 0) + (stats?.starvedBreakerOpen ?? 0)).toBe(12);
+    // TRA-5111 — the census names WHO, not just how many. The lists must agree
+    // with their own counters, the sub-tag containment must hold symbol-wise,
+    // and the partition must cover the whole universe: a count that cannot say
+    // which names starved cannot distinguish a rotation from a permanent hole.
+    expect(stats?.starvedFallbackBudgetSymbols?.length).toBe(stats?.starvedFallbackBudget);
+    expect([...(stats?.starvedBreakerOpenSymbols ?? [])].sort())
+      .toEqual([...(stats?.starvedFallbackBudgetSymbols ?? [])].sort());
+    expect(stats?.evaluatedSymbols?.length).toBe(stats?.evaluated);
+    const touched = new Set([
+      ...(stats?.evaluatedSymbols ?? []), ...(stats?.starvedBreakerOpenSymbols ?? []),
+    ]);
+    expect(touched.size).toBe(12);
   });
 
   it('names TRADIER when both providers are down (TRA-4826 shape, not this one)', async () => {
@@ -207,6 +219,10 @@ describe('TRA-5065 — the sma200 sweep falls back to Tradier', () => {
     expect(stats?.fallbackUnavailable).toBe(2);
     expect(stats?.starvedBreakerOpen).toBe(2);
     expect(stats?.starvedFallbackBudget).toBe(0);
+    // TRA-5111 — and the names ride with the tags.
+    expect([...(stats?.fallbackUnavailableSymbols ?? [])].sort()).toEqual(['AAA', 'BBB']);
+    expect([...(stats?.starvedBreakerOpenSymbols ?? [])].sort()).toEqual(['AAA', 'BBB']);
+    expect(stats?.starvedFallbackBudgetSymbols).toEqual([]);
     // Asked BEFORE the call, so an unavailable vendor costs no request either.
     expect(fallback).not.toHaveBeenCalled();
   });

@@ -1929,6 +1929,10 @@ export interface Sma200SweepCensusReport {
    * {@link Sma200SweepUniverseFold}.
    */
   universe: Sma200SweepUniverseFold;
+  /**
+   * TRA-5111 — the per-symbol starvation fold. See {@link Sma200StarvationFold}.
+   */
+  starvation: Sma200StarvationFold;
   /** ISO time the most-recent sweep in the fleet finished, or null. */
   newestSweepAt: string | null;
   /** Age of `newestSweepAt` in ms at read time — a stale census is not a live one. */
@@ -2098,6 +2102,52 @@ export interface Sma200SweepUniverseFold {
 }
 
 /**
+ * TRA-5111 — the per-symbol starvation fold: WHO is dark, not just how many.
+ *
+ * Filed because two sweeps 4h apart published byte-identical starve COUNTS
+ * (`starvedFallbackBudget 27` twice) and a count cannot distinguish "27
+ * rotating names" from "the same 27 names forever" — the first is a coverage
+ * cadence, the second is 13% of the universe permanently unscannable and
+ * invisible to every downstream consumer (a gate rejection can only come from
+ * an evaluated name, so TRA-4921's AC7 n accrues off this very set).
+ *
+ * Two layers, deliberately distinct:
+ *  - the per-tag unions are "starved on AT LEAST ONE engine" — an engine-level
+ *    fact. A symbol here may still have been evaluated by a sibling book.
+ *  - `darkSymbols` is "evaluated on NO graded engine" — the fleet-level fact
+ *    the filing actually asks about. Only this set gates AC7 arithmetic.
+ */
+export interface Sma200StarvationFold {
+  /** Union over graded engines publishing lists; sorted for sweep-to-sweep diffing. */
+  starvedBreakerOpenSymbols: string[];
+  /** ⚠️ sub-tag of `starvedBreakerOpenSymbols`, same as the counters. */
+  starvedFallbackBudgetSymbols: string[];
+  starvedShortHistorySymbols: string[];
+  /** ⚠️ sub-tag of `starvedBreakerOpenSymbols`, same as the counters. */
+  fallbackUnavailableSymbols: string[];
+  fetchFailedSymbols: string[];
+  /** DISTINCT symbols evaluated by at least one graded engine. */
+  evaluatedDistinct: number;
+  /**
+   * Symbols considered somewhere and evaluated NOWHERE in the graded fleet —
+   * the set that got no look this sweep batch. Sorted. Compare across two
+   * consecutive sweep batches: a stable set is a structural hole, a moving
+   * set is the fairness rotation working.
+   */
+  darkSymbols: string[];
+  darkCount: number;
+  /**
+   * Graded engines whose census carries no per-symbol lists (an older build).
+   * Non-zero ⇒ every list above is a lower bound AND `darkSymbols` may
+   * OVERSTATE darkness (an unpublished engine may have evaluated a listed
+   * symbol). ABSENT ≠ EMPTY.
+   */
+  listsUnpublished: number;
+  /** The label, on the wire. */
+  note: string;
+}
+
+/**
  * TRA-4922 — ceiling on PUBLISHED rejection rows. The structural maximum is
  * `engines × SMA200_REJECTION_MAX` (≈ 68 × 400), so this is generous headroom
  * rather than an expected clip; it exists so a future fleet/cap growth degrades
@@ -2151,6 +2201,17 @@ export function summarizeSma200Sweeps(
   // TRA-4922 (AC-c) — the universe union.
   const universeSymbols = new Set<string>();
   let symbolsUnpublished = 0;
+  // TRA-5111 — the per-symbol starvation unions. Engine-level facts; the
+  // fleet-level `darkSymbols` is derived from these AFTER the pass, because
+  // "dark" means evaluated by NOBODY and that is only knowable once every
+  // graded engine has contributed.
+  const starvedBreakerOpenSet = new Set<string>();
+  const starvedFallbackBudgetSet = new Set<string>();
+  const starvedShortHistorySet = new Set<string>();
+  const fallbackUnavailableSet = new Set<string>();
+  const fetchFailedSet = new Set<string>();
+  const evaluatedSet = new Set<string>();
+  let starveListsUnpublished = 0;
   let maxEngineUniverse: number | null = null;
   let minEngineUniverse: number | null = null;
   // TRA-4922 (AC-d + AC-e) — the integrity witness fold.
@@ -2288,6 +2349,19 @@ export function summarizeSma200Sweeps(
     } else {
       symbolsUnpublished++;
     }
+    // TRA-5111 — the per-symbol lists, keyed on `evaluatedSymbols` presence:
+    // all six lists ship in the same commit, and keying on the one whose
+    // CONTENT is the healthy case keeps "old build" out of "nothing starved".
+    if (Array.isArray(stats.evaluatedSymbols)) {
+      for (const s of stats.evaluatedSymbols) evaluatedSet.add(s);
+      for (const s of stats.starvedBreakerOpenSymbols ?? []) starvedBreakerOpenSet.add(s);
+      for (const s of stats.starvedFallbackBudgetSymbols ?? []) starvedFallbackBudgetSet.add(s);
+      for (const s of stats.starvedShortHistorySymbols ?? []) starvedShortHistorySet.add(s);
+      for (const s of stats.fallbackUnavailableSymbols ?? []) fallbackUnavailableSet.add(s);
+      for (const s of stats.fetchFailedSymbols ?? []) fetchFailedSet.add(s);
+    } else {
+      starveListsUnpublished++;
+    }
     if (newestFinishedAt === null || stats.finishedAt > newestFinishedAt) {
       newestFinishedAt = stats.finishedAt;
     }
@@ -2345,6 +2419,37 @@ export function summarizeSma200Sweeps(
         + 'here a LOWER BOUND, and integrity.nonMonotonic true means a later re-read may be '
         + 'smaller than an earlier one with a named cause (eviction or reset), not a quiet tape.',
     },
+    starvation: (() => {
+      // TRA-5111 — dark = no look ANYWHERE. The budget/unavailable sub-tags
+      // are subsets of starvedBreakerOpen (same invariant as the counters),
+      // so the three outer tags cover the whole no-look population.
+      const noLook = new Set<string>([
+        ...starvedBreakerOpenSet, ...starvedShortHistorySet, ...fetchFailedSet,
+      ]);
+      const darkSymbols = [...noLook].filter((s) => !evaluatedSet.has(s)).sort();
+      return {
+        starvedBreakerOpenSymbols: [...starvedBreakerOpenSet].sort(),
+        starvedFallbackBudgetSymbols: [...starvedFallbackBudgetSet].sort(),
+        starvedShortHistorySymbols: [...starvedShortHistorySet].sort(),
+        fallbackUnavailableSymbols: [...fallbackUnavailableSet].sort(),
+        fetchFailedSymbols: [...fetchFailedSet].sort(),
+        evaluatedDistinct: evaluatedSet.size,
+        darkSymbols,
+        darkCount: darkSymbols.length,
+        listsUnpublished: starveListsUnpublished,
+        note:
+          'Per-tag lists are "starved on AT LEAST ONE engine" and a symbol there may still '
+          + 'have been evaluated by a sibling book — darkSymbols is the fleet-level set '
+          + '(considered somewhere, evaluated NOWHERE this sweep batch) and is the only list '
+          + 'that gates AC7 arrival arithmetic (TRA-4921). starvedFallbackBudgetSymbols and '
+          + 'fallbackUnavailableSymbols are SUB-TAGS of starvedBreakerOpenSymbols, same as '
+          + 'the counters. Lists are sorted: diff darkSymbols across two consecutive sweep '
+          + 'batches — a stable set is a structural hole, a moving set is the LRU fairness '
+          + 'rotation (orderSma200FallbackFairness) working as designed. listsUnpublished > 0 '
+          + 'means a graded engine predates these lists, so every list is a lower bound and '
+          + 'darkSymbols may OVERSTATE darkness.',
+      };
+    })(),
     universe: {
       distinctSymbols: universeSymbols.size === 0 && symbolsUnpublished === graded
         ? null

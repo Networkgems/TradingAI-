@@ -1045,6 +1045,32 @@ export interface Sma200ScanStats {
    * were down, which is TRA-4826's shape and not this ticket's.
    */
   fallbackUnavailable?: number;
+  /**
+   * TRA-5111 — the SYMBOLS behind each starve counter, in the order the sweep
+   * met them. A count alone cannot distinguish "27 random names" from "the
+   * same 27 names every sweep", and that identity question is the whole
+   * finding when a budget cuts an ordered walk: the fairness rotation
+   * (`orderSma200FallbackFairness`) is DESIGNED to move the starved tail
+   * between sweeps, and these lists are the only surface that can prove it
+   * does. Same sub-tag relation as the counters:
+   * `starvedFallbackBudgetSymbols` and `fallbackUnavailableSymbols` are
+   * subsets of `starvedBreakerOpenSymbols`, never disjoint additions.
+   * Optional (TRA-3913): absent on an older build's census, ABSENT ≠ EMPTY.
+   */
+  starvedBreakerOpenSymbols?: string[];
+  starvedFallbackBudgetSymbols?: string[];
+  starvedShortHistorySymbols?: string[];
+  fallbackUnavailableSymbols?: string[];
+  /** TRA-5111 — symbols whose fetch threw, completing the per-symbol partition. */
+  fetchFailedSymbols?: string[];
+  /**
+   * TRA-5111 — symbols actually scored. The fleet fold needs this to tell
+   * "starved on one book" from "dark fleet-wide": a symbol starved on book A
+   * but evaluated on book B had its look this sweep batch; a symbol on NO
+   * engine's evaluated list had none, and only the second kind gates
+   * TRA-4921's AC7 arrival arithmetic.
+   */
+  evaluatedSymbols?: string[];
   /** Symbols whose fetch threw outright. */
   fetchFailed: number;
   /** Signals emitted by this sweep. */
@@ -8809,6 +8835,15 @@ export class SignalEngine {
       servedFallback: 0,
       starvedFallbackBudget: 0,
       fallbackUnavailable: 0,
+      // TRA-5111 — present from birth for the same ABSENT ≠ EMPTY reason: an
+      // empty list is a measurement ("nobody starved"), a missing key is an
+      // older build.
+      starvedBreakerOpenSymbols: [],
+      starvedFallbackBudgetSymbols: [],
+      starvedShortHistorySymbols: [],
+      fallbackUnavailableSymbols: [],
+      fetchFailedSymbols: [],
+      evaluatedSymbols: [],
     };
     // TRA-4457 — an empty universe still owes a census. It is a DIFFERENT fault
     // from a starved feed (the watchlist upstream, not the bar feed), which is
@@ -8864,6 +8899,7 @@ export class SignalEngine {
             else if (pulled.source === 'fallback') stats.servedFallback = (stats.servedFallback ?? 0) + 1;
           } catch (err: unknown) {
             stats.fetchFailed++;
+            stats.fetchFailedSymbols?.push(sym);
             log.warn('sma200: daily candle fetch failed', {
               component: 'sma200-scan', sym,
               reason: err instanceof Error ? err.message : String(err),
@@ -8886,18 +8922,24 @@ export class SignalEngine {
             // would emit 751 of them. The summary below is the trace.
             if (candles.length === 0 && pull.fallbackSkipped === 'budget_exhausted') {
               stats.starvedFallbackBudget = (stats.starvedFallbackBudget ?? 0) + 1;
+              stats.starvedFallbackBudgetSymbols?.push(sym);
               stats.starvedBreakerOpen++;
+              stats.starvedBreakerOpenSymbols?.push(sym);
             } else if (candles.length === 0 && pull.primarySuppressed) {
               if (pull.fallbackSkipped === 'unavailable') {
                 stats.fallbackUnavailable = (stats.fallbackUnavailable ?? 0) + 1;
+                stats.fallbackUnavailableSymbols?.push(sym);
               }
               stats.starvedBreakerOpen++;
+              stats.starvedBreakerOpenSymbols?.push(sym);
             } else {
               stats.starvedShortHistory++;
+              stats.starvedShortHistorySymbols?.push(sym);
             }
             return;
           }
           stats.evaluated++;
+          stats.evaluatedSymbols?.push(sym);
           const evalResult = evaluateSma200(sym, candles, { pullbackMaxDistAtr });
           const latestBarTs = candles[candles.length - 1].timestamp;
           // TRA-3688 S-3a — bar-rollover voiding, run on every scanned symbol
