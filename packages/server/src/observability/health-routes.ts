@@ -6407,6 +6407,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // gainloss derivation). Sums to feesMeasured; a fee with no provenance no
       // longer counts (the pre-2850 `fees: 0` poison reads unmeasured again).
       feesBySource: summary.feesBySource,
+      // TRA-5028 — the aggregates above sum a synthetic `history_import` row
+      // beside the real fill it duplicates (live 2026-10-01: totalFees 1.09 vs
+      // the de-duplicated 0.96). Fold fees/close counts from THIS block; the
+      // raw figures stay for consumers that predate the cut.
+      deduplicated: summary.deduplicated,
+      // TRA-5028 — at n=0 a feesMeasured/n ratio is 0/0; this key says so
+      // explicitly, so vacuous coverage cannot be read as 100%.
+      coverageVacuous: summary.coverageVacuous,
       retentionDays: summary.retentionDays,
       durability: summary.durability,
       lastRecordAt: summary.lastRecordAt,

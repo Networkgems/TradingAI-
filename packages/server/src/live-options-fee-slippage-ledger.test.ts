@@ -1230,3 +1230,89 @@ describe('repriceImportedFillsFromHistory (TRA-3563)', () => {
     expect(straddle.records[0]!.filledPrice).toBeNull();
   });
 });
+
+describe('deduplicated aggregates exclude the synthetic history_import twin (TRA-5028)', () => {
+  // The live incident shape: the SAME NOK close present twice — once as the
+  // real fill, once as the reconcile's synthetic `history_import` twin
+  // (TRA-4143). The raw aggregates sum both (served totalFees 1.09 where the
+  // truth was 0.96); `deduplicated` must count the close ONCE. Asserting that
+  // `tsSynthetic` is merely SET on the row would pass on the broken build —
+  // the assertions here are on the aggregate counts.
+  it('counts a close once when its history_import twin is retained beside it', () => {
+    clearLiveOptionsFeeSlippageLedger();
+    const close = {
+      etDay: '2026-09-02',
+      sleeve: 'single_leg_otm',
+      optionSymbol: 'NOK261002C00010500',
+      side: 'sell_to_close',
+      contracts: 1,
+      filledPrice: 0.11,
+      fees: 0.13,
+      feeSource: 'gainloss_derived',
+      orderId: null,
+    } as const;
+    // The synthetic twin: reconstructed by the reconcile pass, 17:00Z constant ts.
+    recordLiveOptionFill({ ...close, ts: Date.parse('2026-09-02T17:00:00.000Z'), origin: 'history_import' });
+    // The real fill of the same close.
+    recordLiveOptionFill({ ...close, ts: Date.parse('2026-09-02T17:35:37.046Z') });
+    const s = summarizeLiveOptionsFeeSlippage();
+    // Raw aggregates still sum both rows — unchanged for existing consumers.
+    expect(s.n).toBe(2);
+    expect(s.closes).toBe(2);
+    expect(s.totalFees).toBeCloseTo(0.26, 6);
+    expect(s.feesMeasured).toBe(2);
+    expect(s.feesBySource.gainlossDerived).toBe(2);
+    // The de-duplicated block counts the close ONCE.
+    expect(s.deduplicated.n).toBe(1);
+    expect(s.deduplicated.opens).toBe(0);
+    expect(s.deduplicated.closes).toBe(1);
+    expect(s.deduplicated.totalFees).toBeCloseTo(0.13, 6);
+    expect(s.deduplicated.feesMeasured).toBe(1);
+    expect(s.deduplicated.feesBySource).toEqual({ historyCommission: 0, gainlossDerived: 1 });
+    expect(s.deduplicated.syntheticRowsExcluded).toBe(1);
+    // Invariant: the exclusion is the whole raw/dedup delta.
+    expect(s.deduplicated.n + s.deduplicated.syntheticRowsExcluded).toBe(s.n);
+  });
+
+  it('a fill-only ledger reads identical raw and deduplicated aggregates', () => {
+    clearLiveOptionsFeeSlippageLedger();
+    recordLiveOptionFill({
+      ts: 1000,
+      etDay: '2026-09-02',
+      sleeve: 'single_leg_otm',
+      optionSymbol: 'TTD261009C00014000',
+      side: 'buy_to_open',
+      contracts: 1,
+      filledPrice: 0.5,
+      fees: 0.35,
+      feeSource: 'history_commission',
+      orderId: 7,
+    });
+    const s = summarizeLiveOptionsFeeSlippage();
+    expect(s.deduplicated.n).toBe(s.n);
+    expect(s.deduplicated.opens).toBe(1);
+    expect(s.deduplicated.totalFees).toBeCloseTo(0.35, 6);
+    expect(s.deduplicated.syntheticRowsExcluded).toBe(0);
+  });
+
+  it('coverageVacuous is true at n=0 so 0/0 cannot read as 100%, and false with rows', () => {
+    clearLiveOptionsFeeSlippageLedger();
+    const empty = summarizeLiveOptionsFeeSlippage();
+    expect(empty.n).toBe(0);
+    expect(empty.coverageVacuous).toBe(true);
+    // totalFees was already honest at n=0 — the ratio was the unsafe reading.
+    expect(empty.totalFees).toBeNull();
+    recordLiveOptionFill({
+      ts: 1000,
+      etDay: '2026-09-02',
+      sleeve: 'single_leg_otm',
+      optionSymbol: 'KO261002C00090000',
+      side: 'sell_to_close',
+      contracts: 1,
+      filledPrice: 0.2,
+      fees: null,
+      orderId: null,
+    });
+    expect(summarizeLiveOptionsFeeSlippage().coverageVacuous).toBe(false);
+  });
+});

@@ -3789,6 +3789,33 @@ export interface LiveOptionsFeeSlippageSummary {
    * of this object always equals `feesMeasured`.
    */
   feesBySource: { historyCommission: number; gainlossDerived: number };
+  /**
+   * TRA-5028 — the same count/fee aggregates with `tsSynthetic === true` rows
+   * excluded. A `history_import` row is a deliberate reconstruction (TRA-4143)
+   * that can DUPLICATE a real `fill` row for the same close, and the raw
+   * figures above sum both (live 2026-10-01: `totalFees` 1.09 where the
+   * de-duplicated truth was 0.96). The raw aggregates stay published — their
+   * consumers predate this cut — but a reader folding fee totals or close
+   * counts must read THESE. Invariant:
+   * `deduplicated.n + deduplicated.syntheticRowsExcluded === n`.
+   */
+  deduplicated: {
+    n: number;
+    opens: number;
+    closes: number;
+    totalFees: number | null;
+    feesMeasured: number;
+    feesBySource: { historyCommission: number; gainlossDerived: number };
+    /** Rows the block above excluded (`tsSynthetic === true`). */
+    syntheticRowsExcluded: number;
+  };
+  /**
+   * TRA-5028 — true when `n === 0`, so a `feesMeasured / n` coverage ratio
+   * cannot render the vacuous `0 / 0` as 100%. (`totalFees` is already honest
+   * at n=0 — it serializes `null` — the RATIO is what was unsafe: live
+   * coverage read 14/27 → 5/5 purely by unmeasured rows aging off.)
+   */
+  coverageVacuous: boolean;
   /** How many days back the ledger retains. */
   retentionDays: number;
   /** TRA-1681 — whether ANY of the above survives a reboot. Check BEFORE trusting a count. */
@@ -3826,15 +3853,37 @@ export function summarizeLiveOptionsFeeSlippage(): LiveOptionsFeeSlippageSummary
   let closes = 0;
   let feesFromCommission = 0;
   let feesFromGainLoss = 0;
+  // TRA-5028 — the same tallies excluding `tsSynthetic` rows. Every row is
+  // normalized through `toRecord` (hydrate included), so `tsSynthetic === true`
+  // is complete: it already covers `origin === 'history_import'`.
+  const dedupFeeValues: number[] = [];
+  let dedupOpens = 0;
+  let dedupCloses = 0;
+  let dedupFeesFromCommission = 0;
+  let dedupFeesFromGainLoss = 0;
+  let syntheticRows = 0;
   for (const f of fills) {
-    if (f.side === 'buy_to_open') opens += 1;
-    else closes += 1;
+    const synthetic = f.tsSynthetic === true;
+    if (synthetic) syntheticRows += 1;
+    if (f.side === 'buy_to_open') {
+      opens += 1;
+      if (!synthetic) dedupOpens += 1;
+    } else {
+      closes += 1;
+      if (!synthetic) dedupCloses += 1;
+    }
     if (f.slippageVsAsk !== null) vsAsk.push(f.slippageVsAsk);
     if (f.slippageVsMid !== null) vsMid.push(f.slippageVsMid);
     if (f.fees !== null) {
       feeValues.push(f.fees);
-      if (f.feeSource === 'gainloss_derived') feesFromGainLoss += 1;
-      else feesFromCommission += 1;
+      if (!synthetic) dedupFeeValues.push(f.fees);
+      if (f.feeSource === 'gainloss_derived') {
+        feesFromGainLoss += 1;
+        if (!synthetic) dedupFeesFromGainLoss += 1;
+      } else {
+        feesFromCommission += 1;
+        if (!synthetic) dedupFeesFromCommission += 1;
+      }
     }
   }
   const askStats = stats(vsAsk);
@@ -3856,6 +3905,19 @@ export function summarizeLiveOptionsFeeSlippage(): LiveOptionsFeeSlippageSummary
     totalFees: feeValues.length > 0 ? round(feeValues.reduce((s, v) => s + v, 0), 2) : null,
     feesMeasured: feeValues.length,
     feesBySource: { historyCommission: feesFromCommission, gainlossDerived: feesFromGainLoss },
+    deduplicated: {
+      n: fills.length - syntheticRows,
+      opens: dedupOpens,
+      closes: dedupCloses,
+      totalFees: dedupFeeValues.length > 0 ? round(dedupFeeValues.reduce((s, v) => s + v, 0), 2) : null,
+      feesMeasured: dedupFeeValues.length,
+      feesBySource: {
+        historyCommission: dedupFeesFromCommission,
+        gainlossDerived: dedupFeesFromGainLoss,
+      },
+      syntheticRowsExcluded: syntheticRows,
+    },
+    coverageVacuous: fills.length === 0,
     retentionDays: RETAIN_MS / (24 * 60 * 60 * 1000),
     durability: {
       dataDir,
