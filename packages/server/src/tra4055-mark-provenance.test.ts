@@ -449,21 +449,39 @@ describe('TRA-4055 — the generic `sl` and `sl_catastrophic` branches carry the
 describe('TRA-4055 — a fourth stop cannot fire unstamped', () => {
   const SRC = readFileSync(join(HERE, 'options-account.ts'), 'utf8');
 
-  it('the stamp is called EXACTLY ONCE, and inside the block every engine exit funnels through', () => {
-    // The ticket asked for three call sites plus a grep. This is the stronger
-    // form of the same guarantee: `mark` is computed once per row per tick above
-    // the whole cascade, so its provenance is a property of the TICK, not of the
-    // branch — every branch would stamp an identical value. One unconditional
-    // call at the shared seam therefore makes "unstamped" unreachable instead of
-    // merely tested for, and it covers `sl_daily_close`, `profit_floor` and the
-    // trail family too, none of which the three-site design would have reached.
+  it('the stamp is called at EXACTLY the three blocks a full close can leave the tick from', () => {
+    // The original (pre-TRA-5100) form of this guard pinned ONE call at the
+    // SL/trail funnel, on the premise that every engine exit funnels through
+    // it. TRA-5100 measured that premise false: the structural branch
+    // (`supertrend_flip` / `ma20_close_through` / `time_stop`) and the TP1
+    // FULL exit close inline and `continue` BEFORE the funnel, which is why
+    // every one of those closes shipped with no `quoteAtFire` and read
+    // `exit_quote_missing` at the cross (0/8 in the desk demo directional
+    // cell vs 16/19 on the chandelier path). `mark` is still computed once per
+    // row per tick above the whole cascade, so all three sites stamp an
+    // identical value — the guarantee is unchanged, the reachability map is
+    // corrected. A FOURTH unconditional call (or a vanished one) still fails
+    // here loudly.
     const calls = SRC.match(/^\s*stampExitMarkProvenance\(opt, markProvenance\);$/gm) ?? [];
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2); // the structural branch + the funnel
+    // TP1 is the guarded third: PARTIALS must not stamp (first-write-wins
+    // would freeze the TP1 tick's book onto whatever close ends the row).
+    const tp1Calls = SRC.match(/^\s*if \(tp1FullExit\) stampExitMarkProvenance\(opt, markProvenance\);$/gm) ?? [];
+    expect(tp1Calls).toHaveLength(1);
+
+    // Site order within the tick: structural → TP1 full exit → funnel.
+    const STRUCTURAL_LINE = "if (reason === 'supertrend_flip' || reason === 'ma20_close_through' || reason === 'time_stop') {";
+    const structural = SRC.indexOf(STRUCTURAL_LINE);
+    expect(structural).toBeGreaterThan(0);
+    const structuralStamp = SRC.indexOf('stampExitMarkProvenance(opt, markProvenance);', structural);
+    const tp1Stamp = SRC.indexOf('if (tp1FullExit) stampExitMarkProvenance(opt, markProvenance);');
+    expect(structuralStamp).toBeGreaterThan(structural);
+    expect(tp1Stamp).toBeGreaterThan(structuralStamp);
 
     const SEAM_LINE = 'if (exitPremium !== null && exitKind !== null) {';
     const seam = SRC.indexOf(SEAM_LINE);
-    expect(seam).toBeGreaterThan(0);
-    const stamp = SRC.indexOf('stampExitMarkProvenance(opt, markProvenance);');
+    expect(seam).toBeGreaterThan(tp1Stamp);
+    const stamp = SRC.indexOf('stampExitMarkProvenance(opt, markProvenance);', seam);
     expect(stamp).toBeGreaterThan(seam);
     // Immediately after its two neighbours, with nothing conditional between —
     // an `if` slipped in front of it is the regression this pins.

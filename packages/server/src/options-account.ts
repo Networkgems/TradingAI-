@@ -12311,6 +12311,15 @@ export class PaperOptionsAccount {
           if (reason === 'supertrend_flip' || reason === 'ma20_close_through' || reason === 'time_stop') {
             stampOpeningRangeFire(opt, mark); // TRA-4020 (R4)
             stampProfitFloorPdtFire(opt, mark); // TRA-4030 (R4)
+            // TRA-5100 — this branch closes (or stages) INLINE and `continue`s,
+            // so it never reaches the SL/trail funnel's stamp below — which is
+            // why every pre-TRA-4997 `ma20_close_through` / `time_stop` close
+            // was `exit_quote_missing` at the cross while the chandelier rows
+            // priced: the structural exits fire on the SAME per-tick mark and
+            // then discarded its provenance. Stamp it here, exactly as the
+            // funnel does, so these rows price off the fire-tick book instead
+            // of falling back to `last_known`.
+            stampExitMarkProvenance(opt, markProvenance);
             if (waitAndHold) {
               // TRA-2984 — same escalation as the SL/trail staging site below:
               // a structural exit whose previous order expired unfilled is
@@ -12408,6 +12417,13 @@ export class PaperOptionsAccount {
           ? opt.contractsRemaining
           : Math.floor(opt.contractsRemaining * partialExitRatio);
         if (exitContracts > 0) {
+          // TRA-5100 — a TP1 FULL exit closes the whole row (inline below, or
+          // via the stage on the live path) without reaching the funnel's
+          // stamp, same shape as the structural branch above: it fired on this
+          // tick's mark, so its provenance is this tick's. Guarded by
+          // `tp1FullExit` because a PARTIAL stamp would freeze first-write-wins
+          // provenance from the TP1 tick onto whatever close ends the row later.
+          if (tp1FullExit) stampExitMarkProvenance(opt, markProvenance);
           if (waitAndHold) {
             // TRA-354 — stage the partial exit at the TP1 trigger price; engine
             // submits a Tradier limit sell_to_close and finalises on fill.
