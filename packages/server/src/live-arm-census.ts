@@ -306,6 +306,29 @@ export interface LiveArmCensusReport {
     brokerCloseTransportFaultCount: number | null;
   };
   /**
+   * TRA-3962 (board ruling 2026-10-04, interaction `4036dfe9`) — WHICH UNIT
+   * the live options aggregate cap bounds. `capUsd` / `fleetCapUsd` (the
+   * figures the order path gates on, served by
+   * `/api/health/live-options-fee-slippage`) bound the **ACCOUNT**, and that
+   * is DELIBERATE: desk-placed premium the broker reconcile adopts sits
+   * INSIDE `openPremiumAtRiskUsd`, so a desk buy spends the engine's headroom
+   * by design — the rejected alternative (an engine-scoped cap) leaves the
+   * shared broker account bounded by nothing. The board's $300/$500 words
+   * were LOOSE, the code was right; the record was corrected rather than the
+   * code (ruled 36h before the 2026-10-05 live arm, where tightening beats
+   * re-deriving). Engine-attributable spend is
+   * `openPremiumAtRiskUsd − adoptedPremiumAtRiskUsd`; the engine's own
+   * effective allowance is `capUsd − adoptedPremiumAtRiskUsd` ($192.91 as
+   * measured on live `355ca553`, 2026-08-22). Published HERE so no future
+   * reader has to re-derive the unit from the fold — which took three tickets
+   * (TRA-3703 → TRA-3879 → TRA-3962) the last time it was implicit.
+   */
+  capUsdAuthorization: {
+    unit: 'account';
+    ruling: 'TRA-3962';
+    ruledAt: '2026-10-04';
+  };
+  /**
    * TRA-3905 — the ET day the {@link LiveArmCensusRow.brokerOutcome} join was
    * folded for, or `null` when no `etDay` was supplied and the join did not run.
    * This is the field that says whether the broker-outcome cells on this report
@@ -416,6 +439,9 @@ export function summarizeLiveArmCensus(
     // TRA-5014 — `booksScanned === books.length + booksScannedButNotPublished.length`
     // by construction: every input book either builds a row or lands here.
     booksScannedButNotPublished: excluded,
+    // TRA-3962 — a static declaration on purpose: the unit is a ruling, not a
+    // measurement, and it must read the same on every report.
+    capUsdAuthorization: { unit: 'account', ruling: 'TRA-3962', ruledAt: '2026-10-04' },
     brokerOutcomesEtDay: brokerCensus?.etDay ?? null,
     // TRA-3937 — true when the census data was loaded from a durable snapshot
     // (post-close restart). The grader uses this to avoid FORFEIT on a durable read.

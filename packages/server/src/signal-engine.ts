@@ -805,6 +805,8 @@ import { emitAlert } from './notifications/index.js';
 // ring). Separate from `emitAlert` above, which is the in-app user feed: an
 // unmanaged real-money position is an OPS incident, not a trade notification.
 import { dispatchAlert } from './observability/alerts.js';
+// TRA-3962 (Q2, board ruling 2026-10-04) — the over-cap page classifier.
+import { classifyOverCapPage } from './tra3962-over-cap-page.js';
 
 const balanceLog = logger.child({ module: 'signal-engine' });
 const log = logger.child({ module: 'signal-engine' });
@@ -6991,6 +6993,12 @@ export class SignalEngine {
     // stale reading from an earlier tick, and in live mode outside RTH the skip
     // is TRA-726's deliberate no-day-trading hold, not a strand.
     if (optionsExitsActive) this.alertUnmanagedLiveOptions();
+    // TRA-3962 (Q2, board ruling 2026-10-04) — page on an over-cap live book.
+    // Deliberately NOT behind `optionsExitsActive`: outside RTH the exits pass
+    // is TRA-726's no-day-trading hold, but the over-cap condition (a desk buy
+    // the reconcile adopted) can arise and persist there, and the page exists
+    // precisely because the state wants a human, not an engine action.
+    this.alertOverCapLiveBook();
     if (liveOptionsMirroring && optsClosed.length > 0) {
       // TRA-354 — submit the staged Tradier sell_to_close LIMIT orders.
       // `checkExits` returned position snapshots already carrying the
@@ -12052,6 +12060,91 @@ export class SignalEngine {
         // is where the responder looks next. Kept out of the predicate on
         // purpose (see the doc above).
         checkNext: 'GET /api/health/options-live → bootArmEligible / bootArmDrift',
+      },
+    );
+  }
+
+  /**
+   * TRA-3962 (Q2, board ruling 2026-10-04, interaction `4036dfe9`) — PAGE, DO
+   * NOT UNWIND, on an over-cap live book.
+   *
+   * `headroomSignedUsd < 0` already refuses every positive entry (TRA-3911's
+   * gates, regression-pinned); what it did not do is summon anyone. `admin`
+   * sat at −$51.68 on 2026-08-21 and was found only by a human reading the
+   * fee-slippage route by hand. This pages the ops alert channel
+   * (`ALERT_EMAIL` / `ALERT_WEBHOOK_URL`; posture at `/api/health/alerting`)
+   * once per `dispatchAlert` throttle window while the condition holds, and
+   * UNWINDS NOTHING — the board ruled that a forced liquidation converts a
+   * bookkeeping condition into a realized loss in exactly the tape where an
+   * automatic control fires hardest.
+   *
+   * The at-risk pre-gate keeps the 30s tick cheap for every book with no live
+   * premium on: the full exposure fold (fleet enumeration) runs only on a book
+   * that could possibly be over cap. An UNREADABLE basis (the TRA-3970 broker
+   * all-zeros artifact ⇒ `availableCashUsd null` ⇒ `capUsd` fail-closed to 0 ⇒
+   * `headroomSignedUsd null`) pages NOBODY — before TRA-3970 that artifact
+   * manufactured `headroomSignedUsd −140.38` on a book that was not over cap,
+   * and an alert keyed on the sign alone would page the desk every broker
+   * maintenance window. The suppression is logged on the transition into the
+   * unreadable state, never silently.
+   */
+  private overCapBasisUnreadableLogged = false;
+
+  private alertOverCapLiveBook(): void {
+    const atRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
+    // Classifier reason `no_live_at_risk` — short-circuited here so the fleet
+    // fold below never runs for the dozens of books with nothing live on.
+    if (!(atRisk.usd > 0)) return;
+    const exposure = this.getLiveOtmAggregateExposure();
+    const verdict = classifyOverCapPage({
+      headroomSignedUsd: exposure.headroomSignedUsd,
+      openPremiumAtRiskUsd: exposure.openPremiumAtRiskUsd,
+      tradierEnv: this.tradierEnv,
+    });
+    if (verdict.action !== 'page') {
+      if (verdict.reason === 'basis_unreadable') {
+        if (!this.overCapBasisUnreadableLogged) {
+          this.overCapBasisUnreadableLogged = true;
+          log.warn(
+            'over-cap page SUPPRESSED: live at-risk > 0 but headroomSignedUsd is unreadable '
+              + '(capUsd fail-closed on an unreadable balance) — not pageable, and not clean',
+            {
+              issue: 'TRA-3962',
+              book: this.alertUsername ?? null,
+              openPremiumAtRiskUsd: exposure.openPremiumAtRiskUsd,
+              capUsd: exposure.capUsd,
+              availableCashUsd: exposure.availableCashUsd,
+              balanceAsOfMs: exposure.balanceAsOfMs,
+            },
+          );
+        }
+      } else {
+        this.overCapBasisUnreadableLogged = false;
+      }
+      return;
+    }
+    this.overCapBasisUnreadableLogged = false;
+    dispatchAlert(
+      'over-cap-book',
+      verdict.severity,
+      `Live book ${this.alertUsername ?? '(unnamed)'} is OVER its aggregate cap on the `
+        + `${this.tradierEnv} env: headroomSignedUsd ${exposure.headroomSignedUsd}, `
+        + `openPremiumAtRiskUsd ${exposure.openPremiumAtRiskUsd} against capUsd ${exposure.capUsd} `
+        + `(desk-adopted share ${exposure.adoptedPremiumAtRiskUsd}). New entries are already `
+        + `refused (TRA-3911); nothing unwinds automatically — the board ruled PAGE, DO NOT `
+        + `UNWIND (TRA-3962). This condition wants a human: read `
+        + `GET /api/health/live-options-fee-slippage and decide whether to reduce by hand.`,
+      {
+        issue: 'TRA-3962',
+        book: this.alertUsername ?? null,
+        tradierEnv: this.tradierEnv,
+        capUsd: exposure.capUsd,
+        openPremiumAtRiskUsd: exposure.openPremiumAtRiskUsd,
+        headroomSignedUsd: exposure.headroomSignedUsd,
+        // The usual cause: hand-placed desk premium the reconcile adopted into
+        // the shared account's figure (the TRA-3962 finding itself).
+        adoptedPremiumAtRiskUsd: exposure.adoptedPremiumAtRiskUsd,
+        admissibleEntryUsd: exposure.admissibleEntryUsd,
       },
     );
   }

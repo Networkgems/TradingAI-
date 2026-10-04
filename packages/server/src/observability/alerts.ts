@@ -44,7 +44,14 @@ export type AlertKey =
   // monitor that grades on rows scores the position as healthy while its stop
   // sits unexecuted. Distinct from `unmanaged-live-options` (rules never
   // evaluated) — here the rule fired and the ORDER lapsed.
-  | 'expired-exit';
+  | 'expired-exit'
+  // TRA-3962 (Q2, board ruling 2026-10-04) — a live book's openPremiumAtRiskUsd
+  // exceeds its capUsd (`headroomSignedUsd < 0`). The order gates already
+  // refuse every positive entry in this state (TRA-3911), but nothing paged:
+  // `admin` sat at −$51.68 on 08-21 and was found by a human reading the route.
+  // The board chose PAGE over UNWIND — forced liquidation converts a
+  // bookkeeping condition into a realized loss. See tra3962-over-cap-page.ts.
+  | 'over-cap-book';
 
 export type AlertSeverity = 'warning' | 'critical';
 

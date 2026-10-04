@@ -675,6 +675,26 @@ silently grade the other. Note also that `LIVE_OPTION_TEST_AGGREGATE_CAP_USD` is
 on bqb1 — the 750 in force is the compiled default, and the stamp grades the RESOLVED value,
 which is what the order site actually uses.
 
+⚠️ **Mind the ACTOR axis of the unit too — the cap bounds the ACCOUNT, not the engine, and
+that is deliberate** (TRA-3962, board ruling 2026-10-04, interaction `4036dfe9` on that row).
+Desk/hand-placed premium the broker reconcile adopts sits **inside** `openPremiumAtRiskUsd`
+(its share is published as `adoptedPremiumAtRiskUsd`, TRA-3913), and the order path gates on
+the TOTAL (TRA-3911) — so a desk buy spends the engine's headroom **by design**. Earlier
+authorization prose that read as engine-scoped ("the $300/$500 bounds the engine") was LOOSE
+WORDS over correct code: the board ruled the code right and corrected the record, because an
+engine-scoped cap leaves the shared broker account bounded by nothing. Consequences a reader
+should not re-derive:
+- engine-attributable spend = `openPremiumAtRiskUsd − adoptedPremiumAtRiskUsd`;
+- the engine's own effective allowance = `capUsd − adoptedPremiumAtRiskUsd` ($192.91 as
+  measured on live `355ca553`, 2026-08-22, when the desk share was $117 of $273);
+- `headroomSignedUsd < 0` already refuses every positive entry (TRA-3911 gates) and now also
+  **pages** the ops alert channel (`over-cap-book` key, PAGE-DO-NOT-UNWIND — TRA-3962 Q2);
+- the unit declaration is machine-readable on the live arm census
+  (`liveArmCensus.capUsdAuthorization`).
+An engine-scoped reading (ENGINE(a) + a separate account bound) was explicitly NOT rejected
+on the merits — it is parked for post-go-live authorization, and if adopted, both bounds land
+in the SAME change, never the engine loosening first.
+
 Writes go through the single-key path above, then the pinned apply
 (`--commit=<sha already serving>`) — the stamp is inert until a deploy bakes it.
 

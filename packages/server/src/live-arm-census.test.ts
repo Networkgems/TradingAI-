@@ -336,4 +336,15 @@ describe('summarizeLiveArmCensus — TRA-3117 per-book live-arm census', () => {
     expect(serialized).not.toContain('acct-99887766');
     expect(serialized).toContain('***7766');
   });
+
+  it('TRA-3962 — declares WHICH UNIT capUsd bounds (ACCOUNT, by board ruling), on every report including an empty one', () => {
+    // A static declaration, not a measurement: the unit is a ruling and must
+    // read identically on a loaded report and an empty one — a reader of the
+    // census on a quiet host still gets the authorization unit without
+    // re-deriving it from the fold.
+    const declared = { unit: 'account', ruling: 'TRA-3962', ruledAt: '2026-10-04' };
+    expect(summarizeLiveArmCensus([book(PIN, liveProdSettings())], env()).capUsdAuthorization)
+      .toEqual(declared);
+    expect(summarizeLiveArmCensus([], env()).capUsdAuthorization).toEqual(declared);
+  });
 });
