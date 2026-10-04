@@ -546,9 +546,15 @@ export function churnBrakeGuardSharedTapeSpec(): SharedTapeSpec {
     predicate: () => ({ kind: 'age', retainMs: GUARD_RETAIN_MS }),
     flushLine: appendChurnBrakeGuardRawLine,
     note:
-      'One line per demo open candidate that reaches a chokepoint — 67.7 MiB on '
-      + '2026-10-02, +29.6 in 7 d, the second-fastest 30-day tape in /data. TRA-4904 AC4 '
-      + 'ruled a timer unnecessary at 267.4 MiB of headroom; headroom reached 141.7 MiB.',
+      'One line per demo open candidate that reaches a chokepoint — 67.8 MiB measured by this '
+      + 'hook on 2026-10-04 (bytesBefore 71,103,740 over 637,837 lines; mean line 111.5 B). '
+      + 'TRA-5026 (live 2026-10-04) adds 22 B to every cap_verdict line, so the mean walks to '
+      + '~133.5 B as the window turns over. The 30-day window saturated 2026-10-04 (oldest '
+      + 'retained 09-04), so growth is now volume-driven, and volume — not the field — is the '
+      + 'threat: at the post-09-21 regime (~56k lines/trading day) steady state is ~150 MiB, '
+      + 'above the 141.7 MiB headroom TRA-4904 AC4 last stood at (~129 MiB even without the '
+      + 'field). The 10-02 trough (862 lines) was the TRA-5089 feed outage, not a slowdown. '
+      + 'TRA-5069; re-grade against measured post-TRA-5026 accrual before trusting these.',
   };
 }
 
