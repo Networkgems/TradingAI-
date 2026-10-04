@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { generateEodReport, formatMoverMarkdownRow, MOVERS_MARKDOWN_HEADING } from './eod-report.js';
+import {
+  generateEodReport, formatMoverMarkdownRow, MOVERS_MARKDOWN_HEADING,
+  stampLegacyRateBasis,
+} from './eod-report.js';
 import { annotateReportProvenance } from './mover-provenance.js';
 import type { EngineState } from '../signal-engine.js';
 // TRA-3387 — the provenance the session-condemnation census is graded through.
@@ -7,6 +10,8 @@ import type { MoveSuspectSessionProvenance } from '../move-suspect-session-store
 import {
   isMoveSuspect, assessQuotePlausibility, assessLevelContinuity, SUSPECT_MOVE_RATIO_FLOOR,
   type EodMover, type OptionPosition, type Position, type CorporateAction,
+  // TRA-4998 — the archived-cell fixtures below are annotated with it; see `legacyCell`.
+  type EodSignalAccuracy,
 } from '@trading-app/shared';
 import type { OptionTradeJournalSummary } from '../option-trade-journal.js';
 
@@ -1944,3 +1949,80 @@ describe('TRA-3387 top movers — an empty session-condemnation census is EVIDEN
   });
 });
 
+// ── TRA-4998 residual — the READ-TIME basis stamp over the 108 archived cells ──
+//
+// The write-side fix cannot reach a stored snapshot, and `/api/reports/:date` serves a
+// stored snapshot for every past day. Measured on prod `afe4e34a` 2026-10-02: 09-30 and
+// 10-01 still answered `winRate: 0` with NO `winRateBasis` key — the exact surface this
+// ticket exists to kill, and `legacy_unknown` was a declared enum member with zero
+// writers. These tests fix BOTH directions, because a stamp that nulls every day is the
+// same defect sign-flipped.
+describe('TRA-4998 — stampLegacyRateBasis', () => {
+  // The ARCHIVED shape, verbatim off prod: `resolvedSignals`/`unresolvedSignals`/
+  // `winRateBasis` are simply ABSENT (they are optional on the type precisely because
+  // 108 stored cells predate them). Annotated so the stamp's output type carries the
+  // basis key -- a bare literal narrows it away and the assertions stop compiling.
+  const legacyCell = (
+    totalTrades: number, winRate: number | null, avgRR: number | null,
+    accuracy: EodSignalAccuracy,
+  ): { totalTrades: number; winRate: number | null; avgRR: number | null; signalAccuracy: EodSignalAccuracy } =>
+    ({ totalTrades, winRate, avgRR, signalAccuracy: accuracy });
+  const legacy0930 = legacyCell(0, 0, 0, { totalSignals: 557, winningSignals: 0, winRate: 0, avgRR: 0 });
+
+  it('a LEGACY cell (no basis key) with signals and an all-zero rate serves null + legacy_unknown', () => {
+    const out = stampLegacyRateBasis(legacy0930);
+    expect(out.signalAccuracy.winRate).toBeNull();
+    expect(out.signalAccuracy.avgRR).toBeNull();
+    expect(out.signalAccuracy.winRateBasis).toBe('legacy_unknown');
+    // The census itself is NOT restated — a reader can still see what the day held.
+    expect(out.signalAccuracy.totalSignals).toBe(557);
+    expect(out.signalAccuracy.winningSignals).toBe(0);
+  });
+
+  it('top-level winRate/avgRR null ONLY on totalTrades === 0, which is determinable from the archive', () => {
+    expect(stampLegacyRateBasis(legacy0930).winRate).toBeNull();
+    expect(stampLegacyRateBasis(legacy0930).avgRR).toBeNull();
+    // A day that DID close trades and lost every one keeps its real measured 0.
+    const allLosers = { ...legacy0930, totalTrades: 4, winRate: 0, avgRR: 0 };
+    expect(stampLegacyRateBasis(allLosers).winRate).toBe(0);
+    expect(stampLegacyRateBasis(allLosers).avgRR).toBe(0);
+  });
+
+  it('THE OPPOSITE DIRECTION — a go-forward cell already carrying a basis is a strict no-op', () => {
+    // This is the test that stops the fix from becoming "every day reads null". A day whose
+    // signals RESOLVED and all lost is a real 0 and must stay reachable as an alarm.
+    const resolvedAllLosing = legacyCell(3, 0, 0.5, {
+      totalSignals: 9, winningSignals: 0, resolvedSignals: 9, unresolvedSignals: 0,
+      winRate: 0, avgRR: 0, winRateBasis: 'resolved',
+    });
+    expect(stampLegacyRateBasis(resolvedAllLosing)).toEqual(resolvedAllLosing);
+    expect(stampLegacyRateBasis(resolvedAllLosing).signalAccuracy.winRate).toBe(0);
+  });
+
+  it('a legacy cell with NO signals reads no_signals — that flavour of null IS determinable', () => {
+    const quiet = legacyCell(0, 0, 0, { totalSignals: 0, winningSignals: 0, winRate: 0, avgRR: 0 });
+    expect(stampLegacyRateBasis(quiet).signalAccuracy.winRateBasis).toBe('no_signals');
+    expect(stampLegacyRateBasis(quiet).signalAccuracy.winRate).toBeNull();
+  });
+
+  it('a NON-ZERO stored legacy rate is PRESERVED — biased is not the same as unknowable', () => {
+    const measured = legacyCell(5, 0.4, 1.2, { totalSignals: 100, winningSignals: 12, winRate: 0.12, avgRR: 0.8 });
+    const out = stampLegacyRateBasis(measured);
+    expect(out.signalAccuracy.winRate).toBe(0.12);
+    expect(out.signalAccuracy.avgRR).toBe(0.8);
+    expect(out.signalAccuracy.winRateBasis).toBe('legacy_unknown');
+    expect(out.winRate).toBe(0.4);
+  });
+
+  it('does not mutate its input — the stored object is never rewritten', () => {
+    const input = JSON.parse(JSON.stringify(legacy0930)) as typeof legacy0930;
+    stampLegacyRateBasis(input);
+    expect(input).toEqual(legacy0930);
+  });
+
+  it('is a no-op on a cell with no signalAccuracy block at all (journal/desk folds)', () => {
+    const bare: { totalTrades: number; winRate: number | null; avgRR: number | null } =
+      { totalTrades: 2, winRate: 0.5, avgRR: 1 };
+    expect(stampLegacyRateBasis(bare)).toEqual(bare);
+  });
+});

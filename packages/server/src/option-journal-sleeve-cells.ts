@@ -10,6 +10,10 @@ import {
   SPREAD_CEILING_ACCOUNT_CLASSES,
   type SpreadCeilingAccountClass,
 } from './option-spread-cost.js';
+// TRA-5100 — the crossed re-pricing fold, reused verbatim (one pricing rule;
+// a second spelling of the precedence would drift invisibly) to split each
+// cell's strategy-exit crossed coverage by chandelier vs non-chandelier.
+import { foldCrossedCells, type CrossedFoldCells } from './option-crossed-pnl.js';
 import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
 
 // TRA-3715 (split out of TRA-3709) — the cell a sleeve grade can legally be read
@@ -95,15 +99,23 @@ export interface OptionExitReasonRule {
  * reader of the payload, cannot be tested apart from the fold, and grows a third
  * clause silently. A table can be published, diffed, and mutated by a test.
  *
- * ⚠ EVERY exit reason observed in the live journal is listed, so nothing real
- * falls through to `unknown` today (measured 2026-08-14 against live
- * `0e9f0e8bb4b6`, n=2,722 closed: manual 813, sl 580, supertrend_flip 364,
+ * ⚠ This list is NOT a census of the live journal, and it never was — the claim
+ * that it was is what TRA-4991 found. Measured 2026-08-14 against live
+ * `0e9f0e8bb4b6` (n=2,722 closed: manual 813, sl 580, supertrend_flip 364,
  * time_stop 298, ma20_close_through 211, trail 171, chandelier 132,
  * book_halt_flat 75, take_profit_early 43, profit_lock 28,
- * reconstructed-TRA-3472 7). A reason NOT on this list is reported by
- * `unclassifiedExitReasons` on the grid rather than being absorbed — an
- * unrecognised close must be loud, because "silently counted as strategy" is
- * exactly the defect.
+ * reconstructed-TRA-3472 7) every observed reason WAS listed; by 2026-10-01 live
+ * `unclassifiedExitReasons` read `["broker_reconcile","chandelier_daily_close",
+ * "chandelier_restarted","chandelier_spot_seeded","sl_daily_close",
+ * "sl_otm_premium_pct"]`. TRA-4991 (AC4) added the three chandelier variants;
+ * `broker_reconcile`, `sl_daily_close` and `sl_otm_premium_pct` are STILL
+ * unlisted and still land in `unknownExits`, deliberately out of this ticket's
+ * scope rather than classified in passing.
+ *
+ * So: ⛔ do not read this table as "everything real is covered". A reason NOT on
+ * this list is reported by `unclassifiedExitReasons` on the grid rather than
+ * being absorbed — an unrecognised close must be loud, because "silently counted
+ * as strategy" is exactly the defect. `unclassifiedExitReasons` is the census.
  */
 export const OPTION_EXIT_REASON_TABLE: readonly OptionExitReasonRule[] = [
   {
@@ -139,6 +151,61 @@ export const OPTION_EXIT_REASON_TABLE: readonly OptionExitReasonRule[] = [
   { reason: 'ma20_close_through', owner: 'strategy', why: 'Structural exit — price closed through the 20-period MA.' },
   { reason: 'trail', owner: 'strategy', why: 'The sleeve\'s trailing stop fired.' },
   { reason: 'chandelier', owner: 'strategy', why: 'The sleeve\'s chandelier trailing stop fired.' },
+  // ── TRA-4991 (AC4) — the TRA-3217 provenance split, taught to this fold ─────
+  //
+  // TRA-3217 split one `chandelier` label into five AT THE FIRE SITE
+  // (`options-account.ts`, the `exitJournalReason` ternary) precisely so one
+  // label could not cover several mechanisms. This table never learned the
+  // split, so three of the four variants that have actually occurred fell
+  // through to `unknownExits` and out of every sleeve grade — live
+  // `unclassifiedExitReasons` read `["broker_reconcile","chandelier_daily_close",
+  // "chandelier_restarted","chandelier_spot_seeded","sl_daily_close",
+  // "sl_otm_premium_pct"]` (lifetime: `chandelier` 288, and 1 each of the three
+  // below). A split made at the write site and dropped at the read site is a
+  // split that exists in the log and nowhere a grader can see it.
+  //
+  // ⛔ EACH STAYS A SEPARATE ROW. Collapsing them into one `chandelier` bucket
+  // here would undo TRA-3217 at the fold — `byExitReason` keys on the reason
+  // string, so three rows is what keeps the four mechanisms separately foldable
+  // while all four count as strategy exits.
+  //
+  // ⚠️ The FIFTH label, `chandelier_deferred_breach`, is deliberately NOT listed.
+  // It is TRA-3217's structural-break canary: the bookkeeping consumes
+  // `chandelierBreachedWhileSuppressed` on every unsuppressed tick BEFORE the
+  // fire branch can read it, so a non-zero count means the veto is broken, not
+  // that the policy chose to fire. Lifetime count is 0, so listing it is not
+  // needed to keep `unclassifiedExitReasons` from being permanently non-empty
+  // (the reason `reconstructed-TRA-3472` IS listed), and leaving it off means its
+  // first ever occurrence is LOUD on that list instead of quietly folded into a
+  // strategy slice. If it ever fires, add it here in the same breath as
+  // investigating the veto.
+  {
+    reason: 'chandelier_daily_close',
+    owner: 'strategy',
+    why:
+      'TRA-3902 — the chandelier trail was BREACHED intraday on a live row and HELD until the '
+      + 'daily-close window under the live `daily_close` stop policy, then fired inside it. Same '
+      + 'mechanism and same owner as `chandelier`; the label carries the hold\'s provenance so a '
+      + 'close 0-18 min into a session can be told apart from one at the policy\'s own window.',
+  },
+  {
+    reason: 'chandelier_restarted',
+    owner: 'strategy',
+    why:
+      'TRA-3217 — the trail was RE-ANCHORED at spot because a breach was carried out of a '
+      + 'suppressed window (PDT/swing hold, live opening range) and then fired on a later tick. '
+      + 'Strategy-owned: the fire is the trail\'s, not a harness hand-close. Read it beside '
+      + '`chandelier`, never pooled into it: a restarted trail has a shorter life than its row.',
+  },
+  {
+    reason: 'chandelier_spot_seeded',
+    owner: 'strategy',
+    why:
+      'TRA-2893 / TRA-3217 — the trail\'s anchor had to be seeded from the CURRENT spot because '
+      + '`underlyingEntryPrice` was absent or the `0` every `tradier_import` row carries. The '
+      + 'exit is the sleeve\'s, so `strategy`, but the excursion it trails is measured from a '
+      + 'seed and not from entry — which is why it must stay separately foldable.',
+  },
   { reason: 'profit_lock', owner: 'strategy', why: 'The sleeve\'s profit-lock rule fired.' },
   {
     reason: 'book_halt_flat',
@@ -313,6 +380,62 @@ export interface OptionSleeveExitReasonStat {
 }
 
 /**
+ * TRA-5100 — one exit-reason-class slice of a cell's STRATEGY-owned closes,
+ * carrying the full crossed fold so coverage is readable beside its own
+ * provenance split (`pricedByFireTickQuote` / `pricedByLastKnownQuote` /
+ * `lastKnownQuoteMeanAgeMs`) and its refusal census (`unpricedReasons`).
+ */
+export interface OptionSleeveStrategyCrossedSlice {
+  /** Strategy-owned closed rows in this exit-reason class. */
+  closed: number;
+  /** `crossed.priced / closed`, 4 dp; `null` at closed = 0 — never 0. */
+  coverage: number | null;
+  crossed: CrossedFoldCells;
+}
+
+/**
+ * TRA-5100 (parent TRA-5098) — a cell's strategy-exit crossed coverage, SPLIT
+ * by whether the chandelier family closed the row.
+ *
+ * Why this split is published at all: on 2026-10-04 the desk demo directional
+ * cell read crossed coverage 16/19 on chandelier closes and **0/8 on
+ * everything else** (`ma20_close_through` / `time_stop` / `profit_lock`, all
+ * `exit_quote_missing`) — i.e. pricing coverage was 100% confounded with
+ * `exitReason`. The TRA-5098 prereg's primary cut is intention-to-treat
+ * (deliberately NOT conditioned on `exitReason`, which is post-treatment once
+ * the trail flips), so a cost arm computed on the pooled cut silently
+ * re-imposes exactly the selection the ITT cut removes. This block is the
+ * surface that lets a later verdict READ that confound instead of refolding
+ * `rows=all` by hand: prereg rule 5 promotes the cost arm to co-primary when
+ * `nonChandelier.coverage >= 0.80` in the graded cell.
+ *
+ * Membership is the chandelier FAMILY (`exitReason` prefix `chandelier`:
+ * `chandelier`, `chandelier_daily_close`, `chandelier_restarted`,
+ * `chandelier_spot_seeded`) — the confound is about which CLOSE PATH captured
+ * a book, and all four labels are the same path. Only strategy-owned rows are
+ * folded (the same population a sleeve grade may cite).
+ */
+export interface OptionSleeveStrategyCrossedByExitClass {
+  chandelier: OptionSleeveStrategyCrossedSlice;
+  nonChandelier: OptionSleeveStrategyCrossedSlice;
+}
+
+/** TRA-5100 — the chandelier close-path family, by `exitReason` prefix. */
+export function isChandelierExitReason(exitReason: string | null | undefined): boolean {
+  return typeof exitReason === 'string' && exitReason.startsWith('chandelier');
+}
+
+/** TRA-5100 — fold one exit-reason class into its coverage slice. */
+function strategyCrossedSlice(rows: OptionTradeJournalRecord[]): OptionSleeveStrategyCrossedSlice {
+  const crossed = foldCrossedCells(rows);
+  return {
+    closed: rows.length,
+    coverage: rows.length > 0 ? Math.round((crossed.priced / rows.length) * 10_000) / 10_000 : null,
+    crossed,
+  };
+}
+
+/**
  * TRA-3715 item 1 — ONE `accountClass × structure × entryArchetype` cell.
  *
  * All three axes are ON the cell as fields, never encoded into a joined key a
@@ -334,6 +457,13 @@ export interface OptionSleeveCell {
   all: OptionSleeveExitSlice;
   /** The number a sleeve grade may actually cite. */
   strategyExits: OptionSleeveExitSlice;
+  /**
+   * TRA-5100 — crossed-pricing coverage of the `strategyExits` rows, split
+   * chandelier-family vs everything else. `chandelier.closed +
+   * nonChandelier.closed === strategyExits.n`, always. See the type's docblock
+   * for why the split exists (the TRA-5098 cost-arm confound).
+   */
+  strategyCrossedByExitClass: OptionSleeveStrategyCrossedByExitClass;
   harnessExits: OptionSleeveExitSlice;
   unknownExits: OptionSleeveExitSlice;
   /** `strategy + harness + unknown === all.n`. False ⇒ the split lost a row. */
@@ -657,6 +787,14 @@ export function foldOptionSleeveCells(rows: OptionTradeJournalRecord[]): OptionS
       const strategyExits = slice('strategy', byOwner.get('strategy')!);
       const harnessExits = slice('harness', byOwner.get('harness')!);
       const unknownExits = slice('unknown', byOwner.get('unknown')!);
+      // TRA-5100 — the strategy rows partitioned by chandelier-family close
+      // path. Exhaustive by construction: every strategy row lands in exactly
+      // one slice, so the two `closed` counts always sum to `strategyExits.n`.
+      const strategyRows = byOwner.get('strategy')!;
+      const strategyCrossedByExitClass: OptionSleeveStrategyCrossedByExitClass = {
+        chandelier: strategyCrossedSlice(strategyRows.filter((r) => isChandelierExitReason(r.exitReason))),
+        nonChandelier: strategyCrossedSlice(strategyRows.filter((r) => !isChandelierExitReason(r.exitReason))),
+      };
       cells.push({
         accountClass: klass,
         structure: pair.structure,
@@ -666,6 +804,7 @@ export function foldOptionSleeveCells(rows: OptionTradeJournalRecord[]): OptionS
         open: list.length - closedList.length,
         all: slice('all', closedList),
         strategyExits,
+        strategyCrossedByExitClass,
         harnessExits,
         unknownExits,
         exitOwnerCountsSumToClosed:
@@ -731,7 +870,13 @@ export function foldOptionSleeveCells(rows: OptionTradeJournalRecord[]): OptionS
       + 'exitReason was written by a supersede over a different reason -- byExitReason '
       + 'counts those rows under the NEW label, so a fold that cares which rule fired must '
       + 'read that list. Window this with ?sinceEtDay=/&untilEtDay= (ET session '
-      + 'days on closeTs) or the epoch-ms cohort params; unwindowed it is a LIFETIME fold.',
+      + 'days on closeTs) or the epoch-ms cohort params; unwindowed it is a LIFETIME fold. '
+      + 'TRA-5100: strategyCrossedByExitClass splits each cell\'s strategyExits crossed-pricing '
+      + 'coverage chandelier-family vs non-chandelier (measured 2026-10-04: 16/19 vs 0/8 in the '
+      + 'desk demo directional cell — 100% confounded with exitReason). The TRA-5098 prereg '
+      + 'promotes its cost arm to co-primary only when nonChandelier.coverage >= 0.80 in the '
+      + 'graded cell; read it WINDOWED (the lifetime fold is diluted by pre-TRA-4997 history '
+      + 'that carries no stored quote and can never price retroactively).',
   };
 }
 

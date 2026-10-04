@@ -76,7 +76,7 @@ if (rGrafted.status !== 0) {
     const ok = result.answer === null && result.verdict.startsWith('blind-');
     arm('grafted-answer-null', ok,
       `answer=${result.answer}, verdict=${result.verdict} (expect answer=null, verdict=blind-*)`);
-  } catch (e) {
+  } catch {
     arm('grafted-parse', false, `could not parse: ${rGrafted.stdout}`);
   }
 }
@@ -100,7 +100,7 @@ if (rComplete.status !== 0) {
     const ok = result.answer === true && result.verdict === 'carries';
     arm('complete-answer-true', ok,
       `answer=${result.answer}, verdict=${result.verdict} (expect answer=true, verdict=carries)`);
-  } catch (e) {
+  } catch {
     arm('complete-parse', false, `could not parse: ${rComplete.stdout}`);
   }
 }

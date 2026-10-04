@@ -177,16 +177,18 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
   },
   {
     key: 'ENABLE_OPTION_LIVE_OTM',
-    intended: 'on',
+    intended: 'off',
     provenance:
-      'TRA-4750 item 5 board sign-off EXECUTED: card 6b82a9e7 on TRA-3401 (ask_user_questions, ' +
-      'human_only, answered by the board 2026-09-24T01:57Z) ordered the STANDING RE-ARM, superseding ' +
-      'the stand-down posture this row carried 2026-09-22..09-24 (TRA-4750 item 3, executed on bqb1 ' +
-      'by TRA-4785). Re-armed together with the TRA-4814 rider row (ENABLE_OPTION_MAKER_TELEMETRY ' +
-      'below) in the same change, as that ruling requires. The 0.385R cost bar still gates every ' +
-      'entry — arming does not by itself produce trades. An `off` reading here is now a silent ' +
-      'DISARM and is still the event to escalate, in the new direction; standing down again is ' +
-      'risk-reducing and needs no sign-off, but the manifest row must move in the same change.',
+      'TRA-4885 default direction B, EXECUTED by TRA-4988 (2026-10-03): board card f8cd3843 ' +
+      '(ask_user_questions, human_only, 5th in its chain) expired unanswered after 5.74d, firing ' +
+      'the declared default — bands dark FIRST, then restore_both (caps 64/64 -> ratified 300/500, ' +
+      'stamp 5fc18af7) as ratification hygiene, one-shot cost-bar grant NOT re-issued. Supersedes ' +
+      'the TRA-4750-item-5 standing re-arm (card 6b82a9e7, 2026-09-24) this row carried ' +
+      '09-24..10-03. Standing down was risk-reducing and needed no sign-off, per this row\'s own ' +
+      'prior text; the manifest row moved in the same change, as required. The hazard direction ' +
+      'has inverted again: an `on` reading here is now a silent RE-ARM of a stood-down sleeve on ' +
+      'the money host — escalate. Re-arming is a board decision and there is no pending card; it ' +
+      'needs a fresh answer on a live surface (TRA-4885 comment 88153428).',
     resolve: (env) => (isOptionLiveOtmEnabled(env) ? 'on' : 'off'),
   },
   {

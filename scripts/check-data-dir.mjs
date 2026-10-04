@@ -175,25 +175,29 @@ const BASELINE = {
   },
   'engine-scorecard.ts': {
     copies: 0,
-    exempt: [{ text: "const dataDir = process.env['DATA_DIR'];", count: 1, reason: R.REPORT }],
+    exempt: [
+      {
+        text: "const dataDir = process.env['DATA_DIR']?.trim();",
+        count: 1,
+        reason:
+          'TRA-5037 disposition: CONVERTED in place — trims, so blank no longer pushes a ' +
+          '`" "/…` path candidate; not a demo-flags overlay, so resolveDemoFlagEnvFromEnv() ' +
+          'does not apply, and resolveDataDir() would invent an in-bundle candidate',
+      },
+    ],
   },
   'giveback-arm-floor-ledger.ts': {
     copies: 0,
     exempt: [
+      // TRA-5037 — 3 → 1: `resolveRecorderEnvs()`'s read now goes through
+      // `resolveDemoFlagEnvFromEnv()` (it fed the value to resolveDemoFlagEnv as a
+      // ROOT — never a report-read), and the doc comment that spelled the old idiom
+      // out was rewritten with it. The remaining comment documents the banned
+      // in-bundle fallback and stays.
       {
         text: "// build bundle (`index.ts`: `process.env.DATA_DIR ?? join(__dirname,'..','data')`) —",
         count: 1,
         reason: R.COMMENT,
-      },
-      {
-        text: '* Mirrors `SignalEngine.resolveDemoFlagEnv()` EXACTLY (`process.env.DATA_DIR` — not this',
-        count: 1,
-        reason: R.COMMENT,
-      },
-      {
-        text: 'const dir = process.env.DATA_DIR;',
-        count: 1,
-        reason: `${R.REPORT} — deliberately mirrors resolveDemoFlagEnv(), see the comment above it`,
       },
     ],
   },
@@ -210,19 +214,14 @@ const BASELINE = {
   'observability/health-routes.ts': {
     copies: 0,
     exempt: [
-      // 13 report-reads. The health surfaces exist to tell an operator what the box
-      // actually has set — resolving a root here would hide the very drift they report.
-      // TRA-4440 — 10 → 11: TRA-4436 (`4bd2bb59`) added the `rvExitRetuneDemo` readout
-      // on /api/health/option-swing-exits, which resolves the demo-flags overlay env
-      // through the same `dir ? resolveDemoFlagEnv(dir) : process.env` idiom as the
-      // ten above it. Same class, same blank-value behaviour (blank ⇒ process.env,
-      // never a root named ' '). Hand-edited here, which is the ratchet working.
-      // TRA-4726 — 11 → 10: TRA-4629 (`9a2ccba2`) deleted the crypto engine and with it
-      // the regime-TSMOM demo readout, which carried one of these reads. A removal, not
-      // a new unguarded copy; `copies` stays 0.
-      { text: 'const dir = process.env.DATA_DIR;', count: 10, reason: R.REPORT },
+      // TRA-5037 — 12 → 1 code reads: the 11 demo-flags overlay resolutions
+      // (`const dir = …` ×10 + `const sebDir = …`) now go through
+      // `resolveDemoFlagEnvFromEnv()`, which trims, so a blank-but-present DATA_DIR
+      // behaves as unset. They were never report-reads — each fed the value to
+      // `resolveDemoFlagEnv` as a ROOT, which is the hazard this guard bans; the
+      // one surviving read below is the genuine report-read (it publishes the raw
+      // value so an operator can see the drift) and must NOT be converted.
       { text: 'const dataDir = process.env.DATA_DIR ?? null;', count: 1, reason: R.REPORT },
-      { text: 'const sebDir = process.env.DATA_DIR;', count: 1, reason: R.REPORT },
       {
         text: '// actually appended to. `process.env.DATA_DIR` is what the operator *set*, and on a',
         count: 1,
@@ -234,16 +233,19 @@ const BASELINE = {
     copies: 0,
     exempt: [
       {
-        text: "process.env['LOG_DIR'] ?? join(process.env['DATA_DIR'] ?? process.cwd(), 'logs');",
+        text: "process.env['LOG_DIR']?.trim() || join(process.env['DATA_DIR']?.trim() || process.cwd(), 'logs');",
         count: 1,
-        reason: `${R.REPORT} — falls back to cwd, not an in-bundle path; a different predicate`,
+        reason:
+          'TRA-5037 disposition: CONVERTED in place — `||` over trimmed values, so a blank ' +
+          'LOG_DIR/DATA_DIR no longer sends the log tree to `" "/logs`; falls back to cwd, ' +
+          'not an in-bundle path, so resolveDataDir() would change the meaning',
       },
     ],
   },
-  'signal-engine.ts': {
-    copies: 0,
-    exempt: [{ text: 'const dir = process.env.DATA_DIR;', count: 1, reason: R.REPORT }],
-  },
+  // TRA-5037 — `signal-engine.ts` left the baseline: its one hit (the RECORDER's
+  // `SignalEngine.resolveDemoFlagEnv()`) now resolves through
+  // `resolveDemoFlagEnvFromEnv()`, which trims. Removal, not a new copy; the
+  // ratchet demanded this hand edit, which is the design.
 };
 
 /** Sum of `copies` across the baseline — the number the ticket records. */

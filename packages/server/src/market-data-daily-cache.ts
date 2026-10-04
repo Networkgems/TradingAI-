@@ -57,22 +57,26 @@ import type { Candle } from '@trading-app/shared';
  *   allowed to replace a longer stale one.
  * - **Bars are DEEPEST-OR-EQUAL-WINS.** This is the one place the rule is
  *   written down rather than inherited, and it needs its reason on the record.
- *   There are two writers at two different depths — the technical-snapshot pass
- *   stores `MTF_DAILY_BARS` (260) and `otmDailyAtr`'s cold path stores
- *   `OTM_DAILY_ATR_BARS` (40) — and `atr()` is Wilder-smoothed over **every**
- *   candle it is handed, so those two series yield DIFFERENT ATRs for the same
- *   symbol on the same day. Under the per-engine map that made the published
+ *   `atr()` is Wilder-smoothed over **every** candle it is handed — it SEEDS on
+ *   `period` true ranges and smooths to the END of the series — so two different
+ *   LENGTHS of the same series yield DIFFERENT ATRs for the same symbol on the
+ *   same day. Under the per-engine map that made the published
  *   `otmAtrInvalidationLevel` depend on write order. Equal depth still wins, so
  *   the snapshot pass keeps refreshing normally at 260; only a strictly
- *   shallower series loses. The live box already converges on the 260-bar read
- *   (the snapshot pass runs continuously), so this pins the value the fleet
- *   already reports instead of introducing a new one.
+ *   shallower series loses.
  *
- *   ⚠️ Whether 260 is the depth the OTM sleeve's ATR *should* use is a separate,
- *   live-money question — `OTM_DAILY_ATR_BARS = 40` states an intent the warm
- *   path has never honoured — and it is NOT settled here. Changing a published
- *   ATR inside a heap fix is exactly the shape this codebase keeps getting
- *   burned by. It is filed on its own.
+ *   ✅ **Both bar writers now pull at `MTF_DAILY_BARS` (260)** — the
+ *   technical-snapshot pass and `otmDailyAtr`'s cold path alike (TRA-4989,
+ *   implementing the TRA-4943 ruling). When this rule was written the cold path
+ *   pulled its own shallower constant (40), and that depth difference is what
+ *   the rule existed to adjudicate. With one depth in the system the tiebreak is
+ *   a plain **no-op**, which is a strictly simpler invariant to keep true.
+ *
+ *   ⚠️ **Do not read "no-op" as "removable."** It is still load-bearing against
+ *   a SHORT PROVIDER RESPONSE — a thin `yf.chart` reply at the same requested
+ *   depth is a genuinely shallower series, and without this rule it would
+ *   clobber a converged one and move a live exit level. Its regression guard is
+ *   `market-data-daily-cache.test.ts` ("the depth rule is load-bearing").
  *
  * ## Sharing is safe by CONTENT, and that is the load-bearing claim
  *

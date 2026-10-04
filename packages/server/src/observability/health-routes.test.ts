@@ -39,7 +39,23 @@ import {
   isProfitFloorTrailEnabled,
   PROFIT_FLOOR_TRAIL_FLAG,
   EXIT_RISK_RULES_FLAG,
+  OTM_SLEEVE_EXIT_RULE_VALUE,
+  isExitRiskRulesEnabled,
 } from '../exit-risk-rules-flag.js';
+// TRA-4991 (AC2 + AC3) — the chandelier trail parameterisation + ratchet census.
+import {
+  CHANDELIER_ATR_PERIOD,
+  SHADOW_CANDLE_TIMEFRAME_MS,
+  noteChandelierRatchet,
+  resetChandelierRatchetLedgerForTests,
+  resolveChandelierTrailParams,
+  summarizeChandelierRatchets,
+} from '../option-chandelier-trail.js';
+import {
+  EXIT_CHANDELIER_ATR_MULT,
+  EXIT_CHANDELIER_ATR_MULT_HIGHBETA,
+  EXIT_CHANDELIER_HIGHBETA_ATRPCT,
+} from '@trading-app/shared';
 import { resolveDemoFlagEnv, resolveDemoFlagEnvFromEnv } from '../demo-flags.js';
 // TRA-5030 — the arm predicate + its flag name, imported as SYMBOLS so the route
 // assertions below cannot drift against retyped literals.
@@ -47,6 +63,9 @@ import {
   isOptionRealFillShadowEnabled,
   OPTION_REAL_FILL_SHADOW_FLAG,
 } from '../option-real-fill-shadow.js';
+// TRA-5037 — the churn-brake flag, the surface the sibling-reads blank-case test
+// below grades after the 11 class-A conversions in health-routes.ts.
+import { CHURN_LOSS_BRAKE_FLAG } from '../churn-loss-brake-flag.js';
 // TRA-3216 — the live OTM underlying allowlist + the enforcement-gate ledger it publishes through.
 import { OPTION_LIVE_OTM_UNIVERSE_VAR } from '../otm-live-universe-flag.js';
 import { clearLiveEnforceGateLedger, recordLiveEnforceDecision } from '../live-enforce-gate-ledger.js';
@@ -3775,7 +3794,14 @@ describe('GET /api/health/equity-entry-funnel — symbol layer (TRA-1793)', () =
 // The acceptance criterion is not "the route exists" but "the route can tell an
 // outage from a drought", so these assert the SEPARATION, not the shape.
 describe('TRA-2193 GET /api/health/rv-scan', () => {
-  function mountRvScan(env: Record<string, string | undefined> = {}) {
+  function mountRvScan(
+    env: Record<string, string | undefined> = {},
+    // TRA-5087 — the staleness grade needs BOTH instants or it grades nothing:
+    // a fixture `now` against the vitest process's real boot reads as a
+    // permanent arming grace. Defaults keep the legacy cases on NOW (1970,
+    // outside calendar coverage, where the grade is `calendar_uncovered`).
+    clock: { nowMs?: number; bootedAtMs?: number } = {},
+  ) {
     const saved: Record<string, string | undefined> = {};
     for (const k of Object.keys(env)) {
       saved[k] = process.env[k];
@@ -3787,7 +3813,8 @@ describe('TRA-2193 GET /api/health/rv-scan', () => {
       requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
       userCtx: async () => ctx('admin', engineState()),
       getSettings: () => settings(),
-      now: () => NOW,
+      now: () => clock.nowMs ?? NOW,
+      bootedAtMs: clock.bootedAtMs,
     });
     const handlers = routes.get('/api/health/rv-scan')!;
     const res = fakeRes();
@@ -3855,6 +3882,55 @@ describe('TRA-2193 GET /api/health/rv-scan', () => {
     ).toBe(last.candidatesEvaluated - last.candidatesPassed);
     expect(dir.lastScan!['bucketsBalance']).toBe(true);
     expect((body.dataSource as unknown as Record<string, unknown>).lastFetchOkAt).toBe(NOW);
+  });
+
+  // TRA-5087 — the wiring of the in-RTH staleness discriminator, asserted on the
+  // route's own payload (the pure grader has its own suite in
+  // rv-scan-rth-staleness.test.ts). Both directions, because the whole defect
+  // was a reading that could not distinguish them.
+  it('TRA-5087 RED: a day-old lastScanAt mid-RTH on a session day flips verdict to stale_in_rth and ok to false', () => {
+    const fridayClose = Date.parse('2026-10-02T19:59:59.326Z');
+    const run = beginRvScan('directional', 1, () => fridayClose);
+    run.enterSymbol();
+    run.reject('no_trend_confluence');
+    run.fetchOk();
+    run.finish();
+
+    // Monday 2026-10-05, 11:00 ET — the next session, mid-RTH, booted pre-open.
+    const { body } = mountRvScan(
+      { ENABLE_OPTION_DEMO_DIRECTIONAL: '1' },
+      { nowMs: Date.parse('2026-10-05T15:00:00Z'), bootedAtMs: fridayClose },
+    );
+    expect(body.verdict).toBe('stale_in_rth');
+    expect(body.ok).toBe(false);
+    const g = body.rthStaleness as unknown as Record<string, unknown>;
+    expect(g.state).toBe('stale_in_rth');
+    expect(g.inRth).toBe(true);
+    // The loop DID turn since boot — that is exactly the claim `scanning` used
+    // to hide behind, so pin that the raw counters still say so while the
+    // verdict no longer does.
+    expect(body.scanCountSinceBoot).toBe(1);
+  });
+
+  it('TRA-5087 GREEN CONTROL: the 2026-10-03 incident read — Saturday, lastScanAt at Friday close — keeps verdict scanning and ok true', () => {
+    const fridayClose = Date.parse('2026-10-02T19:59:59.326Z');
+    const run = beginRvScan('directional', 1, () => fridayClose);
+    run.enterSymbol();
+    run.reject('no_trend_confluence');
+    run.fetchOk();
+    run.finish();
+
+    // The filing's own read instant: 2026-10-03T16:39:53Z, which is 12:39 ET
+    // on a SATURDAY — the weekday misread that produced this ticket.
+    const { body } = mountRvScan(
+      { ENABLE_OPTION_DEMO_DIRECTIONAL: '1' },
+      { nowMs: Date.parse('2026-10-03T16:39:53Z'), bootedAtMs: fridayClose },
+    );
+    expect(body.verdict).toBe('scanning');
+    expect(body.ok).toBe(true);
+    const g = body.rthStaleness as unknown as Record<string, unknown>;
+    expect(g.state).toBe('out_of_session');
+    expect(g.reason).toMatch(/not an NYSE session/);
   });
 
   it('separates ARMED-BUT-NEVER-RAN from DISARMED — the two an operator must not confuse', () => {
@@ -8322,6 +8398,93 @@ describe('TRA-4510 option-swing-exits profitFloorTrail — both books', () => {
   });
 });
 
+// ─── TRA-4991 (AC2 + AC3, parent TRA-4945) — the chandelier REACHES THE ROUTE ──
+//
+// The resolver's own cases live in `tra4991-chandelier-trail-publication.test.ts`.
+// What this pins is that the levels and the ratchet census are actually ON
+// `/api/health/option-swing-exits`, because the gap TRA-4945 hit was not a wrong
+// value — it was a route that published FLAGS ONLY. `swingTimeStop`,
+// `rvExitRetuneLive/Demo`, `takeProfitEarlyLive` and `profitFloorTrail` carried no
+// level and no ATR, `/api/health/otm-sleeve-mandate` carried no exit-rule key at
+// all, and so "what width is the trail, on what series, and is it retired on the
+// OTM sleeve" had to be answered with `git show` against the deployed commit.
+describe('TRA-4991 option-swing-exits — the chandelier trail parameterisation + ratchet census', () => {
+  const serve = (): Record<string, unknown> => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/option-swing-exits')!;
+    expect(handlers).toHaveLength(1); // unauthenticated, like its siblings
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    return (res.body as { chandelier: Record<string, unknown> }).chandelier;
+  };
+
+  it('publishes the resolved widths, the ATR source and the sleeve rule — not just flags', () => {
+    const c = serve();
+    // Identity with the resolver, not a copy: a second spelling of these numbers
+    // on the route is how a published level drifts from the one the trail uses.
+    expect(c).toMatchObject(resolveChandelierTrailParams(process.env));
+    expect(c.atrMult).toBeCloseTo(EXIT_CHANDELIER_ATR_MULT, 9);
+    expect(c.atrMultHighBeta).toBeCloseTo(EXIT_CHANDELIER_ATR_MULT_HIGHBETA, 9);
+    expect(c.highBetaAtrPct).toBeCloseTo(EXIT_CHANDELIER_HIGHBETA_ATRPCT, 9);
+    expect(c.atrTimeframeMs).toBe(SHADOW_CANDLE_TIMEFRAME_MS);
+    expect(c.atrPeriod).toBe(CHANDELIER_ATR_PERIOD);
+    // AC2's honesty field: `compiled` ⇒ there is no env key to hunt for.
+    expect(c.multSource).toBe('compiled');
+    // …and the one read that answers "is the chandelier retired on the OTM
+    // sleeve" without inferring it from a `render.yaml` absence.
+    expect(c.otmSleeveExitRule).toMatchObject({ envKey: OTM_SLEEVE_EXIT_RULE_VALUE });
+  });
+
+  it('AC3 — the ratchet census is on the wire, per book, with its three-cell partition', () => {
+    resetChandelierRatchetLedgerForTests();
+    noteChandelierRatchet('live', EXIT_CHANDELIER_HIGHBETA_ATRPCT * 2, EXIT_CHANDELIER_ATR_MULT_HIGHBETA);
+    noteChandelierRatchet('demo', undefined, EXIT_CHANDELIER_ATR_MULT);
+
+    const ratchets = serve().ratchets as ReturnType<typeof summarizeChandelierRatchets>;
+    // ⚠ NOT pooled — live and demo ratchet in one process, and a pooled count
+    // would let demo volatility answer a question asked about real money.
+    expect(ratchets.byMode.live.highBeta).toBe(1);
+    expect(ratchets.byMode.demo.highBeta).toBe(0);
+    // ⛔ The discrimination a flag cannot make: demo's base resolution came from
+    // NO atrPct at all, so the high-beta branch was unreachable there, not
+    // declined. `baseAtrPctAbsent` is what says so.
+    expect(ratchets.byMode.demo.baseAtrPctAbsent).toBe(1);
+    expect(ratchets.byMode.demo.maxAtrPct).toBeNull();
+    for (const t of [ratchets.byMode.live, ratchets.byMode.demo, ratchets.all]) {
+      expect(t.highBeta + t.base + t.baseAtrPctAbsent).toBe(t.ratchets);
+      // …and the DENOMINATOR partitions too. `rowsSeen` is what stops a
+      // `ratchets: 0` being read as a measurement when nothing was eligible —
+      // measured live on 2026-10-02, where the whole book was two combos.
+      expect(t.rowsSeen).toBe(t.ratchets + Object.values(t.skipped).reduce((a, n) => a + n, 0));
+    }
+    expect(ratchets.all.rowsSeen).toBe(2);
+    resetChandelierRatchetLedgerForTests();
+  });
+
+  it('⛔ names the master beside the counts, so a `ratchets: 0` under a dark master is not read as a measurement', () => {
+    // The ratchet only runs while `exitRisk` is attached, i.e. while the
+    // exit-risk master is on. Without this field a structural zero ("the trail
+    // was never evaluated") is indistinguishable from "evaluated, never high
+    // beta" — the same conflation AC3's `baseAtrPctAbsent` cell removes one level
+    // down. Resolved through the engine's OWN helper over each book's own env
+    // view, so it cannot drift from the decision site.
+    const c = serve();
+    expect(c.requiresMaster).toBe(EXIT_RISK_RULES_FLAG);
+    expect(c.exitRiskMaster).toEqual({
+      live: isExitRiskRulesEnabled(process.env),
+      demo: isExitRiskRulesEnabled(
+        process.env.DATA_DIR ? resolveDemoFlagEnv(process.env.DATA_DIR) : process.env,
+      ),
+    });
+  });
+});
+
 // ─── TRA-4978 (parent TRA-4931) — the stale-input ATTRIBUTION SPLIT on the wire ─
 //
 // The fold's own cases live in `tra4978-cost-bar-stale-attribution.test.ts`. What
@@ -8679,5 +8842,74 @@ describe('TRA-5030 DATA_DIR states on /api/health/option-real-fill-shadow', () =
     delete process.env[FLAG];
     process.env.DATA_DIR = '';
     expect(await serve()).toMatchObject({ enabled: false, enabledSource: 'off' });
+  });
+});
+
+// TRA-5037 — the 11 sibling reads in this file (TRA-5030 converted only
+// /api/health/option-real-fill-shadow) must also treat a blank-but-present DATA_DIR
+// as unset. One per-surface test, on /api/health/churn-brake, built on the same
+// planted-`" "` fixture as the TRA-5030 block above — a test that only sets
+// `DATA_DIR=' '` and asserts the safe outcome passes against the defect, because a
+// MISSING overlay also falls back to process.env.
+describe('TRA-5037 blank DATA_DIR on /api/health/churn-brake (the sibling reads)', () => {
+  const FLAG = CHURN_LOSS_BRAKE_FLAG;
+  let tmp: string | null = null;
+  let cwd0: string | null = null;
+
+  const serve = async (): Promise<{ armed: boolean }> => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    await routes.get('/api/health/churn-brake')![0]!({ query: {} }, res);
+    return res.body as { armed: boolean };
+  };
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'tra5037-hr-'));
+    delete process.env[FLAG];
+    delete process.env.DATA_DIR;
+  });
+
+  afterEach(() => {
+    if (cwd0) process.chdir(cwd0);
+    cwd0 = null;
+    delete process.env[FLAG];
+    delete process.env.DATA_DIR;
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    tmp = null;
+  });
+
+  it('BLANK ⇒ treated as UNSET; the planted " " overlay is live, yet the readout must ignore it', async () => {
+    cwd0 = process.cwd();
+    mkdirSync(join(tmp!, ' '), { recursive: true });
+    writeFileSync(join(tmp!, ' ', 'demo-flags.json'), JSON.stringify({ [FLAG]: '1' }), 'utf8');
+    process.chdir(tmp!);
+
+    // FIXTURE IS LIVE — negative control through the real resolveDemoFlagEnv.
+    expect(resolveDemoFlagEnv(' ', {} as NodeJS.ProcessEnv)[FLAG]).toBe('1');
+
+    process.env.DATA_DIR = ' ';
+    expect((await serve()).armed).toBe(false);
+
+    // Blank is UNSET, not "overlay off": process.env still arms the readout.
+    process.env[FLAG] = '1';
+    expect((await serve()).armed).toBe(true);
+
+    // `''` — the other blank spelling, pinned.
+    delete process.env[FLAG];
+    process.env.DATA_DIR = '';
+    expect((await serve()).armed).toBe(false);
+  });
+
+  it('SET ⇒ the overlay still wins (the conversion must not have weakened the file path)', async () => {
+    writeFileSync(join(tmp!, 'demo-flags.json'), JSON.stringify({ [FLAG]: '1' }), 'utf8');
+    process.env.DATA_DIR = tmp!;
+    expect(process.env[FLAG]).toBeUndefined();
+    expect((await serve()).armed).toBe(true);
   });
 });

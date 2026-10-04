@@ -76,7 +76,14 @@ const pin2 = {
   sizingRefusedOptionRows: 0,
   enforcedModelWouldSizeAtLeastOne: 0,
   enforcedModelWouldSizeZero: 0,
+  // Which LEG produced the number. `enforcedModelUnreadable` must mean exactly
+  // "neither leg could read it" — it is an alarm, never a quiet zero.
+  enforcedReadFromCard: 0,
+  enforcedReplayedFromAsk: 0,
   enforcedModelUnreadable: 0,
+  // The card's published enforced count must never exceed the replay's UPPER
+  // bound. Non-zero here means the two models have forked.
+  publishedExceedsReplayUpperBound: 0,
   examples: [],
 };
 
@@ -86,7 +93,8 @@ for (const c of cards.cards) {
     refusedByField: {},
   });
   t.total += 1;
-  pin1.total === 0;
+  // `pin1.total` is NOT counted here: it is set from `cards.cards.length` at the
+  // initializer above. (A vestigial `pin1.total === 0;` no-op sat on this line.)
   const incomplete = c.incompleteFields ?? [];
   const refused = c.refusedFields ?? [];
   for (const f of refused) t.refusedByField[f] = (t.refusedByField[f] ?? 0) + 1;
@@ -113,26 +121,55 @@ for (const c of cards.cards) {
   if (!isOption) continue;
   pin2.sizingRefusedOptionRows += 1;
   // The sleeve sizes on the ASK limit, never on the mark or the stop distance.
-  const ask = Number(contract?.ask);
-  if (!Number.isFinite(ask) || ask <= 0) { pin2.enforcedModelUnreadable += 1; continue; }
+  // ⛔ The ask is nested under `contract.liquidity`, NOT at the top of
+  // `contract.data`. Reading `contract.ask` returns `undefined` for EVERY live
+  // row, so this leg reported `enforcedModelUnreadable: 45 of 45` — a zero that
+  // reads identically to "the card does not carry enough to replay the enforced
+  // model", which is the false-BLIND direction of the bug this file measures.
+  // Measured 2026-10-02T14:20Z in-window against live `104bc8ed`; the shipped
+  // keys are `contract.liquidity.{bid,ask,spreadPerShare,…}`.
+  const ask = Number(contract?.liquidity?.ask ?? contract?.ask);
+  // ── The authoritative leg, post-TRA-4990 ─────────────────────────────────
+  // The card now publishes the ENFORCED count itself (`sizing.data.model ===
+  // 'enforced'`). Prefer it over any replay: a bound re-implemented inside an
+  // instrument agrees with itself and forks silently. The replay below survives
+  // only as a CROSS-CHECK, and only where the ask is readable.
+  const sizing = c.fields?.sizing?.data ?? {};
+  const published = sizing.model === 'enforced' ? Number(sizing.quantity) : NaN;
+  const publishedOk = Number.isFinite(published) && published >= 0;
   // resolveLiveOptionTestContracts(askLimit, min(cash, cap), maxContracts), then
   // capOtmEntryContracts(..., otmFloor). Available cash is NOT on the card, so
   // the cap alone is used — an UPPER bound on the enforced count, which is the
   // conservative direction for the claim "the engine would have sized >= 1".
-  const perContract = ask * 100;
-  const fits = Math.floor(TEST_CAP_USD / perContract);
-  const enforced = fits < 1 ? 0 : Math.min(fits, Math.max(1, Math.floor(MAX_CONTRACTS)), MAX_PER_ENTRY);
+  const askOk = Number.isFinite(ask) && ask > 0;
+  const perContract = askOk ? ask * 100 : null;
+  const fits = askOk ? Math.floor(TEST_CAP_USD / perContract) : null;
+  const replayUpperBound = !askOk ? null
+    : fits < 1 ? 0 : Math.min(fits, Math.max(1, Math.floor(MAX_CONTRACTS)), MAX_PER_ENTRY);
+  // `null` = NOT COMPARED, never "they agree" (the TRA-4990 three-valued rule).
+  const replayAgrees = publishedOk && replayUpperBound !== null
+    ? published <= replayUpperBound : null;
+  if (replayAgrees === false) pin2.publishedExceedsReplayUpperBound += 1;
+
+  if (!publishedOk && !askOk) { pin2.enforcedModelUnreadable += 1; continue; }
+  const enforced = publishedOk ? published : replayUpperBound;
+  pin2[publishedOk ? 'enforcedReadFromCard' : 'enforcedReplayedFromAsk'] += 1;
   if (enforced >= 1) pin2.enforcedModelWouldSizeAtLeastOne += 1;
   else pin2.enforcedModelWouldSizeZero += 1;
   if (pin2.examples.length < 6) {
     pin2.examples.push({
       symbol: c.symbol, signalType: c.signalType,
-      ask, perContractNotional: perContract,
-      cardBasis: c.fields?.sizing?.data?.basis ?? null,
-      cardQuantity: c.fields?.sizing?.data?.quantity ?? null,
-      cardRiskBudget: c.fields?.sizing?.data?.riskBudget ?? null,
+      ask: askOk ? ask : null, perContractNotional: perContract,
+      cardBasis: sizing.basis ?? null,
+      cardQuantity: sizing.quantity ?? null,
+      cardSizingModel: sizing.model ?? null,
+      cardRiskBudget: sizing.riskBudget ?? null,
+      cardRiskBudgetContracts: sizing.riskBudgetContracts ?? null,
+      cardDivergesFromRiskBudget: sizing.divergesFromRiskBudget ?? null,
       cardReasons: c.fields?.sizing?.reasons ?? null,
-      enforcedQuantityUpperBound: enforced,
+      enforcedQuantity: enforced,
+      enforcedSource: publishedOk ? 'published_by_card' : 'replayed_from_ask',
+      replayUpperBound, replayAgrees,
     });
   }
 }

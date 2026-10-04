@@ -121,6 +121,7 @@ import {
   RV_SCAN_PATH_STRUCTURE_LABEL,
   type RvScanAdmissibilityLedgerRead, // TRA-4255
 } from '../rv-scan-telemetry.js'; // TRA-2193 / TRA-2245
+import { gradeRvScanRthStaleness } from '../rv-scan-rth-staleness.js'; // TRA-5087
 import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
 import { buildWheelPromotionGateSummary } from '../wheel-promotion-gate-store.js'; // TRA-2028
 import {
@@ -361,10 +362,19 @@ import { snapshotRiskThrottleSizing } from '../risk-throttle-sizing.js';
 import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG, isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG, isBookGiveBackArmFloorEnabled, BOOK_GIVEBACK_ARM_FLOOR_FLAG, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_FLAG, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, isRvExitRetuneEnabled, RV_EXIT_RETUNE_FLAG, isTakeProfitEarlyLiveEnabled, TAKE_PROFIT_EARLY_LIVE_FLAG, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_VALUE, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, resolveOptionsHaltScope, OPTIONS_HALT_SCOPE_VAR, isOtmTp1FullExit1LotEnabled, OTM_TP1_FULL_EXIT_1LOT_FLAG, isProfitFloorTrailEnabled, PROFIT_FLOOR_TRAIL_FLAG, type OptionsHaltScopeResolution } from '../exit-risk-rules-flag.js';
 // TRA-4244 — the env-resolved OTM profit-side schedule, surfaced beside barR.
 import { describeOtmProfitSchedule } from '../otm-profit-schedule.js';
+// TRA-4991 (AC2 + AC3) — the chandelier trail's resolved parameterisation and
+// the since-boot high-beta ratchet census. ⛔ Observe-only.
+import {
+  resolveChandelierTrailParams,
+  summarizeChandelierRatchets,
+} from '../option-chandelier-trail.js';
+// TRA-5061 — the side-by-side ATR shadow census (evidence class
+// `reachability_only`; never the forward test). ⛔ Observe-only.
+import { summarizeChandelierAtrShadow } from '../tra5061-chandelier-atr-shadow.js';
 import { summarizeOptionsBreakerLedger } from '../options-breaker-ledger.js'; // TRA-3218
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
-import { resolveDemoFlagEnv, resolveDemoFlagEnvFromEnv, DEMO_FLAG_ALLOWLIST } from '../demo-flags.js';
+import { resolveDemoFlagEnvFromEnv, DEMO_FLAG_ALLOWLIST } from '../demo-flags.js';
 // TRA-4436 — demo-effective ma20 confirm bars, derived from the shipped
 // `buildRvExitParams` so the option-swing-exits readout cannot drift from it.
 import { demoEffectiveMa20ConfirmBars } from '../rv-exit-params.js';
@@ -646,6 +656,13 @@ export interface LiveHealthDeps {
   adoptedHandoverRows?: () => AdoptedHandoverCensusRow[];
   /** Injectable clock for deterministic tests. Defaults to Date.now. */
   now?: () => number;
+  /**
+   * TRA-5087 — when this process booted, for the rv-scan in-RTH staleness
+   * boot grace. Tests inject it beside `now`; absent ⇒ derived from
+   * `process.uptime()`. A fixture `now` mixed with the REAL boot instant
+   * grades nothing, which is why this is a dep and not an inline read.
+   */
+  bootedAtMs?: number;
 }
 
 /** TRA-3445 — one engine's aggregate live-OTM exposure readout. */
@@ -1876,6 +1893,31 @@ export interface Sma200SweepCensusReport {
      * count, and a TypeScript doc comment never reaches them.
      */
     rejectedMaxDistIs: 'SIGMA_OVER_ENGINES_NOT_AC7_N';
+    /**
+     * TRA-5065 — WHO served the bars, Σ over graded engines.
+     *
+     * `evaluated` alone cannot tell a healthy Yahoo from a permanently-429ing
+     * one carried by the Tradier fallback, and the whole filed defect was that
+     * `evaluated: 0` read as a quiet market. The positive control this ticket
+     * owes is exactly the pair `yahooBreakerOpen: true` (on
+     * `/api/health/quotes`) next to `servedFallback > 0` here.
+     */
+    servedPrimary: number;
+    servedFallback: number;
+    /**
+     * Σ of the two sub-tags on `starvedBreakerOpen`. ⚠️ ALREADY COUNTED inside
+     * `starvedBreakerOpen` — they name the reason that bucket filled, they do
+     * not add to it. Adding them to the starve total double-counts.
+     */
+    starvedFallbackBudget: number;
+    fallbackUnavailable: number;
+    /**
+     * Graded engines whose census carries NO `servedPrimary`/`servedFallback`
+     * key — a build from before this ticket. Non-zero ⇒ the four numbers above
+     * are a lower bound over a partial fleet and a `0` is not a reading.
+     * ABSENT ≠ ZERO, the same discipline as `rejectedMaxDistUnpublished`.
+     */
+    servedUnpublished: number;
   };
   /**
    * TRA-4922 (AC-a) — the AC7 count arm: the DISTINCT rejected cohort, folded
@@ -2086,6 +2128,12 @@ export function summarizeSma200Sweeps(
     rejectedMaxDist: 0,
     rejectedMaxDistUnpublished: 0,
     rejectedMaxDistIs: 'SIGMA_OVER_ENGINES_NOT_AC7_N' as const,
+    // TRA-5065 — the provider attribution.
+    servedPrimary: 0,
+    servedFallback: 0,
+    starvedFallbackBudget: 0,
+    fallbackUnavailable: 0,
+    servedUnpublished: 0,
   };
   let graded = 0;
   let neverSwept = 0;
@@ -2217,6 +2265,18 @@ export function summarizeSma200Sweeps(
       totals.rejectedMaxDist += stats.rejectedMaxDist;
     } else {
       totals.rejectedMaxDistUnpublished++;
+    }
+    // TRA-5065 — the provider attribution, same ABSENT ≠ ZERO discipline. The
+    // presence test is `servedFallback`, not `servedPrimary`: both ship in the
+    // same commit, and keying on the one whose non-zero IS the finding makes a
+    // partially-upgraded fleet impossible to misread as a served one.
+    if (typeof stats.servedFallback === 'number') {
+      totals.servedPrimary += stats.servedPrimary ?? 0;
+      totals.servedFallback += stats.servedFallback;
+      totals.starvedFallbackBudget += stats.starvedFallbackBudget ?? 0;
+      totals.fallbackUnavailable += stats.fallbackUnavailable ?? 0;
+    } else {
+      totals.servedUnpublished++;
     }
     // TRA-4922 (AC-c) — the DISTINCT universe. Same absent-key discipline: a
     // missing list is an unmeasured engine, never an engine that swept nothing.
@@ -5544,8 +5604,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // reads mostly `pending` on a calm/empty forward book — an honest not-yet, never
   // a silent pass. Read-only: routes no order. Live stays gated on TRA-382.
   app.get('/api/health/wheel-promotion-gate', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const ivFilterEnabled = isWheelIvEntryFilterEnabled(env);
     res.json({
       ok: true,
@@ -5636,8 +5695,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // and reset on the ~daily reboot (same contract as `/api/health/live-equity`); a
   // validation run reads them within a session. No balances/PII.
   app.get('/api/health/churn-brake', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const armed = isChurnLossBrakeEnabled(env);
     const cap = resolveSameSessionOpenCap(env);
     const build = resolveBuildInfo();
@@ -5693,8 +5751,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // DEMO-ONLY by construction: the engine records here only on the demo directional
   // chokepoint. No balances/PII — just flag, thresholds, symbol counts, reject codes.
   app.get('/api/health/directional-quality-gate', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const armed = isDirectionalQualityGateEnabled(env);
     const thresholds = resolveDirectionalQualityThresholds(env);
     const etDay = etDateString(new Date(now()));
@@ -5880,11 +5937,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // whenever the recorder is dark or stale, and `invalidations` serializes as `null`
   // rather than `0` while dark (TRA-1707: `0` is never "not measured").
   app.get('/api/health/giveback-arm-floor', (_req, res) => {
-    const dir = process.env.DATA_DIR;
     // The live book reads process.env; the demo book overlays demo-flags.json — mirror
     // the engine's `bookMarkEnv` resolution so `armed` reflects what each book sees.
     const liveEnv = process.env;
-    const demoEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const demoEnv = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const summary = summarizeGiveBackArmFloor({ now: now() });
     const rec = summary.recorder;
     // Darkness and staleness are BOTH failures of the instrument, not of the book: a
@@ -6327,7 +6383,20 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // state instead of logs. `armed:false` with the env unset is the shipped
       // default; `stateUnreadable:true` means every consult is refusing
       // (fail closed) and an operator must inspect the commit file.
-      oneShotCostBarGrant: getLiveOtmOneShotGrantState(liveEnv, nowMs),
+      // TRA-5020 — `counterProvenance` says WHICH of these fields survive a
+      // restart, computed BY THE ROUTE so no reader has to diff two values by
+      // eye. `consults`/`grants`/`commits`/`refusalsByReason` are SINCE-BOOT
+      // (module-level tallies); `committed`/`stateUnreadable` are DURABLE. The
+      // block published both side by side with nothing distinguishing them, and
+      // bqb1 reboots ~6x/day — so a post-reboot `commits: 0` is evidence about
+      // NOTHING while reading byte-identically to "the grant was never spent".
+      // Read `counterProvenance.verdict` and `commitsDurable`, never `commits`,
+      // for any cross-boot claim. The boot stamp is handed in because the module
+      // cannot know it; without it the tallies' start instant renders UNKNOWN
+      // rather than being back-filled from the read time.
+      oneShotCostBarGrant: getLiveOtmOneShotGrantState(liveEnv, nowMs, {
+        processStartedAt: resolveBuildInfo().startedAt,
+      }),
       n: summary.n,
       opens: summary.opens,
       closes: summary.closes,
@@ -7294,8 +7363,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   });
 
   app.get('/api/health/cost-aware-gate', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const armed = isOptionCostAwareGateEnabled(env);
     const config = resolveCostGateConfig(env);
     const structures = ['single_leg_rv', 'single_leg_otm', 'directional'];
@@ -8211,6 +8279,21 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           processStartedAt: liveEnforceBuild.startedAt,
         }),
       },
+      /**
+       * TRA-5038 AC3 — the shared periodic compaction hook, as this tape sees it.
+       *
+       * Published explicitly because this route hand-picks fields off `summary`
+       * rather than spreading it: a field added to `LiveEnforceSummary` alone would
+       * typecheck, test green, and never reach the wire.
+       *
+       * ⚠ READ `hookState`, NOT `timerPasses`. bqb1's uptime is routinely under one
+       * 6h interval, so 0 passes is the ordinary HEALTHY reading; `timer_not_armed`
+       * is the alarm, and it is the state in which every other field on this route
+       * still reads healthy. `span.fill` is the TRA-5038 AC1 answer — when it reads
+       * `still_filling`, this tape's bytes divided by `retained.retentionDays`
+       * UNDERSTATE its write rate.
+       */
+      sharedCompaction: summary.sharedCompaction,
       // TRA-3216 — the universe restriction is a live rejection path that is ON by
       // DEFAULT, so it has to enter this sentence. Before this ticket the
       // `!anyArmed` branch asserted the live path was "byte-for-byte ... no
@@ -8579,8 +8662,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   //
   // Observe-only: reading this never routes an order or moves a bar.
   app.get('/api/health/option-spread-cost', async (req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const config = resolveCostGateConfig(env);
 
     // TRA-2316 — optional `?sinceTs=` (epoch ms) cohort filter on the ENTRY
@@ -8866,8 +8948,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // the DATA_DIR demo-flags.json overlay, file wins), so a reader can tell whether
     // a `session_edge_blackout` bucket of 0 is "armed but no entries hit an edge" vs
     // "disarmed, could never increment". DARK by default; tightening-only.
-    const sebDir = process.env.DATA_DIR;
-    const sebEnv = sebDir ? resolveDemoFlagEnv(sebDir) : process.env;
+    const sebEnv = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const sebArmed = isSessionEdgeBlackoutEnabled(sebEnv);
     const sebMinutes = resolveSessionEdgeBlackoutMinutes(sebEnv);
     res.json({
@@ -8991,8 +9072,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // the demo-flags.json overlay, and the live flag alone arms the exit-risk
   // input: signal-engine `optionExitRisk = master || takeProfitEarlyArmed`).
   app.get('/api/health/take-profit-early', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const enabled = isTakeProfitEarlyEnabled(env);
     const liveEnabled = isTakeProfitEarlyLiveEnabled(process.env);
     res.json({
@@ -9033,8 +9113,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // missing signal, stated out loud. It also makes TRA-1293's own forward-sample of
   // gate 2's rejection rate — the stated pre-live-promotion bar — takeable at last.
   app.get('/api/health/entry-greeks-gate', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const enabled = isEntryGreeksGateEnabled(env);
     const etDay = etDateString(new Date(now()));
     const counts = summarizeEntryGreeksGate(etDay);
@@ -9166,17 +9245,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const rvRetuneLive = isRvExitRetuneLiveEnabled(process.env);
     const tpEarlyLive = isTakeProfitEarlyLiveEnabled(process.env);
     const swingTimeStopTradingDays = resolveSwingTimeStopTradingDays(process.env);
-    // The demo book's env view — the same `dir ? resolveDemoFlagEnv(dir) :
-    // process.env` the engine's private `resolveDemoFlagEnv()` returns.
-    // TRA-4606 — `dir`, not `dataDir`. The TRA-4440 exemption in
-    // scripts/check-data-dir.mjs covers exactly the `dir` report-read idiom at
-    // count 11, and the rename to `dataDir` both dropped that count to 10
-    // (STALE_EXEMPTION) and presented as an eleventh, UNEXEMPTED copy (NEW_COPY).
-    // Same read, same blank-value behaviour; only the identifier moved.
-    // ⛔ Do not spell the exempted line out in prose here — the scanner matches on
-    // text, so quoting it verbatim in a comment counts as another copy.
-    const dir = process.env.DATA_DIR;
-    const demoEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
+    // The demo book's env view — the same resolution the engine's private
+    // `resolveDemoFlagEnv()` returns (TRA-5037: both now go through
+    // `resolveDemoFlagEnvFromEnv()`, which trims, so a blank-but-present
+    // DATA_DIR behaves as unset instead of resolving a dir literally named " ").
+    const demoEnv = resolveDemoFlagEnvFromEnv();
+    // TRA-5061 — hoisted so the ATR-series selection is resolved EXACTLY ONCE
+    // for this response. The shadow census publishes `decidedBy` and the spread
+    // below publishes `atrTimeframe`; resolving the flag twice is precisely how
+    // two fields on one route come to disagree, and here they would disagree
+    // about which trail is load-bearing.
+    const chandelierTrailParams = resolveChandelierTrailParams(process.env);
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
@@ -9241,7 +9320,63 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           exitRiskMaster: isExitRiskRulesEnabled(demoEnv),
         },
       },
-      note: 'Hard exits (premium stop, trail, give-back cap, session stop, take-profit) are unaffected by all of the above and keep firing through the swing hold.',
+      // TRA-4991 (AC2 + AC3, parent TRA-4945) — the UNDERLYING-space ATR
+      // chandelier's parameterisation and its high-beta branch census.
+      //
+      // WHY IT LANDS ON THIS ROUTE. This is already the exit-parameterisation
+      // readout, and before this it published FLAGS ONLY — no levels, no ATR.
+      // `/api/health/otm-sleeve-mandate` carries no exit-rule key at all. So the
+      // trail's width, the series it is measured on, and whether the whole family
+      // is retired on the OTM sleeve existed nowhere a reader could reach, and
+      // TRA-4945 had to answer "what fired this chandelier exit" with `git show`
+      // against the deployed commit. A levels-free exit-parameterisation route is
+      // the gap, not a property worth preserving.
+      //
+      // ⚠️ `ratchets` is a SINCE-BOOT process counter and is NOT persisted. It is
+      // split by book because live and demo ratchet in one process. AC3's question
+      // — is the high-beta multiplier (3.5) reachable when its 0.05 threshold is a
+      // daily-scale number applied to a 5m-scale `atrPct`? — is answered by
+      // `highBeta` vs `base` vs `baseAtrPctAbsent` and `maxAtrPct`, never by a
+      // flag: a flag reads identically whether the branch is live or dead.
+      //
+      // ⛔ Read `baseAtrPctAbsent` BEFORE reading `highBeta: 0`. On ratchets with
+      // no `atrPct` served the branch was UNREACHABLE, not declined, and a zero
+      // over that denominator is not a reading about volatility.
+      //
+      // ⛔ And read `exitRiskMaster` BEFORE reading `ratchets.*: 0`. The ratchet
+      // only runs while `exitRisk` is attached, i.e. while the master flag is on,
+      // so a zero under a dark master is a STRUCTURAL zero — the trail was never
+      // evaluated — and not a measurement about the book. Published here beside
+      // the counts rather than left to be joined from `profitFloorTrail` below.
+      chandelier: {
+        ...chandelierTrailParams,
+        requiresMaster: EXIT_RISK_RULES_FLAG,
+        exitRiskMaster: {
+          live: isExitRiskRulesEnabled(process.env),
+          demo: isExitRiskRulesEnabled(demoEnv),
+        },
+        ratchets: summarizeChandelierRatchets(),
+        // TRA-5061 — the SIDE-BY-SIDE counterfactual: both the 5m and the daily
+        // trail resolved on every ratchet, only the selected one deciding.
+        //
+        // ⛔ This is the block the ARM decision reads, and `ratchets` above is
+        // not a substitute for it: while the flag is `shadow_5m` the producer
+        // refuses nothing, so `ratchets.skipped.no_daily_atr` is a STRUCTURAL 0
+        // and carries no information about whether the daily store would be warm
+        // enough to give the repair a level. `atrShadow.byBook.*.readings
+        // .dailyColdRate` is that same quantity measured as a counterfactual on
+        // the real rows, with nothing armed.
+        //
+        // ⛔ EVIDENCE CLASS `reachability_only`. It cannot produce cost-aware
+        // `crossedR` and must never be cited as the forward test — see
+        // `notEvidenceFor` on the payload, which is QuantTrader's written
+        // ratification (TRA-5061 AC5), not a caveat added here.
+        //
+        // The timeframe is resolved ONCE above and handed in, so `decidedBy`
+        // here and `atrTimeframe` on the spread cannot disagree.
+        atrShadow: summarizeChandelierAtrShadow(chandelierTrailParams.atrTimeframe.timeframe),
+      },
+      note: 'Hard exits (premium stop, trail, give-back cap, session stop, take-profit) are unaffected by all of the above and keep firing through the swing hold. TRA-4991: `chandelier` carries the ATR trail\'s resolved width, its ATR source timeframe and the since-boot high-beta ratchet census; per-close SPOT-space inputs are on the journal row (`/api/health/option-journal?rows=all` -> `chandelier`).',
     });
   });
 
@@ -9258,8 +9393,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // structurally incapable of touching live capital (the live branch stays
   // hard-gated by the empty TRA-817 manifest regardless of this flag).
   app.get('/api/health/sma200-forward-test', (_req, res) => {
-    const dir = process.env.DATA_DIR;
-    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const enabled = isSma200DemoForwardTestEnabled(env);
     // TRA-1289 — fill evidence for the TRA-1242 accrual monitor. Without a
     // countable signal, "armed, no swing yet" is indistinguishable from "a fill
@@ -9729,9 +9863,8 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // `<bundle>/data/demo-flags.json` when `DATA_DIR` is unset, which the engine
     // never does — re-opening the route-vs-recorder disagreement above, inverted.
     //
-    // ⚠️ The 11 sibling reads in this file still carry the naked idiom, so do NOT
-    // "match the neighbours" here — they are the backlog, not the pattern. TRA-5037
-    // carries them, the recorder included, with the per-site classification.
+    // TRA-5037 converted the 11 sibling reads in this file (and the recorder) to
+    // the same helper, so the neighbours now ARE the pattern.
     const flagEnv = resolveDemoFlagEnvFromEnv();
     const enabled = isOptionRealFillShadowEnabled(flagEnv);
 
@@ -10116,8 +10249,35 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           ? 'armed_but_never_ran'
           : 'scanning';
 
+    // TRA-5087 — the in-RTH staleness discriminator. `scanning` + `enabled: true`
+    // read IDENTICALLY at 20.7h stale on a Saturday (healthy — the exchange was
+    // shut) and at 20.7h stale mid-session on a weekday (dark-in-RTH on the
+    // money host), and the Saturday reading got filed as an RTH outage because
+    // the route left the calendar question to the reader. `scanning` only ever
+    // asserted "the loop has turned since boot", which on a multi-day process
+    // says nothing about TODAY. The grade is calendar-aware (weekends, NYSE
+    // closures, early closes, DST) and fail-closed; thresholds and the full
+    // state table live in rv-scan-rth-staleness.ts.
+    const rthStaleness = gradeRvScanRthStaleness({
+      nowMs: now(),
+      lastScanAtMs: lastScanAt,
+      armed: armed.length > 0,
+      bootedAtMs: deps.bootedAtMs,
+    });
+    // `stale_in_rth` outranks `scanning` on the roll-up: a loop that turned
+    // YESTERDAY must not wear the same word mid-session today. The more
+    // specific `disarmed` / `armed_but_never_ran` keep their names —
+    // `rthStaleness` carries the red beside them either way.
+    const verdictOut =
+      verdict === 'scanning' && rthStaleness.state === 'stale_in_rth'
+        ? 'stale_in_rth'
+        : verdict;
+
     res.json({
-      ok: true,
+      // TRA-5087 — `ok` is the staleness grade, not a pulse. False when scans
+      // are stale INSIDE regular hours on a session day (or the calendar cannot
+      // say), true overnight/weekend/holiday no matter how old `lastScanAt` is.
+      ok: rthStaleness.ok,
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       // Top-level `enabled` = is ANY instrumented single-leg entry path armed.
@@ -10125,9 +10285,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // actually reach the pass (TRA-3080). The two disagree whenever a book is in a
       // mode whose arm flag is off, which is the desk's state since 2026-07-30.
       enabled: armed.length > 0,
-      verdict,
+      verdict: verdictOut,
       lastScanAt,
       scanCountSinceBoot: watched.reduce((n, p) => n + (p.scanCountSinceBoot ?? 0), 0),
+      // TRA-5087 — the dark-in-RTH vs quiet-overnight discriminator. Read
+      // `state` + `reason`; `ok` above is wired to it.
+      rthStaleness,
       // TRA-2245 — per-path structure labels. `single_leg_rv` is now reserved for the
       // (compile-time-OFF) rv_scan path; the directional producers journal
       // `single_leg_directional`. Each path in `paths[]` also carries its own
@@ -10260,7 +10423,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         + 'passes; `rejectionsByGate[g] - blindRejectionsByGate[g]` is the ledger of the '
         + 'passes that actually ruled. Both maps are empty on lines written before '
         + '2026-09-10 (NOT MEASURED): if `sum(blindScansByGate) < blindScans` a contributing '
-        + 'boot predates them and the subtraction is incomplete.',
+        + 'boot predates them and the subtraction is incomplete. '
+        // TRA-5087 — the census absence that got filed as an outage: no 2026-10-03
+        // row at "12:39 ET mid-RTH" was cited as evidence the scanner was dark,
+        // but 10-03 was a SATURDAY. The note has to carry the calendar or the
+        // next reader repeats it.
+        + 'TRA-5087: an absent ET DAY (not just an absent cell) on a NON-SESSION date — a '
+        + 'weekend or NYSE closure, e.g. 2026-09-26/27 and 2026-10-03 (Saturdays) — is the '
+        + 'exchange calendar, not an outage. `rthStaleness` above is the in-RTH '
+        + 'discriminator: it reads `stale_in_rth` when scans stop INSIDE regular hours on a '
+        + 'session day and stays green over weekends/holidays/overnight.',
       censusRetentionDays: 30,
     });
   });

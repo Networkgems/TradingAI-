@@ -5,8 +5,14 @@
  * `atr(candles, 14)` (packages/engine/src/indicators/atr.ts) seeds on the first
  * 14 true ranges and then Wilder-smooths to the END of the series. It does NOT
  * slice to the period. So the same symbol on the same day yields a different
- * ATR from a 40-bar series (`OTM_DAILY_ATR_BARS`, cold path) than from a 260-bar
- * one (`MTF_DAILY_BARS`, warm path — the normal path on the live box).
+ * ATR from a 40-bar series than from a 260-bar one.
+ *
+ * ⚠️ HISTORICAL: 40 was `OTM_DAILY_ATR_BARS`, the OTM entry ATR's COLD-path pull,
+ * against 260 (`MTF_DAILY_BARS`) on the warm path. TRA-4989 implemented the
+ * TRA-4943 ruling and **deleted that constant** — both paths now pull 260. So
+ * `SHALLOW = 40` below is no longer any depth the engine requests; it is the
+ * defect's depth, kept so this script stays the before/after for the ruling and
+ * a re-runnable convergence probe. Do not read it as current behaviour.
  *
  * This script quantifies the gap, and the gap in the exit level it stamps:
  *   otmAtrInvalidationLevel = underlyingEntryPrice ∓ atrMult × ATR   (atrMult = 1)

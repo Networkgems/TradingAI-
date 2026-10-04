@@ -77,12 +77,22 @@ async function main() {
       if (entry.name === 'users' && entry.kind === 'dir') {
         // Look for patterns that indicate closes/ or tape/ files
         for (const pattern of entry.byFile) {
-          if (pattern.pattern.includes('closes') || pattern.pattern.includes('tape')) {
+          const isCloses = pattern.pattern.includes('closes');
+          const isTape = pattern.pattern.includes('tape');
+          if (isCloses || isTape) {
             console.log(`  ${pattern.pattern}: ${pattern.files} files, ${(pattern.bytes / (1024 ** 2)).toFixed(2)} MiB`);
           }
+          // A pattern can name both families; count it once per family it belongs to so
+          // the two subtotals stay independently readable rather than silently merged.
+          if (isCloses) closesTotal += pattern.bytes;
+          if (isTape) tapeTotal += pattern.bytes;
         }
       }
     }
+    // The subtotals this section exists to report. Printing only the per-pattern rows left
+    // the reader to add them up by hand against a 64 MiB budget.
+    console.log(`  closes/ subtotal: ${(closesTotal / (1024 ** 2)).toFixed(2)} MiB`);
+    console.log(`  tape/   subtotal: ${(tapeTotal / (1024 ** 2)).toFixed(2)} MiB`);
 
     // Unaccounted space
     if (storage.usage.unaccounted) {
@@ -96,7 +106,6 @@ async function main() {
   console.log('\n=== HEADROOM ANALYSIS ===');
   const freeGiB = storage.disk.freeBytes / (1024 ** 3);
   const current64MiB = 64;
-  const currentBytes = current64MiB * 1024 * 1024;
 
   console.log(`Current ledger budget: ${current64MiB} MiB`);
   console.log(`Free space available: ${freeGiB.toFixed(2)} GiB (${(freeGiB * 1024).toFixed(0)} MiB)`);

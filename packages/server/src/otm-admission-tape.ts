@@ -141,6 +141,13 @@ import { dirname, join } from 'path';
 import { createInterface } from 'readline';
 import type { OtmAdmissionDecision, OtmAdmissionRefusalReason } from '@trading-app/engine';
 import { logger } from './observability/index.js';
+import {
+  bufferSharedTapeAppend,
+  sharedTapeCompactionState,
+  sharedTapeRewriteInFlight,
+  type SharedTapeCompactionState,
+  type SharedTapeSpec,
+} from './shared-tape-compaction.js';
 import { etDateString } from './scheduler.js';
 import { etClockParts } from './et-clock.js';
 import {
@@ -151,6 +158,9 @@ import {
 const log = logger.child({ module: 'otm-admission-tape' });
 
 export const OTM_ADMISSION_TAPE_FILENAME = 'otm-admission-tape.jsonl';
+
+/** Registry key for the shared compaction hook (TRA-5038). */
+export const OTM_ADMISSION_TAPE = 'otm-admission-tape';
 
 /**
  * Rows written by this build carry this; v1 rows (no field) are open-biased.
@@ -827,6 +837,26 @@ function applyRow(row: OtmAdmissionTapeRow): void {
 
 function appendLines(lines: string[]): void {
   if (dataDir == null || lines.length === 0) return;
+  // TRA-5038 — the shared periodic compaction rewrites this file mid-session. A chunk
+  // written between that rewrite's read and its rename would be erased by the rename,
+  // and an erased row reads identically to a row never written (TRA-1681). Buffer
+  // instead; the flush comes back through the raw append below, so `appendErrors` and
+  // `fileBytes` stay correct.
+  const chunk = lines.join('\n') + '\n';
+  if (sharedTapeRewriteInFlight(OTM_ADMISSION_TAPE)) {
+    if (bufferSharedTapeAppend(OTM_ADMISSION_TAPE, chunk)) return;
+  }
+  appendOtmAdmissionTapeRawChunk(chunk);
+}
+
+/**
+ * Append one already-serialized chunk. Split out so the shared compaction hook's
+ * buffer flush goes through THIS path, keeping both `appendErrors` and the `fileBytes`
+ * counter authoritative — a flush that bypassed it would make a failed flush invisible
+ * and leave `fileBytes` short by the flushed bytes.
+ */
+function appendOtmAdmissionTapeRawChunk(chunk: string): void {
+  if (dataDir == null) return;
   const path = otmAdmissionTapePath(dataDir);
   try {
     mkdirSync(dirname(path), { recursive: true });
@@ -834,7 +864,6 @@ function appendLines(lines: string[]): void {
     // exists / unwritable — the append below surfaces the error
   }
   try {
-    const chunk = lines.join('\n') + '\n';
     appendFileSync(path, chunk, 'utf8');
     fileBytes += chunk.length;
   } catch (err) {
@@ -842,6 +871,40 @@ function appendLines(lines: string[]): void {
     lastAppendError = err instanceof Error ? err.message : String(err);
     log.warn('otm-admission-tape append failed', { reason: lastAppendError });
   }
+}
+
+/**
+ * TRA-5038 — what this tape contributes to the ONE shared compaction hook.
+ *
+ * ⚠ The predicate is `bytes_whole_day`, NOT `age` and NOT plain `bytes`. This tape's
+ * binding bound is a 144 MiB BYTE CEILING (its 60-day `RETAIN_MS` never gets reached),
+ * and the prune must land on an ET-DAY boundary: consumers divide by SESSIONS, so a
+ * partial day biases its own within-day sample toward the afternoon, and a biased day
+ * is worse than an absent one. {@link hydrateOtmAdmissionTapeFromDisk} has always
+ * pruned whole days for that reason; the periodic pass matches it.
+ *
+ * The periodic pass deliberately does NOT reuse the hydrate's prune: that one
+ * `JSON.parse`s every line and rebuilds the in-memory fold, which is affordable once
+ * at boot and is exactly what TRA-5038 AC4 forbids four times a day on the money box
+ * (~189k rows here, straight into the TRA-2111 yield-preempt tripwire).
+ */
+export function otmAdmissionTapeSharedTapeSpec(): SharedTapeSpec {
+  return {
+    tape: OTM_ADMISSION_TAPE,
+    resolvePath: () => (dataDir == null ? null : otmAdmissionTapePath(dataDir)),
+    predicate: () => ({ kind: 'bytes_whole_day', maxBytes: MAX_FILE_BYTES }),
+    flushLine: appendOtmAdmissionTapeRawChunk,
+    // The rewrite reclaims bytes this module counted on the way in; without this the
+    // counter would overstate the file by exactly what was just reclaimed.
+    onRewrite: (bytesAfter) => {
+      fileBytes = bytesAfter;
+    },
+    note:
+      'The largest single reservation in /data (144 MiB hard byte cap, 56.1 MiB observed '
+      + '2026-10-02) and the reason TRA-4899 was filed. Boot-only enforcement meant the '
+      + 'file also carried up to one boot gap ABOVE the cap; the shared timer bounds that '
+      + 'to one interval. Bound is BYTES, pruned by WHOLE ET DAYS.',
+  };
 }
 
 export interface OtmAdmissionPassContext {
@@ -1278,9 +1341,23 @@ export interface OtmAdmissionTapeSummary {
     lastAppendError: string | null;
     hydratedDays: number;
     hydratedRecords: number;
-    /** Approximate file size — pruning whole oldest days starts at `policy.maxFileBytes`. */
+    /**
+     * Approximate file size — pruning whole oldest days starts at `policy.maxFileBytes`.
+     * Counted on the way in and re-based off `stat` after a shared-hook rewrite
+     * (TRA-5038), so it no longer overstates the file by whatever a compaction
+     * reclaimed.
+     */
     fileBytes: number;
   };
+  /**
+   * TRA-5038 AC3 — the shared compaction hook as this tape sees it.
+   *
+   * ⚠ READ `sharedCompaction.hookState`, NOT `timerPasses`. `timer_not_armed` is the
+   * alarm, and it is the state in which every other field in this payload still reads
+   * healthy. This tape's predicate is `bytes_whole_day`: its bound is the 144 MiB
+   * ceiling, not its 60-day retention, so its span carries no `cutoff`.
+   */
+  sharedCompaction: SharedTapeCompactionState;
 }
 
 function slotLabel(slot: number): string {
@@ -1392,6 +1469,12 @@ export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
       hydratedRecords,
       fileBytes,
     },
+    // TRA-5038 AC3 — compaction outcome + an ARM-DERIVED `hookState`. Read `hookState`,
+    // not `timerPasses`: `timer_not_armed` is the alarm and every other field here
+    // still reads healthy in that state. `span.fill` reports whether the 144 MiB
+    // ceiling is binding yet — for this tape that is a CAP question, not a retention
+    // one, so there is no `cutoff` on its span.
+    sharedCompaction: sharedTapeCompactionState(OTM_ADMISSION_TAPE),
   };
 }
 

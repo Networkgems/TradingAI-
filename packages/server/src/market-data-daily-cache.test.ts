@@ -72,8 +72,11 @@ describe('TRA-4158 shared daily market-data store', () => {
     expect(setDailyBars('AAA', deep)).toBe(true);
     expect(dailyBarsDepth('AAA')).toBe(260);
 
-    // The cold `OTM_DAILY_ATR_BARS = 40` pull must not clobber the 260-bar series
-    // the technical-snapshot pass maintains.
+    // A strictly shallower series must not clobber the 260-bar one the
+    // technical-snapshot pass maintains. Until TRA-4989 the shallow writer was a
+    // second code path by design (the cold ATR pull, at its own constant 40);
+    // both writers now request 260, so the surviving source of a short series is
+    // a THIN PROVIDER RESPONSE — which is why this rule is still load-bearing.
     expect(setDailyBars('AAA', series(40, 500))).toBe(false);
     expect(dailyBarsDepth('AAA')).toBe(260);
     expect(getDailyBars('AAA')).toBe(deep);

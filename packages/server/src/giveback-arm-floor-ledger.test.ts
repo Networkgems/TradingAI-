@@ -1,7 +1,10 @@
 // TRA-1892 (parent TRA-1592 → TRA-1435) — durable, recoverable give-back arm-floor
 // forward-test ledger.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, appendFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, appendFileSync, writeFileSync } from 'fs';
+// TRA-5037 — the fixture-is-live control for the blank-DATA_DIR test below must go
+// through the REAL resolveDemoFlagEnv, not a local mirror of it.
+import { resolveDemoFlagEnv } from './demo-flags.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -412,5 +415,51 @@ describe('giveback-arm-floor-ledger', () => {
       expect(getBookSessionPeak('demo', 'engine-4', DAY)).toBeCloseTo(183, 5);
       expect(getBookSessionPeak('live', 'engine-4', DAY)).toBeCloseTo(40, 5);
     });
+  });
+});
+
+// TRA-5037 — `resolveRecorderEnvs()` (the no-override path `summarizeGiveBackArmFloor`
+// takes in production) must treat a blank-but-present DATA_DIR as unset. A test that
+// only sets `DATA_DIR=' '` and asserts the safe outcome passes against the defect —
+// a MISSING overlay also falls back to process.env — so the fixture below plants
+// `<tmp>/" "/demo-flags.json` and proves it live through the real resolveDemoFlagEnv.
+describe('TRA-5037 blank DATA_DIR on resolveRecorderEnvs (the no-override demo env)', () => {
+  const FLAG = 'EXIT_RISK_RULES_ENABLED'; // the recorder's master gate; allowlisted
+  let tmp: string | null = null;
+  let cwd0: string | null = null;
+
+  beforeEach(() => {
+    clearGiveBackArmFloorLedger();
+    tmp = mkdtempSync(join(tmpdir(), 'tra5037-gb-'));
+    delete process.env[FLAG];
+    delete process.env.DATA_DIR;
+  });
+
+  afterEach(() => {
+    if (cwd0) process.chdir(cwd0);
+    cwd0 = null;
+    delete process.env[FLAG];
+    delete process.env.DATA_DIR;
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    tmp = null;
+  });
+
+  it('BLANK ⇒ treated as UNSET: the planted " " overlay is live, yet the demo book must not arm', () => {
+    cwd0 = process.cwd();
+    mkdirSync(join(tmp!, ' '), { recursive: true });
+    writeFileSync(join(tmp!, ' ', 'demo-flags.json'), JSON.stringify({ [FLAG]: '1' }), 'utf8');
+    process.chdir(tmp!);
+
+    // FIXTURE IS LIVE — negative control through the real resolveDemoFlagEnv.
+    expect(resolveDemoFlagEnv(' ', {} as NodeJS.ProcessEnv)[FLAG]).toBe('1');
+
+    process.env.DATA_DIR = ' ';
+    const s = summarizeGiveBackArmFloor({ now: 1_100 });
+    expect(s.recorder.armedByBook.demo).toBe(false);
+    expect(s.recorder.state).toBe('dark');
+
+    // Blank is UNSET, not "overlay off": process.env still arms both books.
+    process.env[FLAG] = '1';
+    expect(summarizeGiveBackArmFloor({ now: 1_100 }).recorder.armedByBook.demo).toBe(true);
   });
 });

@@ -5,6 +5,12 @@ import type { Candle } from '@trading-app/shared';
 import type { CandlePattern, ReversalChecklist } from '@trading-app/engine';
 import { logger } from './observability/index.js';
 import {
+  bufferSharedTapeAppend,
+  extractLineTs,
+  sharedTapeRewriteInFlight,
+  type SharedTapeSpec,
+} from './shared-tape-compaction.js';
+import {
   resolveOutcome,
   type ShadowOutcome,
   type ShadowResolution,
@@ -79,6 +85,9 @@ const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** Published on the health probes (AC4) so `/data` can be audited without grepping here. */
 export const REVERSAL_SHADOW_RETENTION_DAYS = RETAIN_MS / (24 * 60 * 60 * 1000);
+
+/** Registry key for the shared compaction hook (TRA-5038). */
+export const REVERSAL_SHADOW_TAPE = 'reversal-shadow-signals';
 
 /**
  * What the boot load actually did — the AC5 surface. A `RETAIN_MS` that ships without a
@@ -319,10 +328,72 @@ async function ensureLoaded(now: number = Date.now()): Promise<Map<string, Rever
 }
 
 async function appendLine(line: LedgerLine): Promise<void> {
+  const raw = `${JSON.stringify(line)}\n`;
+  // TRA-5038 — the shared periodic compaction rewrites this file mid-session, and this
+  // append is the one of the four that is ASYNC. The flag is raised synchronously
+  // before the rewrite's first `await`, and this check is synchronous too (it runs
+  // before any `await` in this function), so the check cannot observe a stale `false`
+  // and then land inside the rewrite window. A row lost that way reads identically to
+  // a row never written (TRA-1681).
+  if (sharedTapeRewriteInFlight(REVERSAL_SHADOW_TAPE)) {
+    if (bufferSharedTapeAppend(REVERSAL_SHADOW_TAPE, raw)) return;
+  }
+  await appendRawLine(raw);
+}
+
+/** Append one already-serialized line. The shared hook's buffer flush comes through here. */
+async function appendRawLine(raw: string): Promise<void> {
   const path = storeFile();
   const dir = dirname(path);
   if (!existsSync(dir)) await mkdir(dir, { recursive: true });
-  await appendFile(path, `${JSON.stringify(line)}\n`, 'utf-8');
+  await appendFile(path, raw, 'utf-8');
+}
+
+/**
+ * TRA-5038 — what this tape contributes to the ONE shared compaction hook.
+ *
+ * `flushLine` is the only sync/async seam in the four: the shared hook's flush is
+ * synchronous by contract, so the write is STARTED here and its failure logged rather
+ * than awaited. That is the same best-effort posture the rest of this module's appends
+ * already have (every caller treats a shadow-row write as non-blocking), and a failure
+ * is logged rather than swallowed.
+ */
+export function reversalShadowSharedTapeSpec(): SharedTapeSpec {
+  return {
+    tape: REVERSAL_SHADOW_TAPE,
+    resolvePath: () => storeFile(),
+    predicate: () => ({ kind: 'age', retainMs: RETAIN_MS }),
+    flushLine: (raw) => {
+      void appendRawLine(raw).catch((err: unknown) => {
+        log.warn('reversal shadow buffered append flush failed', {
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      });
+    },
+    note:
+      'One line per captured reversal setup (plus its forward outcome) — 44.3 MiB on '
+      + '2026-10-02, and the only one of the four that SHRANK over the week (-6.2), which '
+      + 'is itself evidence its 30-day cutoff is already binding.',
+    // This tape is a two-kind union and a `resolve` line carries NO `ts` — by design
+    // (ageing the kinds independently would orphan resolutions from their opens; see
+    // ensureLoaded). The shared walk's default reader therefore stops dead on the
+    // first resolve line it meets, which the first live timer fire proved
+    // (2026-10-03T23:42Z: 106 opens dropped, then wedged, span `unknown`). Dating a
+    // resolve by `resolvedAt` is safe IN A PREFIX WALK: a resolve can only follow its
+    // own open, so any resolve the walk reaches is an orphan whose open was already
+    // dropped, and `resolvedAt > rec.ts` always — the substitution can only retain
+    // longer, never drop a row whose open survived. `resolvedAt` is the LAST key on a
+    // resolve line (~120–150 bytes in), hence the widened head.
+    tsHeadBytes: 256,
+    lineTs: (head) => {
+      const ts = extractLineTs(head);
+      if (ts !== null) return ts;
+      const m = /"resolvedAt":\s*(-?\d+(?:\.\d+)?)/.exec(head);
+      if (m === null) return null;
+      const at = Number(m[1]);
+      return Number.isFinite(at) ? at : null;
+    },
+  };
 }
 
 /**

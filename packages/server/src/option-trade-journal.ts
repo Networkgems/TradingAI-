@@ -2,7 +2,7 @@ import { readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { deriveEntrySpreadPct } from '@trading-app/shared';
-import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp, OptionExitQuote, OptionMarkProvenance, OptionPeakStampBasis, OptionProfitLockFire, OptionTakeProfitEarlyFire } from '@trading-app/shared';
+import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp, OptionExitQuote, OptionMarkProvenance, OptionPeakStampBasis, OptionProfitLockFire, OptionTakeProfitEarlyFire, OptionChandelierFire } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
 import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-throttle-sizing.js';
@@ -763,6 +763,27 @@ export interface OptionTradeJournalClose {
    */
   takeProfitEarlyFire?: OptionTakeProfitEarlyFire;
   /**
+   * TRA-4991 (AC1, parent TRA-4945) — the UNDERLYING-space ATR chandelier's
+   * trigger inputs at the firing tick: `peakUnderlying`, `chandelierStop`,
+   * `underlyingEntryPrice`, `spotAtFire`, the `atr` consumed and the
+   * `atrPeriod` / `atrTimeframeMs` that produced it.
+   *
+   * Every other column on a chandelier close is in PREMIUM space, and the
+   * chandelier decides in SPOT space. That mismatch is why TRA-4945 could only
+   * name the trigger on a 197-second zero-excursion close by reading source
+   * bytes against the deployed commit, and why a reader of that row
+   * (`peakPremium == entryBasisPremium`, `mae.frac == 0`) reasonably concluded
+   * "a trailing stop fired with no trail" — a misread that cost a weekly
+   * roll-up escalation.
+   *
+   * ⛔ ABSENT on every row the chandelier never armed, and the absence IS the
+   * verdict "not measured". It is never a zeroed object: a `0` ATR reads as "no
+   * volatility" and licenses the opposite conclusion. ⛔ Never backfilled — the
+   * spot-space state of a closed row is not recoverable from the archived row,
+   * and a reconstructed trail is a fabricated column.
+   */
+  chandelier?: OptionChandelierFire;
+  /**
    * TRA-4246 (AC1) — THE ROW'S OWN STOP-BASIS R, and the divisor it was
    * computed with, captured at the close write.
    *
@@ -1013,6 +1034,16 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
    * Read-only shadow: no order path is involved in producing it.
    */
   takeProfitEarlyShadow?: OptionTradeJournalTakeProfitEarlyShadow;
+  /**
+   * TRA-4991 (AC1) — the chandelier's SPOT-space trigger inputs, folded from the
+   * CLOSE row and served on `?rows=all`. Absent on every row the chandelier
+   * never armed, and — same absence semantics as `profitLockFire` — a
+   * chandelier-family row with NO stamp on a post-stamp build is a RELABEL (a
+   * supersede that rewrote `exitReason`, or a close path that never ran the
+   * trail), not a fire we forgot to record. Read the absence; ⛔ do not fill it.
+   * See {@link OptionTradeJournalClose.chandelier}.
+   */
+  chandelier?: OptionChandelierFire;
   /**
    * TRA-4246 (AC1) — the row's own stop-basis R, its null-reason and its
    * divisor, folded from the CLOSE row. Forward-only; ⛔ never backfilled.
@@ -3019,6 +3050,12 @@ function foldLine(
             profitLock: { ...line.close.takeProfitEarlyFire.profitLock },
           },
         }
+      : {}),
+    // TRA-4991 (AC1) — the chandelier's spot-space trigger inputs; absent stays
+    // absent (the absence is the verdict "never armed"), and ⛔ never zeroed.
+    // Copied for the same aliasing reason as `markProvenance` above.
+    ...(line.close.chandelier !== undefined
+      ? { chandelier: { ...line.close.chandelier } }
       : {}),
     // TRA-4246 (AC1) — the row's own stop-basis R and the divisor it used.
     // `pnlRStopBasis` is folded when the KEY is present, `null` included: a

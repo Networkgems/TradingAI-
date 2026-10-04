@@ -16,6 +16,7 @@ import {
   reversalHitRateByScore,
   isReversalShadowEnabled,
   reversalShadowCompaction,
+  reversalShadowSharedTapeSpec,
   REVERSAL_SHADOW_RETENTION_DAYS,
   type ReversalShadowOpen,
   type ReversalShadowRecord,
@@ -358,4 +359,36 @@ describe('reversal-shadow-ledger — retention + boot compaction (TRA-4883)', ()
       expect(c.ranAt).toBe(new Date(NOW).toISOString());
     });
   }
+});
+
+describe('reversal-shadow-ledger — shared-tape lineTs dates BOTH line kinds (TRA-5038)', () => {
+  // The first live timer fire (2026-10-03T23:42Z) wedged on this tape: a `resolve`
+  // line carries no `ts`, so the shared walk's default reader stopped on the first
+  // one and the timer predicate went inert until the next boot hydrate. The spec's
+  // own `lineTs` must date an open by `rec.ts` and a resolve by `resolvedAt`, within
+  // the spec's own `tsHeadBytes` window, on lines serialized EXACTLY as the ledger
+  // writes them.
+  it('dates open lines by rec.ts and resolve lines by resolvedAt', () => {
+    const spec = reversalShadowSharedTapeSpec();
+    expect(spec.lineTs).toBeDefined();
+    expect(spec.tsHeadBytes).toBeDefined();
+    const head = (line: string): string => line.slice(0, spec.tsHeadBytes as number);
+
+    const open = JSON.stringify({ kind: 'open', rec: openRec({ ts: DAY + 5 * MIN }) });
+    expect((spec.lineTs as (h: string) => number | null)(head(open))).toBe(DAY + 5 * MIN);
+
+    const resolve = JSON.stringify({
+      kind: 'resolve',
+      id: 'AAPL:long:1',
+      res: { outcome: 'SL_HIT', realizedR: -1, barsToResolution: 57 },
+      resolvedAt: DAY + 90 * MIN,
+    });
+    // No "ts" key anywhere on a resolve line — the defect precondition.
+    expect(resolve.includes('"ts"')).toBe(false);
+    expect((spec.lineTs as (h: string) => number | null)(head(resolve))).toBe(DAY + 90 * MIN);
+    // And resolvedAt actually sits beyond the DEFAULT 96-byte head, which is why the
+    // spec widens it — if this stops holding, the widened head is merely unnecessary.
+    expect(resolve.indexOf('"resolvedAt"')).toBeGreaterThan(96);
+    expect(resolve.length).toBeLessThanOrEqual(spec.tsHeadBytes as number);
+  });
 });

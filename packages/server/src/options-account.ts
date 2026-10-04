@@ -7,6 +7,7 @@ import type {
   TradeSignal,
   OptionLeg,
   OptionPosition,
+  OptionBasisWriter,
   OptionPendingExit,
   OptionsAccountState,
   OtmMispricingSignal,
@@ -29,6 +30,31 @@ import type {
   OptionProfitFloorPdtHold,
   OptionMarkProvenance,
 } from '@trading-app/shared';
+import {
+  EXIT_CHANDELIER_ATR_MULT,
+  EXIT_CHANDELIER_ATR_MULT_HIGHBETA,
+  EXIT_CHANDELIER_HIGHBETA_ATRPCT,
+} from '@trading-app/shared';
+import { chandelierMultiplier } from '@trading-app/engine';
+// TRA-4991 — the chandelier trail's publishable inputs + the AC3 ratchet census.
+// ⛔ Observe-only: nothing imported here is read by a level, a decision or an
+// order path.
+import {
+  CHANDELIER_ATR_PERIOD,
+  noteChandelierRatchet,
+  noteChandelierRowSkipped,
+  type OptionChandelierAtrSource,
+  type ChandelierAtrInertReason,
+} from './option-chandelier-trail.js';
+// TRA-5061 — the side-by-side ATR shadow's census. Noted at the SAME five sites
+// as the TRA-4991 census above, deliberately rather than forwarded from inside
+// it (that would close an ESM cycle); the suite asserts the two `rowsSeen`
+// agree, which is what catches a future sixth site.
+import {
+  noteChandelierAtrShadow,
+  noteChandelierAtrShadowSkip,
+  type ChandelierAtrShadowPair,
+} from './tra5061-chandelier-atr-shadow.js';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
 import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
@@ -589,10 +615,63 @@ const COMBO_BS_RISK_FREE_RATE = 0.045;
  * wait-and-hold, wiring the rules here covers demo AND live automatically.
  */
 export interface OptionExitRiskInput {
-  /** ATR(14) of the UNDERLYING on 5m bars, keyed by underlying symbol. */
+  /**
+   * ATR(14) of the UNDERLYING, keyed by underlying symbol.
+   *
+   * ⚠ TRA-4992 — the SERIES is the producer's choice, not 5m by definition any
+   * more: `CHANDELIER_ATR_TIMEFRAME` selects the 5m shadow-candle cache
+   * (default) or the position-timeframe daily store. Read
+   * {@link underlyingAtrSourceBySymbol} for what a given entry was measured on;
+   * do not assume a timeframe from this map's name.
+   */
   underlyingAtrBySymbol: Map<string, number>;
   /** Underlying ATR / price by symbol — picks the high-beta multiplier. Optional. */
   underlyingAtrPctBySymbol?: Map<string, number>;
+  /**
+   * TRA-4991 (AC1) — the PROVENANCE of the two maps above, per symbol: the
+   * period handed to `atr()`, the bar spacing MEASURED off the series it was
+   * computed on, and the bar count. Folded onto the journal close row by a
+   * chandelier fire.
+   *
+   * ⚠ MEASURED, not declared. A constant published beside the fire can go stale
+   * the day somebody re-points the chandelier at a different series — which is
+   * exactly the repair TRA-4992 is filed to make — and a stale `5m` reading
+   * would be indistinguishable from a correct one. The producer measures the
+   * bars it actually used.
+   *
+   * Optional: a hand-built `OptionExitRiskInput` (tests) may omit it, in which
+   * case the fire publishes `atrPeriod` / `atrTimeframeMs` as the compiled
+   * default and `null` respectively rather than inventing a spacing.
+   */
+  underlyingAtrSourceBySymbol?: Map<string, OptionChandelierAtrSource>;
+  /**
+   * TRA-4992 (AC3) — underlyings the producer deliberately served NO chandelier
+   * ATR for, with the reason. Present ⇔ the producer refused at least one.
+   *
+   * ⛔ This is the FAIL-CLOSED path, not an error channel. The row's chandelier
+   * leg is inert (no level stamped, no fire) and stays that way; the only thing
+   * this map adds is the ability to say WHY on the census, so a cold daily store
+   * cannot read as `no_spot_or_atr` (a feed outage). There is no fallback to the
+   * 5m ATR by design — see {@link ChandelierAtrInertReason}.
+   */
+  underlyingAtrInertBySymbol?: Map<string, ChandelierAtrInertReason>;
+  /**
+   * TRA-5061 — the SIDE-BY-SIDE ATR shadow: for each underlying that produced a
+   * width, BOTH the 5m and the daily chandelier trail, resolved through one code
+   * path, with `decidedBy` naming the arm that actually set the level.
+   *
+   * ⛔ OBSERVE-ONLY. The ratchet reads `underlyingAtrBySymbol` exactly as
+   * before; this map is recorded by the census on the way past and is never
+   * consulted for a level, a fire or an order. Present ⇔ the producer attached
+   * it — a hand-built input (tests) omits it, which the census counts as
+   * `pairAbsent` rather than folding into its observation denominator.
+   *
+   * It exists because the arm decision for `CHANDELIER_ATR_TIMEFRAME` needs the
+   * counterfactual `no_daily_atr` rate and the 3.0/3.5 split on REAL rows before
+   * anything arms, and the flag itself earns no rows while the sleeve is dark.
+   * It answers MECHANISM REACHABILITY only, never P&L.
+   */
+  underlyingAtrShadowBySymbol?: Map<string, ChandelierAtrShadowPair>;
   /**
    * TRA-1294 — take-profit-early capture fraction (0.50–0.70). Present ⇔ the
    * caller armed the STANDALONE, DEMO-ONLY `TAKE_PROFIT_EARLY_ENABLED` flag
@@ -5443,13 +5522,21 @@ export type AdoptedBasisRestatementOutcome =
       riskUnmanagedReason: string | null;
     };
 
-function restateEngineOpenedBasis(opt: OptionPosition, brokerPremium: number): void {
+function restateEngineOpenedBasis(
+  opt: OptionPosition,
+  brokerPremium: number,
+  // TRA-5010 — three different LOGGED callers share this one mutation, so the
+  // writer cannot be recovered from the row afterwards unless it is passed in.
+  // Required rather than defaulted: a fourth caller must choose a tag.
+  writer: OptionBasisWriter,
+): void {
   const previous = opt.premiumPaid;
   if (!Number.isFinite(previous) || previous <= 0) return;
   const ratio = brokerPremium / previous;
   if (!Number.isFinite(ratio) || ratio <= 0) return;
 
   opt.premiumPaid = brokerPremium;
+  opt.basisWriter = writer; // TRA-5010 — attribution the log cannot carry alone
   // NOT touched, deliberately:
   //   • `contracts` / `contractsRemaining` — the broker-flat sweep above owns
   //     disappearance, and letting the payload drive quantity would fight the
@@ -7950,6 +8037,15 @@ export class PaperOptionsAccount {
           ...(position.profitLockFire !== undefined
             ? { profitLockFire: { ...position.profitLockFire } }
             : {}),
+          // TRA-4991 (AC1) — the underlying-space chandelier's trigger inputs,
+          // off the row the fire stamped them on. ⛔ ABSENT stays absent, and an
+          // absent key is the verdict "the chandelier never armed on this row" —
+          // it is never zeroed, because a `0` ATR reads as "no volatility"
+          // instead of "not measured" and the two license opposite conclusions
+          // about the same close. ⛔ Never reconstructed.
+          ...(position.chandelierFire !== undefined
+            ? { chandelier: { ...position.chandelierFire } }
+            : {}),
           // TRA-4759 (AC1) — the take-profit-early decision at its firing
           // tick, beside the lock's stamp. Absent stays absent: only a
           // take-profit-early fire writes one, and ⛔ a reconstructed record
@@ -9651,6 +9747,8 @@ export class PaperOptionsAccount {
       contracts,
       contractsRemaining: contracts,
       premiumPaid,
+      // TRA-5010 — the open-time mark; demo biases it up by demoSlippagePct (one-signed).
+      basisWriter: 'engine_open_mark',
       currentPremium: premiumPaid,
       tp1Premium,
       tp1Hit: false,
@@ -9827,6 +9925,8 @@ export class PaperOptionsAccount {
       contracts,
       contractsRemaining: contracts,
       premiumPaid,
+      // TRA-5010 — the open-time mark; demo biases it up by demoSlippagePct (one-signed).
+      basisWriter: 'engine_open_mark',
       currentPremium: premiumPaid,
       tp1Premium,
       tp1Hit: false,
@@ -10113,6 +10213,8 @@ export class PaperOptionsAccount {
       contracts,
       contractsRemaining: contracts,
       premiumPaid,
+      // TRA-5010 — the capped worst case per lot, not a traded premium.
+      basisWriter: 'defined_risk_max_loss',
       currentPremium: premiumPaid,
       // Combos are held to manual close / expiry; the per-leg SL/TP/trailing
       // engine skips them (sentinels keep checkExits a no-op even if reached).
@@ -10219,6 +10321,11 @@ export class PaperOptionsAccount {
     const addPricePerShare = addDebitPerContract / 100;
     // Blend the per-share basis: (Σ existing + add) / total contracts.
     opt.premiumPaid = (opt.premiumPaid * opt.contracts + addPricePerShare * addContracts) / newContracts;
+    // TRA-5010 — this blend appends NOTHING to the restatement log, and it moves
+    // the basis in EITHER direction (an add below the basis lowers it). That makes
+    // it the leading candidate for a both-ways `basisDeltaUsd` on a session whose
+    // restatement census is empty, and this stamp is the only trace it leaves.
+    opt.basisWriter = 'average_on_add';
 
     // Defined-risk combo: scale the reserved capital + display totals. The
     // per-lot defined-risk bound is unchanged; we only add lots.
@@ -10396,6 +10503,8 @@ export class PaperOptionsAccount {
       // Short basis: the premium sold per share. Settlement reads creditUsd /
       // collateralUsd directly rather than the long `(mark − premiumPaid)` math.
       premiumPaid: creditPerShare,
+      // TRA-5010 — premium SOLD per share — settlement reads creditUsd, not (mark - basis).
+      basisWriter: 'short_credit',
       currentPremium: creditPerShare,
       // Held to roll / assignment / expiry — sentinels keep the long exit
       // engine a no-op even if a covered write ever reached it.
@@ -10740,6 +10849,8 @@ export class PaperOptionsAccount {
       contracts,
       contractsRemaining: contracts,
       premiumPaid: creditPerShare,
+      // TRA-5010 — premium SOLD per share — settlement reads creditUsd, not (mark - basis).
+      basisWriter: 'short_credit',
       currentPremium: creditPerShare,
       tp1Premium: Number.POSITIVE_INFINITY,
       tp1Hit: false,
@@ -10897,6 +11008,8 @@ export class PaperOptionsAccount {
       contracts,
       contractsRemaining: contracts,
       premiumPaid,
+      // TRA-5010 — underlyingPrice x OPTIONS_ATM_PREMIUM_RATIO — a model, not a quote.
+      basisWriter: 'atm_synthetic',
       currentPremium: premiumPaid,
       tp1Premium,
       tp1Hit: false,
@@ -11310,6 +11423,14 @@ export class PaperOptionsAccount {
       // mirroring — combos aren't leg-mirrored in v1), and an in-flight
       // `pendingExit` keep the skip.
       if (opt.legs && opt.legs.length > 1) {
+        // TRA-4991 (AC3) — counted HERE, at the filter itself, because a combo
+        // `continue`s ~400 lines before the chandelier chain and so is invisible
+        // to a census taken there. That invisibility is not hypothetical: live
+        // `7b99dda8cd30` published `ratchets: 0` while the whole book was two
+        // `bull_put` combos, and a reader could not tell that from "the trail ran
+        // and never went high beta". ⛔ Observe-only.
+        noteChandelierRowSkipped(opt.mode === 'live' ? 'live' : 'demo', 'multi_leg');
+        noteChandelierAtrShadowSkip(opt.mode === 'live' ? 'live' : 'demo', 'multi_leg');
         if (
           multiLegExitParams
           && mode === 'demo'
@@ -11332,7 +11453,14 @@ export class PaperOptionsAccount {
       // credit positions held to roll / assignment / expiry. The long-side
       // SL/TP/trailing schedule doesn't apply (its P&L basis is inverted), so
       // the per-tick engine skips them; they settle via settleCoveredWrite.
-      if (opt.coveredWrite) continue;
+      if (opt.coveredWrite) {
+        // TRA-4991 (AC3) — the second documented pre-chain filter, counted for the
+        // same reason as the combo above: a book of covered writes must not read
+        // as a book whose trail ran.
+        noteChandelierRowSkipped(opt.mode === 'live' ? 'live' : 'demo', 'covered_write');
+        noteChandelierAtrShadowSkip(opt.mode === 'live' ? 'live' : 'demo', 'covered_write');
+        continue;
+      }
       const isImported = opt.importedFromTradier === true;
       if (isImported) {
         // TRA-361 — imports flow through SL/TP1/trail when auto-management is
@@ -11675,7 +11803,30 @@ export class PaperOptionsAccount {
       const chandelierRetired = otmSleeveExitRule === 'trail' && isOtmSleeveRow(opt);
       let chandelierUSide: Side | null = null;
       let chandelierUnderlying: number | undefined;
+      // TRA-4991 (AC1) — the ratchet's own inputs, hoisted to the scope the FIRE
+      // can see. `uatr` and the ATR provenance live inside the ratchet block
+      // below, and the fire site is ~800 lines further on; before this they were
+      // unreachable from there, which is why the only way to establish what fired
+      // a chandelier exit was `git show` against the deployed commit.
+      // ⛔ Observe-only — no exit predicate reads this.
+      let chandelierRatchetInputs: {
+        atr: number;
+        atrPct: number | null;
+        atrPeriod: number;
+        atrTimeframeMs: number | null;
+        atrBars: number;
+        atrMult: number;
+        highBeta: boolean;
+      } | null = null;
+      // TRA-4991 (AC3) — the ratchet census needs its DENOMINATOR, so every
+      // branch of this chain reports itself. `ratchets: 0` with no denominator is
+      // the same vacuity the counter exists to kill: measured on live
+      // `7b99dda8cd30` the book was two `bull_put` combos, which the single-leg
+      // trail never sees, so the zero was a 0/0 and not a reading. ⛔ Observe-only.
+      const chandelierCensusMode = opt.mode === 'live' ? 'live' : 'demo';
       if (chandelierRetired) {
+        noteChandelierRowSkipped(chandelierCensusMode, 'retired');
+        noteChandelierAtrShadowSkip(chandelierCensusMode, 'retired');
         // A row that ticked on a pre-TRA-3941 build carries a PERSISTED stop, a
         // trail note and possibly a daily-close hold latch. Dropped here rather
         // than left inert: `summarizeLiveStopActionability` reads the hold latch
@@ -11683,6 +11834,8 @@ export class PaperOptionsAccount {
         // `chandelier_daily_close_hold` against a rule that no longer exists,
         // for as long as the row stays open.
         delete opt.chandelierStop;
+        delete opt.chandelierStopBasis;
+        delete opt.chandelierStopNonReconstructionReason;
         delete opt.chandelierTrailNote;
         delete opt.chandelierBreachedWhileSuppressed;
         delete opt.chandelierHeldForDailyClose;
@@ -11732,6 +11885,8 @@ export class PaperOptionsAccount {
               opt.chandelierTrailNote = 'spot_seeded';
             }
             delete opt.chandelierStop;
+            delete opt.chandelierStopBasis;
+            delete opt.chandelierStopNonReconstructionReason;
           }
           // TRA-4020 (R2) — stamp `peakUnderlyingAt` only when the extreme
           // actually moves (a seed from the entry anchor or from spot is not a
@@ -11741,14 +11896,90 @@ export class PaperOptionsAccount {
             ? Math.max(opt.peakUnderlying, chandelierUnderlying)
             : Math.min(opt.peakUnderlying, chandelierUnderlying);
           if (opt.peakUnderlying !== priorPeakUnderlying) opt.peakUnderlyingAt = Date.now();
+          const uatrPct = exitRisk.underlyingAtrPctBySymbol?.get(opt.symbol);
           opt.chandelierStop = chandelierStop({
             side: chandelierUSide,
             initialStop: chandelierUSide === 'buy' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY,
             extremeSinceEntry: opt.peakUnderlying,
             atr: uatr,
-            atrPct: exitRisk.underlyingAtrPctBySymbol?.get(opt.symbol),
+            atrPct: uatrPct,
             prevTrailStop: opt.chandelierStop,
           });
+          // TRA-4991 (AC1 + AC3) — which multiplier this ratchet resolved, and
+          // the series provenance behind the ATR it used.
+          //
+          // ⛔ `chandelierMultiplier` is the ENGINE's own comparison, called with
+          // no overrides exactly as `chandelierStop` just called it internally —
+          // NOT a re-spelling of `atrPct > 0.05` here. A second copy of the
+          // threshold would publish a count of what this file believes instead
+          // of a count of what the trail did, which is the whole failure this
+          // ticket is answering (a flag reads the same whether its branch is
+          // live or dead; so does a mis-derived counter).
+          const uatrMult = chandelierMultiplier(uatrPct);
+          // TRA-5101 (TRA-4991 residual) — stamp the inputs that SET the stop,
+          // at the tick they set it. The ratchet accepted this tick's raw
+          // candidate exactly when the returned level EQUALS it (bit-identical
+          // arithmetic: `chandelierStop` computes `extreme ∓ mult×atr` from
+          // these same operands); a held `prevTrailStop` keeps the prior
+          // basis, which is the whole point — the fire can then publish the
+          // inputs the level actually came from instead of leaving the reader
+          // a 0.013% gap with no column saying why (NU, 2026-10-03).
+          // ⛔ Observe-only — no exit predicate reads this.
+          const uatrRaw = chandelierUSide === 'buy'
+            ? opt.peakUnderlying - uatrMult * uatr
+            : opt.peakUnderlying + uatrMult * uatr;
+          if (opt.chandelierStop === uatrRaw) {
+            opt.chandelierStopBasis = {
+              at: Date.now(),
+              peakUnderlying: opt.peakUnderlying,
+              atr: uatr,
+              atrPct: uatrPct !== undefined && Number.isFinite(uatrPct) ? uatrPct : null,
+              atrMult: uatrMult,
+            };
+            // TRA-5102 — the row's live fields recompose the level again, so
+            // the standing verdict (if any) is consumed, not left to rot.
+            delete opt.chandelierStopNonReconstructionReason;
+          } else {
+            // TRA-5102 (TRA-5101 residual, split from TRA-5100) — the ratchet
+            // HELD, so this row's live (peak, atr, mult) no longer recompose
+            // its own persisted stop. Say so ON THE OPEN ROW, in the same
+            // breath as the stop write: the fire block (`:12916`) only speaks
+            // at the close, and the NU reader was auditing an OPEN row when
+            // the 0.013% gap appeared with no column saying why. With a basis
+            // stamp the reason points at the inputs that DO reconstruct it;
+            // without one (stop persisted by a pre-TRA-5101 build) the reason
+            // says exactly that — ⛔ a basis is never fabricated after the
+            // fact. ⛔ Observe-only — no exit predicate reads this.
+            opt.chandelierStopNonReconstructionReason =
+              opt.chandelierStopBasis !== undefined
+                ? 'ratchet_held_prior_level'
+                : 'stop_predates_basis_stamp';
+          }
+          const atrSource = exitRisk.underlyingAtrSourceBySymbol?.get(opt.symbol);
+          chandelierRatchetInputs = {
+            atr: uatr,
+            atrPct: uatrPct !== undefined && Number.isFinite(uatrPct) ? uatrPct : null,
+            // A hand-built `OptionExitRiskInput` with no provenance map falls
+            // back to the compiled period (which IS what `atr()` used) and to a
+            // `null` spacing — never a guessed 5m, never a `0`.
+            atrPeriod: atrSource?.period ?? CHANDELIER_ATR_PERIOD,
+            atrTimeframeMs: atrSource?.timeframeMs ?? null,
+            atrBars: atrSource?.bars ?? 0,
+            atrMult: uatrMult,
+            highBeta: uatrMult === EXIT_CHANDELIER_ATR_MULT_HIGHBETA,
+          };
+          // Counted once per row per exit pass (the TRA-3217 re-anchor below
+          // recomputes the SAME width from the same ATR and atrPct, so counting
+          // it again would inflate the denominator without adding a resolution).
+          noteChandelierRatchet(chandelierCensusMode, uatrPct, uatrMult);
+          // TRA-5061 — the SIDE-BY-SIDE pair for this same ratchet. Counted
+          // once per row per exit pass, in lockstep with the census above, so
+          // `observations` is the ratchet count the arm decision's
+          // `no_daily_atr` stop is written against. ⛔ Observe-only.
+          noteChandelierAtrShadow(
+            chandelierCensusMode,
+            exitRisk.underlyingAtrShadowBySymbol?.get(opt.symbol),
+          );
 
           // TRA-3217 — breach bookkeeping. While suppressed, the flag mirrors
           // the CURRENT breach state (a breach that heals mid-hold clears it,
@@ -11778,18 +12009,64 @@ export class PaperOptionsAccount {
               });
               opt.peakUnderlying = chandelierUnderlying;
               delete opt.chandelierStop;
+              const restartAtrPct = exitRisk.underlyingAtrPctBySymbol?.get(opt.symbol);
               opt.chandelierStop = chandelierStop({
                 side: chandelierUSide,
                 initialStop: chandelierUSide === 'buy' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY,
                 extremeSinceEntry: chandelierUnderlying,
                 atr: uatr,
-                atrPct: exitRisk.underlyingAtrPctBySymbol?.get(opt.symbol),
+                atrPct: restartAtrPct,
               });
+              // TRA-5101 — a restart has no `prevTrailStop` to hold, so the
+              // re-anchored level IS this tick's raw candidate; its basis is
+              // this tick's inputs by construction.
+              opt.chandelierStopBasis = {
+                at: Date.now(),
+                peakUnderlying: chandelierUnderlying,
+                atr: uatr,
+                atrPct: restartAtrPct !== undefined && Number.isFinite(restartAtrPct) ? restartAtrPct : null,
+                atrMult: chandelierMultiplier(restartAtrPct),
+              };
+              // TRA-5102 — a re-anchored level IS this tick's candidate, so
+              // the row reconstructs again; drop any standing verdict.
+              delete opt.chandelierStopNonReconstructionReason;
               opt.chandelierTrailNote = 'restarted_stale_breach';
               this.chandelierStaleBreachVetoes += 1;
             }
           }
+        } else {
+          // Eligible, but this tick served no underlying spot or no positive ATR
+          // (too few cached bars for the underlying). The nearest cell to a real
+          // absence: the trail WOULD have run had the feed reached it.
+          //
+          // TRA-4992 (AC3) — unless the producer refused the ATR on purpose
+          // because `CHANDELIER_ATR_TIMEFRAME=daily` and the daily store was
+          // cold. Then the leg is inert BY DESIGN and gets its own cell: pooled
+          // with `no_spot_or_atr`, a daily-store warm-up would read as a feed
+          // outage and the arm decision's central question ("inert because the
+          // input is missing, or just a quiet book?") would be unanswerable.
+          //
+          // Spot is checked FIRST: with no spot the trail could not have run on
+          // either series, so that is a feed absence whatever the flag says, and
+          // attributing it to the flag would overstate the repair's cost.
+          const dailyAtrInert = chandelierUnderlying != null
+            && uatr === undefined
+            && exitRisk.underlyingAtrInertBySymbol?.get(opt.symbol) === 'cold_daily_atr';
+          noteChandelierRowSkipped(
+            chandelierCensusMode,
+            dailyAtrInert ? 'no_daily_atr' : 'no_spot_or_atr',
+          );
+          noteChandelierAtrShadowSkip(
+            chandelierCensusMode,
+            dailyAtrInert ? 'no_daily_atr' : 'no_spot_or_atr',
+          );
         }
+      } else {
+        // Never reaches the ratchet at all: a combo (held to expiry/manual close,
+        // the single-leg trail does not evaluate it), or no `exitRisk` attached,
+        // i.e. the exit-risk master is off and the zero is STRUCTURAL.
+        noteChandelierRowSkipped(chandelierCensusMode, opt.legs ? 'multi_leg' : 'no_exit_risk');
+        noteChandelierAtrShadowSkip(chandelierCensusMode, opt.legs ? 'multi_leg' : 'no_exit_risk');
       }
 
       // TRA-2820 — the unmanaged sentinel is a DECISION, and until now it existed
@@ -12091,6 +12368,15 @@ export class PaperOptionsAccount {
           if (reason === 'supertrend_flip' || reason === 'ma20_close_through' || reason === 'time_stop') {
             stampOpeningRangeFire(opt, mark); // TRA-4020 (R4)
             stampProfitFloorPdtFire(opt, mark); // TRA-4030 (R4)
+            // TRA-5100 — this branch closes (or stages) INLINE and `continue`s,
+            // so it never reaches the SL/trail funnel's stamp below — which is
+            // why every pre-TRA-4997 `ma20_close_through` / `time_stop` close
+            // was `exit_quote_missing` at the cross while the chandelier rows
+            // priced: the structural exits fire on the SAME per-tick mark and
+            // then discarded its provenance. Stamp it here, exactly as the
+            // funnel does, so these rows price off the fire-tick book instead
+            // of falling back to `last_known`.
+            stampExitMarkProvenance(opt, markProvenance);
             if (waitAndHold) {
               // TRA-2984 — same escalation as the SL/trail staging site below:
               // a structural exit whose previous order expired unfilled is
@@ -12188,6 +12474,13 @@ export class PaperOptionsAccount {
           ? opt.contractsRemaining
           : Math.floor(opt.contractsRemaining * partialExitRatio);
         if (exitContracts > 0) {
+          // TRA-5100 — a TP1 FULL exit closes the whole row (inline below, or
+          // via the stage on the live path) without reaching the funnel's
+          // stamp, same shape as the structural branch above: it fired on this
+          // tick's mark, so its provenance is this tick's. Guarded by
+          // `tp1FullExit` because a PARTIAL stamp would freeze first-write-wins
+          // provenance from the TP1 tick onto whatever close ends the row later.
+          if (tp1FullExit) stampExitMarkProvenance(opt, markProvenance);
           if (waitAndHold) {
             // TRA-354 — stage the partial exit at the TP1 trigger price; engine
             // submits a Tradier limit sell_to_close and finalises on fill.
@@ -12582,6 +12875,86 @@ export class PaperOptionsAccount {
                 : opt.chandelierTrailNote === 'spot_seeded'
                   ? 'chandelier_spot_seeded'
                   : 'chandelier';
+          // TRA-4991 (AC1) — the trail's own inputs, in SPOT space, stamped at
+          // the FIRST firing tick (a re-staged unfilled leg keeps the original
+          // decision's record, same semantics as `profitLockFire`) and folded
+          // onto the journal close row.
+          //
+          // These six quantities are the ones a reader cannot re-derive: the
+          // close destroys the position, and every published column about it is
+          // in PREMIUM space. `peakPremium == entryBasisPremium` with
+          // `mae.frac == 0` on a `chandelier` row (TRA-4945's MARA close) reads
+          // as "a trailing stop fired with no trail" and is nothing of the kind
+          // — the trail moved, in a space nothing published.
+          //
+          // `chandelierRatchetInputs` is non-null by construction wherever this
+          // branch is reachable (`chandelierUSide` is only ever set in the same
+          // block that fills it). Guarded rather than asserted: an ABSENT
+          // `chandelier` object on a chandelier row is a readable "not measured",
+          // and ⛔ a fabricated one is not.
+          if (
+            opt.chandelierFire === undefined
+            && chandelierRatchetInputs !== null
+            // Re-stated for the type checker, not for the logic: all four are
+            // conjuncts of `chandelierBreachRaw` and so are already true here.
+            && chandelierUSide !== null
+            && chandelierUnderlying != null
+            && opt.chandelierStop !== undefined
+            && opt.peakUnderlying !== undefined
+          ) {
+            // TRA-5101 (TRA-4991 residual) — does the block about to be
+            // published recompose its own stop? The stop is a monotone
+            // ratchet, so a width that grew after the level last advanced
+            // leaves the firing tick's (peak, atr, mult) unable to reproduce
+            // it (NU 2026-10-03, off by 0.013%). EXACT equality on purpose:
+            // when the ratchet accepted the firing tick's candidate this is
+            // the same arithmetic on the same operands, bit-identical — and a
+            // tolerance would re-open the exact "close enough, no column says
+            // why" gap this field exists to close. When it cannot recompose,
+            // the row names the reason and, where the basis stamp exists,
+            // publishes the inputs that DO reconstruct it. ⛔ Observe-only.
+            const chandelierStopReconstructs = opt.chandelierStop === (
+              chandelierUSide === 'buy'
+                ? opt.peakUnderlying - chandelierRatchetInputs.atrMult * chandelierRatchetInputs.atr
+                : opt.peakUnderlying + chandelierRatchetInputs.atrMult * chandelierRatchetInputs.atr
+            );
+            opt.chandelierFire = {
+              at: Date.now(),
+              exitReason: exitJournalReason,
+              side: chandelierUSide,
+              peakUnderlying: opt.peakUnderlying,
+              peakUnderlyingAt: opt.peakUnderlyingAt ?? null,
+              chandelierStop: opt.chandelierStop,
+              spotAtFire: chandelierUnderlying,
+              underlyingEntryPrice: opt.underlyingEntryPrice,
+              atr: chandelierRatchetInputs.atr,
+              atrPct: chandelierRatchetInputs.atrPct,
+              atrPeriod: chandelierRatchetInputs.atrPeriod,
+              atrTimeframeMs: chandelierRatchetInputs.atrTimeframeMs,
+              atrBars: chandelierRatchetInputs.atrBars,
+              atrMult: chandelierRatchetInputs.atrMult,
+              highBeta: chandelierRatchetInputs.highBeta,
+              atrMultBase: EXIT_CHANDELIER_ATR_MULT,
+              atrMultHighBeta: EXIT_CHANDELIER_ATR_MULT_HIGHBETA,
+              highBetaAtrPct: EXIT_CHANDELIER_HIGHBETA_ATRPCT,
+              ...(opt.chandelierTrailNote !== undefined
+                ? { trailNote: opt.chandelierTrailNote }
+                : {}),
+              stopReconstructs: chandelierStopReconstructs,
+              // A `false` carries its reason: the level predates the firing
+              // tick's inputs (basis published beside it), or the stop was
+              // persisted by a pre-TRA-5101 build whose setting tick was never
+              // captured — ⛔ a basis is never reconstructed after the fact.
+              ...(chandelierStopReconstructs
+                ? {}
+                : opt.chandelierStopBasis !== undefined
+                  ? {
+                      stopNonReconstructionReason: 'ratchet_held_prior_level' as const,
+                      stopBasis: { ...opt.chandelierStopBasis },
+                    }
+                  : { stopNonReconstructionReason: 'stop_predates_basis_stamp' as const }),
+            };
+          }
         } else if (exitPremium === null) {
           // Rule 2 — trade-level profit-lock on premium-derived R (we are always
           // LONG the premium, so entry = premiumPaid, stop = stopLossPremium).
@@ -14672,7 +15045,7 @@ export class PaperOptionsAccount {
     // what re-derives the stop off the corrected basis: BAC 1.41 -> 1.65 carries
     // the 0.80 stop to 1.32 and the 1.50 TP1 to 2.475.
     this.recordEngineBasisRestatement(opt, recorded.premiumPaid, 'recorded_fill_repair');
-    restateEngineOpenedBasis(opt, recorded.premiumPaid);
+    restateEngineOpenedBasis(opt, recorded.premiumPaid, 'recorded_fill_repair');
     this.finishEngineBasisRestatement(opt);
 
     accountLog.warn('engine row basis REPAIRED from this engine\'s own recorded fill', {
@@ -14906,6 +15279,10 @@ export class PaperOptionsAccount {
      */
     const install = (row: OptionPosition): boolean => {
       row.premiumPaid = requestedPremiumPaid;
+      // TRA-5010 — this path DOES append (`operator_restatement`, since
+      // ea73fb029 / 2026-08-22), which is what rules the operator pin out as the
+      // cause of a basis move on a session whose restatement census is empty.
+      row.basisWriter = 'operator_restatement';
       // ★ The correction is a STANDING INSTRUCTION, not a value. Without this
       // pin the write lands, reads back perfectly, and the next Tradier sweep
       // 30s later copies the broker's blend back over it — measured on bqb1 at
@@ -15192,7 +15569,7 @@ export class PaperOptionsAccount {
             continue;
           }
           this.recordEngineBasisRestatement(existing, incoming.premiumPaid);
-          restateEngineOpenedBasis(existing, incoming.premiumPaid);
+          restateEngineOpenedBasis(existing, incoming.premiumPaid, 'broker_reconcile');
           this.finishEngineBasisRestatement(existing);
           // Count it: an engine-opened row was previously invisible to the
           // summary, so a reconcile that fixed nothing for it still reported
@@ -15489,6 +15866,10 @@ export class PaperOptionsAccount {
           existing.contracts = incoming.contracts;
           existing.contractsRemaining = incoming.contracts;
           existing.premiumPaid = incoming.premiumPaid;
+          // TRA-5010 — the IMPORTED-row arm. Unlike the engine-opened arm ~300
+          // lines above, nothing here appends to the restatement log, and the
+          // broker's figure can land either side of ours.
+          existing.basisWriter = 'import_adopted';
           // Mark current premium as the entry premium until a fresh quote
           // refreshes it — better than zero or stale data.
           existing.currentPremium = incoming.premiumPaid;
@@ -15516,6 +15897,8 @@ export class PaperOptionsAccount {
         contracts: incoming.contracts,
         contractsRemaining: incoming.contracts,
         premiumPaid: incoming.premiumPaid,
+        // TRA-5010 — the broker's own figure for a row this engine did not open.
+        basisWriter: 'import_adopted',
         currentPremium: incoming.premiumPaid,
         // TRA-361 — thresholds installed by `applyImportedRiskThresholds`
         // below so the auto-manage flag and the new RV-defaults logic share
@@ -15781,7 +16164,7 @@ export class PaperOptionsAccount {
         row.contracts = plan.split.toContracts;
         row.contractsRemaining = plan.split.toContracts;
         this.recordEngineBasisRestatement(row, plan.split.toPremiumPaid, 'desk_lot_split');
-        restateEngineOpenedBasis(row, plan.split.toPremiumPaid);
+        restateEngineOpenedBasis(row, plan.split.toPremiumPaid, 'desk_lot_split');
         this.finishEngineBasisRestatement(row);
         this.lotAdoptionSplitTotal += 1;
         split = 1;
@@ -15836,6 +16219,8 @@ export class PaperOptionsAccount {
         contracts: plan.mint.contracts,
         contractsRemaining: plan.mint.contracts,
         premiumPaid: plan.mint.premiumPaid,
+        // TRA-5010 — the desk lot-adoption mint.
+        basisWriter: 'import_adopted',
         // The mark refresher repopulates this from the quote cache; the entry
         // price is a better placeholder than zero or the broker's blend.
         currentPremium: plan.mint.premiumPaid,

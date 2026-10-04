@@ -89,7 +89,21 @@ import { withPhase, timeSyncPhase } from './phase-timing.js';
 import { EvalYielder, TickPacer } from './cooperative-yield.js';
 import { TickExitWorkMeter, type TickExitWorkTerms } from './tick-exit-work.js';
 import { TickExitRegionMeter, classifyExitInterval, type TickExitRegionRthTerms } from './tick-exit-region.js';
-import { trySma200ScanSlot, releaseSma200ScanSlot, fetchSma200CandlesShared } from './sma200-scan-admission.js';
+// TRA-4991 — the chandelier ATR's shared provenance constants. ⛔ Observe-only.
+import {
+  CHANDELIER_ATR_PERIOD,
+  SHADOW_CANDLE_TIMEFRAME_MS,
+  measureCandleTimeframeMs,
+  type OptionChandelierAtrSource,
+  type ChandelierAtrInertReason,
+} from './option-chandelier-trail.js';
+// TRA-5061 — the side-by-side ATR shadow. OBSERVE-ONLY; see its module docblock.
+import {
+  buildChandelierAtrShadowArm,
+  type ChandelierAtrShadowPair,
+} from './tra5061-chandelier-atr-shadow.js';
+import { trySma200ScanSlot, releaseSma200ScanSlot, fetchSma200CandlesShared, orderSma200FallbackFairness } from './sma200-scan-admission.js';
+import type { Sma200CandlePull } from './sma200-scan-admission.js';
 import { resolveSma200PullbackMaxDistAtr, resolveSma200PullbackTimeCapBars, sma200PullbackExitModel, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved, signalRingEvictionIndex, isSma200SignalType, type Sma200SweepVerdict } from './sma200-validity.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync, earningsCalendarReadSync, recentEarningsDateSync } from './earnings-store.js';
@@ -221,7 +235,7 @@ import {
 import { recordWheelBookSnapshot } from './wheel-promotion-gate-store.js';
 import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
 import { buildProfitFloorLadder, resolveOtmProfitSchedule } from './otm-profit-schedule.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isProfitFloorTrailEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, resolveSwingTimeStopTradingDays, resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isProfitFloorTrailEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, resolveSwingTimeStopTradingDays, resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule, resolveChandelierAtrTimeframe, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
 // TRA-4436 — the RV exit re-tune param set, extracted so the shipped demo/live
 // construction is testable and its demo-effective ma20 gate publishable.
 import { buildRvExitParams } from './rv-exit-params.js';
@@ -683,7 +697,7 @@ import {
 import type { BrokerCloseEvent, BrokerRejectClass } from './broker-submit-census.js';
 import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
 import { isSma200DemoForwardTestEnabled } from './sma200-forward-test-flag.js';
-import { resolveDemoFlagEnv } from './demo-flags.js';
+import { resolveDemoFlagEnvFromEnv } from './demo-flags.js';
 // TRA-2233 — marketable(bid) open-position valuation, DARK behind
 // ENABLE_MARKETABLE_OPEN_MTM. Demo-scoped downstream (account guards on
 // mode==='demo'), so wiring it into both accounts can never change a live number.
@@ -971,17 +985,66 @@ export interface Sma200ScanStats {
   /** Symbols that yielded >= `SMA200_MIN_BARS` bars and were actually scored. */
   evaluated: number;
   /**
-   * Symbols that came back short WHILE the Yahoo breaker was open — i.e. we
-   * never asked. Attributed by a post-hoc sample of `isYahooBreakerOpen()`, so
-   * it is sound in aggregate but not per-symbol.
+   * Symbols NO PROVIDER served: the Yahoo breaker was open so the primary was
+   * never asked, and the Tradier fallback did not carry it either.
+   *
+   * TRA-5065 — the attribution is now PER-SYMBOL and taken BEFORE the call
+   * (`Sma200CandlePull.primarySuppressed`), not from a post-hoc
+   * `isYahooBreakerOpen()` sample that could not tell a mid-sweep breaker flip
+   * from a short listing. A symbol the fallback was asked for and that came
+   * back empty stays in THIS bucket rather than `starvedShortHistory`:
+   * `fetchTradierDailyCandles` returns `[]` for a refusal and for a genuinely
+   * empty series alike, so the conservative reading — "we did not get a look" —
+   * is the one that cannot be mistaken for a market fact.
    */
   starvedBreakerOpen: number;
   /**
-   * Symbols that came back short with the breaker CLOSED — a genuinely short
-   * listing history (a recent IPO, a delisted ticker). A different condition
-   * from the above with a different remedy, so it gets its own counter.
+   * Symbols that came back short with the primary ASKED and answering — a
+   * genuinely short listing history (a recent IPO, a delisted ticker), or bars
+   * that arrived but numbered under {@link SMA200_MIN_BARS}. A different
+   * condition from the above with a different remedy, so it gets its own
+   * counter.
    */
   starvedShortHistory: number;
+  /**
+   * TRA-5065 — symbols whose bars came off the PRIMARY (Yahoo) leg, including
+   * replays out of the process-wide memo (the memo carries its origin). Σ with
+   * {@link servedFallback} is "symbols somebody served"; the gap to
+   * `considered` is the starve.
+   *
+   * Optional (TRA-3913): absent on a build without the fallback, and ABSENT ≠
+   * ZERO — a fold that reads a missing key as "Yahoo served nothing" would
+   * invent this ticket's own defect on a mixed-build fleet.
+   */
+  servedPrimary?: number;
+  /**
+   * TRA-5065 (AC3) — symbols whose bars came off the TRADIER fallback leg.
+   * Sibling of `OtmDailySeriesCounters.fetchOkFallback`, and the reason it is
+   * published separately: a fallback that hides inside `evaluated` turns
+   * "Tradier carried this sweep" into "the sweep ran", and the next reader
+   * cannot tell a healthy Yahoo from a permanently-429ing one.
+   */
+  servedFallback?: number;
+  /**
+   * TRA-5065 — symbols the fallback could not be asked for because this
+   * sweep's fallback wall-clock budget was spent.
+   *
+   * ⚠️ A SUB-TAG OF {@link starvedBreakerOpen}, NOT A DISJOINT BUCKET. Those
+   * symbols are counted in BOTH, and `sma200SweepStarved` must keep
+   * reconciling to `considered - evaluated`; a fourth independent bucket would
+   * silently drop them out of the starve total and read as a healthier sweep.
+   * It exists because the two have different OWNERS: the remedy here is ours
+   * (raise the budget, shrink the universe), not Yahoo's.
+   */
+  starvedFallbackBudget?: number;
+  /**
+   * TRA-5065 — symbols the fallback could not be asked for because Tradier
+   * itself was unavailable (no client, or its bar breaker open). The same
+   * sub-tag relationship to {@link starvedBreakerOpen} as above — counted in
+   * both, never added to the starve total twice. Non-zero means BOTH providers
+   * were down, which is TRA-4826's shape and not this ticket's.
+   */
+  fallbackUnavailable?: number;
   /** Symbols whose fetch threw outright. */
   fetchFailed: number;
   /** Signals emitted by this sweep. */
@@ -2345,6 +2408,30 @@ const SMA200_SCAN_INTERVAL_MS = 4 * 60 * 60_000;
 // TRA-451 — daily bars pulled per symbol for the SMA-200 scan. The spec needs
 // ≥ 250 sessions; an extra ~30-bar cushion covers holidays / missing prints.
 const SMA200_DAILY_BARS = SMA200_MIN_BARS + 30;
+/**
+ * TRA-5065 — wall clock one sweep may spend on the TRADIER FALLBACK leg.
+ *
+ * ⛔ Not a nicety. `runSma200Scan` is AWAITED inside `doTick`, and `doTick`'s
+ * duration is still the live exit-evaluation interval on the real-money book
+ * (TRA-2200's hoist is deferred), so every millisecond here is exit latency on
+ * live capital. A Tradier `/markets/history` call costs ~350ms (measured
+ * 2026-10-02, 10 concurrent), so at `SCAN_BATCH` 5 an UNBUDGETED 750-symbol
+ * universe would add ~52s to a tick and put ~750 requests against a modelled
+ * 200 req/min account budget — tripping the SHARED Tradier bar breaker and
+ * taking the OTM daily series and the MTF backfill down with it.
+ *
+ * Sized below `OTM_DAILY_SERIES_BUDGET_MS` (8s) for the same reason that one
+ * is below `SWEEP_BUDGET_MS`: this sink is DISPLAY-ONLY (TRA-819), nothing
+ * capital-facing waits on it, and the budget's cost is bounded coverage, not
+ * lost coverage — the fairness order rotates which symbols the next sweep
+ * reaches, and the shortfall is published as `starvedFallbackBudget` rather
+ * than hidden. 6s ≈ 85 symbols/sweep, which clears the live universes measured
+ * on bqb1 (~100 per engine, 400 across 4 engines) in one or two sweeps.
+ *
+ * The budget bounds the FALLBACK leg only. A healthy Yahoo sweep never consults
+ * it and is exactly as fast as it was before this ticket.
+ */
+const SMA200_FALLBACK_BUDGET_MS = 6_000;
 
 // TRA-1926 — collapse a daily-bar timestamp to its UTC calendar day. Yahoo can
 // hand back the same session with a drifting sub-day timestamp (an intraday
@@ -2373,14 +2460,6 @@ const TECHNICAL_SNAPSHOT_REFRESH_MS = 5 * 60_000;
 const TECHNICAL_COLD_SCAN_INTERVAL = 4;
 const MTF_MINUTE_BARS = 2000;
 const MTF_DAILY_BARS = 260;
-/**
- * TRA-3943 — daily bars pulled on the COLD path for the OTM sleeve's entry
- * ATR(14, daily). 40 is ATR(14)'s 15-bar floor plus a month of slack for
- * holidays and a thin provider response; deliberately far short of
- * {@link MTF_DAILY_BARS}, because this pull happens on the entry path and the
- * only thing downstream of it is a 14-period average.
- */
-const OTM_DAILY_ATR_BARS = 40;
 
 /**
  * TRA-787 — SupertrendConfluence SHADOW channel parameters.
@@ -2404,7 +2483,13 @@ const OTM_DAILY_ATR_BARS = 40;
  * cache (TRA-552) de-dupes against the MTF snapshot's deeper pull. The shadow
  * EVALUATION still runs every tick off the cached 5m series (TRA-787 acceptance #1).
  */
-const SUPERTREND_SHADOW_TF_MS = 5 * 60_000;
+// TRA-4991 — ONE definition, shared with the surface that publishes it. The
+// option chandelier's ATR is computed on THIS series (`buildOptionExitRisk` reads
+// `shadowCandleCache`), so `/api/health/option-swing-exits` has to be able to
+// name its width; two constants describing one series is how a published
+// timeframe goes stale silently, and this exact width is what TRA-4992 is filed
+// to repair.
+const SUPERTREND_SHADOW_TF_MS = SHADOW_CANDLE_TIMEFRAME_MS;
 // TRA-840 — deep enough that the resampled 1h confirm clears the 30-bar guard.
 const SUPERTREND_SHADOW_MINUTE_BARS = 2400;
 const SUPERTREND_SHADOW_REFRESH_MS = 60_000;
@@ -3819,24 +3904,120 @@ export class SignalEngine {
 
   /**
    * TRA-1268 (TRA-1250 Rule 1) — build the {@link OptionExitRiskInput}: ATR(14)
-   * of the UNDERLYING on the 5m shadow-candle cache, one entry per open
-   * option's underlying. Underlyings without enough cached bars are omitted.
-   * Multi-leg combos are skipped (they're held to expiry/manual close). Only
-   * called when `EXIT_RISK_RULES_ENABLED` is on.
+   * of the UNDERLYING, one entry per open option's underlying. Underlyings
+   * without enough cached bars are omitted. Multi-leg combos are skipped
+   * (they're held to expiry/manual close). Only called when
+   * `EXIT_RISK_RULES_ENABLED` is on.
+   *
+   * TRA-4992 — the ATR's SERIES is selected by `CHANDELIER_ATR_TIMEFRAME`:
+   * `shadow_5m` (default, today's behaviour) is the 5m shadow-candle cache;
+   * `daily` is the position-timeframe daily store, which is what
+   * `EXIT_CHANDELIER_ATR_MULT = 3.0` was specified against. On `daily` a cold
+   * store leaves the symbol out and records it inert — it does NOT fall back to
+   * the 5m series, because a fallback would make the flag's effect unobservable.
    */
   private buildOptionExitRisk(): OptionExitRiskInput | undefined {
     const underlyingAtrBySymbol = new Map<string, number>();
     const underlyingAtrPctBySymbol = new Map<string, number>();
+    // TRA-4991 (AC1) — the provenance of each ATR, so a chandelier fire can
+    // publish the series it decided on instead of leaving a reader to infer it
+    // from a constant somewhere else in the tree.
+    const underlyingAtrSourceBySymbol = new Map<string, OptionChandelierAtrSource>();
+    // TRA-4992 (AC3) — symbols the chandelier leg is INERT for, with the reason,
+    // so the exit pass's census can attribute them instead of folding them into
+    // `no_spot_or_atr` (which also means "no spot was served").
+    const underlyingAtrInertBySymbol = new Map<string, ChandelierAtrInertReason>();
+    // TRA-5061 — the side-by-side counterfactual, per underlying. OBSERVE-ONLY:
+    // nothing downstream reads this to set a level. See the module docblock for
+    // why it answers mechanism reachability and NOT P&L.
+    const underlyingAtrShadowBySymbol = new Map<string, ChandelierAtrShadowPair>();
+    // TRA-4992 (AC1) — WHICH series the trail's ATR is measured on. `process.env`
+    // on both books: this is a boot config applied by redeploy (TRA-3724), like
+    // the profit-floor VALUES and unlike the demo-overlay ARMS. Resolved ONCE per
+    // build rather than per symbol so one pass cannot straddle an env change.
+    //
+    // ⛔ `shadow_5m` (the default, and the intended shipping state) is the
+    // 3.0 x ATR(14, 5m) UNIT ERROR — see `resolveChandelierAtrTimeframe`.
+    const chandelierAtrTf = resolveChandelierAtrTimeframe();
     for (const opt of this.optionsAccount.getState().openOptions) {
       if (opt.legs && opt.legs.length > 1) continue;
       if (underlyingAtrBySymbol.has(opt.symbol)) continue;
-      const series = this.shadowCandleCache.get(opt.symbol);
-      if (!series || series.length < 15) continue;
-      const a = atr(series);
-      if (a == null || !(a > 0)) continue;
+      // A second row on an underlying already refused must not re-walk the cold
+      // path, and must not be able to resolve differently from the first.
+      if (underlyingAtrInertBySymbol.has(opt.symbol)) continue;
+      // TRA-4992 — on `daily`, the per-symbol per-ET-day DAILY store TRA-3943
+      // already maintains and `refreshTechnicalSnapshot` warms for free. Read
+      // SYNCHRONOUSLY and uppercase-keyed, the same convention `otmDailyAtr`
+      // uses; deliberately NOT `otmDailyAtr` itself, which is async and carries an
+      // on-demand `fetchDailyCandles` fallback. This producer runs on every exit
+      // tick, so a network pull here would put a provider round-trip on the exit
+      // path — and a cold symbol is AC3's inert row, which is the behaviour we
+      // want, not an error to recover from. No new feed (AC1).
+      //
+      // TRA-5061 — BOTH series are resolved here, not just the selected one, so
+      // the side-by-side shadow can publish the counterfactual width.
+      //
+      // COST, stated honestly because this runs on every exit tick: one extra
+      // in-memory store lookup, plus (in the pair build below) `atr`, `atrPct`
+      // and `measureCandleTimeframeMs` on BOTH series rather than one — so two
+      // of each where the shipped path did one. All of it is arithmetic over
+      // already-cached bars; neither store read can fetch, so there is no new
+      // feed and no provider round-trip on the exit path (the constraint
+      // TRA-4992 set when it chose a synchronous daily read over `otmDailyAtr`).
+      // The denominator is unique OPEN single-leg underlyings, which is small.
+      const dailySeries = getSharedDailyBars(opt.symbol.toUpperCase())
+        ?? getSharedDailyBars(opt.symbol);
+      const shadow5mSeries = this.shadowCandleCache.get(opt.symbol);
+      const series = chandelierAtrTf.timeframe === 'daily' ? dailySeries : shadow5mSeries;
+      // ⛔ AC3 — FAIL CLOSED, and never onto the 5m series. `noteInert` is called
+      // only on the `daily` arm: on `shadow_5m` a cold cache is the long-standing
+      // `no_spot_or_atr` behaviour and must keep reading as that, so the new cell
+      // counts the FLAG's cost of admission and nothing else.
+      const noteInert = (): void => {
+        if (chandelierAtrTf.timeframe === 'daily') {
+          underlyingAtrInertBySymbol.set(opt.symbol, 'cold_daily_atr');
+        }
+      };
+      if (!series || series.length < 15) { noteInert(); continue; }
+      // TRA-4991 — the period is stated EXPLICITLY (it is `atr()`'s own default,
+      // so this is behaviour-neutral) because the fire publishes it. A published
+      // period that is really "whatever the indicator defaults to today" is not a
+      // measurement of anything.
+      const a = atr(series, CHANDELIER_ATR_PERIOD);
+      if (a == null || !(a > 0)) { noteInert(); continue; }
       underlyingAtrBySymbol.set(opt.symbol, a);
-      const ap = atrPct(series);
+      const ap = atrPct(series, CHANDELIER_ATR_PERIOD);
       if (ap != null && Number.isFinite(ap)) underlyingAtrPctBySymbol.set(opt.symbol, ap);
+      underlyingAtrSourceBySymbol.set(opt.symbol, {
+        period: CHANDELIER_ATR_PERIOD,
+        // MEASURED off the bars just consumed, not asserted from the resample
+        // constant: a repair that re-points this cache has to move this reading.
+        timeframeMs: measureCandleTimeframeMs(series),
+        bars: series.length,
+        // TRA-4992 — and the SELECTED series beside the measured spacing, because
+        // a daily series' measured spacing is a range (weekends) while this is
+        // exact. Together they catch "flag flipped, input did not".
+        series: chandelierAtrTf.timeframe,
+      });
+      // TRA-5061 — the SIDE-BY-SIDE pair: both trails resolved, only
+      // `decidedBy` load-bearing. Attached ONLY on this branch, i.e. only where
+      // the SELECTED arm produced a width, because that is exactly the set of
+      // rows that will reach the ratchet — and `observations` has to equal the
+      // ratchet count for `dailyColdRate` to be the per-ratchet rate the arm
+      // decision's stop is written against.
+      //
+      // ⚠ The selected arm is recomputed by `buildChandelierAtrShadowArm`
+      // rather than assembled from `a`/`ap` above. That is deliberate: it puts
+      // both arms through ONE code path, so the published columns are
+      // comparable by construction. It is also asserted — the suite checks the
+      // selected arm's `atrValue` is the value wired into
+      // `underlyingAtrBySymbol`, which is what makes the unselected column
+      // trustworthy.
+      underlyingAtrShadowBySymbol.set(opt.symbol, {
+        shadow5m: buildChandelierAtrShadowArm(shadow5mSeries, 'shadow_5m', measureCandleTimeframeMs),
+        daily: buildChandelierAtrShadowArm(dailySeries, 'daily', measureCandleTimeframeMs),
+        decidedBy: chandelierAtrTf.timeframe,
+      });
     }
     // TRA-1294 — take-profit-early is premium-space only (no underlying ATR
     // needed); attach its capture fraction so the branch activates even for
@@ -3874,6 +4055,17 @@ export class SignalEngine {
       : undefined;
     if (
       underlyingAtrBySymbol.size === 0
+      // TRA-4992 — an inert-but-ELIGIBLE row still needs the input object to
+      // exist. Without this clause, flipping the flag on a cold daily store
+      // would return `undefined`, and the exit pass would then count the row
+      // `no_exit_risk` — i.e. "the exit-risk master is off", a STRUCTURAL zero —
+      // when the master is on and the real reason is AC3's cold cache. It would
+      // also drop `openingRangeGuardMin`, silently widening the TRA-3217
+      // suppression window for the premium trail and profit-lock legs, which are
+      // out of this ticket's scope entirely. The chandelier still cannot run:
+      // `underlyingAtrBySymbol` has no entry for the symbol, which is the
+      // fail-closed property itself.
+      && underlyingAtrInertBySymbol.size === 0
       && takeProfitEarlyCaptureFrac === undefined
       && profitFloorLadder === undefined
     ) return undefined;
@@ -3889,6 +4081,9 @@ export class SignalEngine {
     return {
       underlyingAtrBySymbol,
       underlyingAtrPctBySymbol,
+      underlyingAtrSourceBySymbol,
+      underlyingAtrInertBySymbol,
+      underlyingAtrShadowBySymbol,
       takeProfitEarlyCaptureFrac,
       openingRangeGuardMin,
       ...(profitFloorLadder !== undefined ? { profitFloorLadder } : {}),
@@ -8546,6 +8741,13 @@ export class SignalEngine {
       starvedBreakerOpen: stats.starvedBreakerOpen,
       starvedShortHistory: stats.starvedShortHistory,
       fetchFailed: stats.fetchFailed,
+      // TRA-5065 — WHO served, beside how many. `evaluated > 0` with
+      // `servedFallback == evaluated` is the whole point of this ticket and is
+      // unreadable from `evaluated` alone.
+      servedPrimary: stats.servedPrimary,
+      servedFallback: stats.servedFallback,
+      starvedFallbackBudget: stats.starvedFallbackBudget,
+      fallbackUnavailable: stats.fallbackUnavailable,
       fired: stats.fired,
       voided: stats.voided,
       maxDistAtr: stats.maxDistAtr,
@@ -8600,6 +8802,13 @@ export class SignalEngine {
       rejectedMaxDist: 0,
       maxDistAtr: null,
       memoHits: 0,
+      // TRA-5065 — present from birth so a build that carries the fallback
+      // publishes zeros rather than absent keys. ABSENT ≠ ZERO is the fleet
+      // fold's discriminator for "this engine is on an older build".
+      servedPrimary: 0,
+      servedFallback: 0,
+      starvedFallbackBudget: 0,
+      fallbackUnavailable: 0,
     };
     // TRA-4457 — an empty universe still owes a census. It is a DIFFERENT fault
     // from a starved feed (the watchlist upstream, not the bar feed), which is
@@ -8619,18 +8828,40 @@ export class SignalEngine {
     // pullback fired by one sweep carries the same stamp.
     const pullbackTimeCapBars = resolveSma200PullbackTimeCapBars(process.env);
     stats.timeCapBars = pullbackTimeCapBars;
-    for (let i = 0; i < symbols.length; i += SCAN_BATCH) {
+    // TRA-5065 — the fallback leg's wall-clock allowance for THIS sweep. See
+    // `SMA200_FALLBACK_BUDGET_MS`; the deadline is captured once so every
+    // symbol in the sweep is measured against the same clock.
+    const fallbackDeadline = Date.now() + SMA200_FALLBACK_BUDGET_MS;
+    // …and the order the budget cuts. Least-recently-fallback-served first, so
+    // a universe bigger than the budget rotates its coverage instead of
+    // pinning a permanent blind spot on the tail.
+    const scanOrder = orderSma200FallbackFairness(symbols);
+    for (let i = 0; i < scanOrder.length; i += SCAN_BATCH) {
       await Promise.all(
-        symbols.slice(i, i + SCAN_BATCH).map(async (sym) => {
+        scanOrder.slice(i, i + SCAN_BATCH).map(async (sym) => {
           let candles: Candle[];
+          let pull: Sma200CandlePull;
           try {
             // TRA-4457 S2 — shared across engines: the next engine to sweep this
             // symbol inside the memo window scores it without a request.
+            // TRA-5065 — …and the Tradier leg behind it, so the sweep is not
+            // pinned to a provider that 429s ~permanently on this host.
             const pulled = await fetchSma200CandlesShared(
               sym, SMA200_DAILY_BARS, (s, n) => fetchDailyCandles(s, n),
+              {
+                breakerOpen: () => isYahooBreakerOpen(),
+                fallback: {
+                  fetch: (s, n) => fetchTradierDailyCandles(s, n),
+                  available: () => isTradierDailyAvailable(),
+                  budgetExhausted: () => Date.now() >= fallbackDeadline,
+                },
+              },
             );
+            pull = pulled;
             candles = pulled.candles;
             if (pulled.fromMemo) stats.memoHits = (stats.memoHits ?? 0) + 1;
+            if (pulled.source === 'primary') stats.servedPrimary = (stats.servedPrimary ?? 0) + 1;
+            else if (pulled.source === 'fallback') stats.servedFallback = (stats.servedFallback ?? 0) + 1;
           } catch (err: unknown) {
             stats.fetchFailed++;
             log.warn('sma200: daily candle fetch failed', {
@@ -8640,15 +8871,30 @@ export class SignalEngine {
             return;
           }
           if (candles.length < SMA200_MIN_BARS) {
-            // TRA-4457 — attribute the starve. `isYahooBreakerOpen()` is a
-            // sample taken after the fact, not a proof for this symbol (the
-            // breaker can flip mid-sweep), but across a sweep it cleanly
-            // separates "we never asked" from "this ticker has < 250 sessions
-            // of history", which are different conditions with different
-            // remedies. Still no per-symbol log line: at 751 symbols a starved
-            // sweep would emit 751 of them. The summary below is the trace.
-            if (isYahooBreakerOpen()) stats.starvedBreakerOpen++;
-            else stats.starvedShortHistory++;
+            // TRA-4457 — attribute the starve: "we never asked" and "this
+            // ticker has < 250 sessions of history" are different conditions
+            // with different remedies.
+            //
+            // TRA-5065 — attributed off what the pull ACTUALLY DID, per
+            // symbol, rather than a post-hoc `isYahooBreakerOpen()` sample
+            // that a mid-sweep breaker flip could misread. Order matters: a
+            // symbol the fallback never reached because WE ran out of budget
+            // is our latency decision, not a vendor outage, so it is named
+            // first and separately.
+            //
+            // Still no per-symbol log line: at 751 symbols a starved sweep
+            // would emit 751 of them. The summary below is the trace.
+            if (candles.length === 0 && pull.fallbackSkipped === 'budget_exhausted') {
+              stats.starvedFallbackBudget = (stats.starvedFallbackBudget ?? 0) + 1;
+              stats.starvedBreakerOpen++;
+            } else if (candles.length === 0 && pull.primarySuppressed) {
+              if (pull.fallbackSkipped === 'unavailable') {
+                stats.fallbackUnavailable = (stats.fallbackUnavailable ?? 0) + 1;
+              }
+              stats.starvedBreakerOpen++;
+            } else {
+              stats.starvedShortHistory++;
+            }
             return;
           }
           stats.evaluated++;
@@ -8977,7 +9223,10 @@ export class SignalEngine {
     };
 
     // TRA-1408 — per-name same-session open cap (DEMO-scoped, DARK until armed).
-    const churnCap = this.churnOpenCapVerdict(signal.symbol);
+    // TRA-5026 — `equity`: the SMA-200 pullback router opens shares directly (it
+    // never passes through `routeEquitySignal`), so it is the cap's second equity
+    // chokepoint and must state the same book.
+    const churnCap = this.churnOpenCapVerdict(signal.symbol, 'equity');
     if (churnCap.blocked) {
       signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${churnCap.count}/${churnCap.cap})`;
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'churn_brake');
@@ -9041,10 +9290,18 @@ export class SignalEngine {
    * the only writable switch a non-admin agent has on the self-hosted host.
    * When `DATA_DIR` is unset (unit tests / CLI) there is no canonical file
    * location, so `process.env` is used directly.
+   *
+   * TRA-5037 — through `resolveDemoFlagEnvFromEnv`, which TRIMS, so a
+   * blank-but-present `DATA_DIR` (`' '`, bqb1 has reached it twice) behaves as
+   * UNSET instead of resolving the overlay against a directory literally named
+   * `" "` relative to the launch cwd. This is the RECORDER: the writer
+   * (`index.ts` → `writeDemoFlagFile(resolveDataDir(), …)`) already trimmed, so
+   * under the old truthiness gate a blank value had the arm written to
+   * `<bundle>/data/demo-flags.json` and read from `" "/demo-flags.json` — the
+   * write returned 200 and the flag never took effect here.
    */
   private resolveDemoFlagEnv(): NodeJS.ProcessEnv {
-    const dir = process.env.DATA_DIR;
-    return dir ? resolveDemoFlagEnv(dir) : process.env;
+    return resolveDemoFlagEnvFromEnv();
   }
 
   /**
@@ -10771,9 +11028,19 @@ export class SignalEngine {
    * count on the ET session exactly like the DCA per-name counters, so the cap
    * auto-resets at the ET-day roll. Consulted at each demo open chokepoint BEFORE
    * the position opens; the caller records the open via {@link recordChurnOpen}.
+   *
+   * TRA-5026 — `assetClass` is REQUIRED and stated by the chokepoint, exactly like
+   * {@link recordChurnOpen}'s. The cap is cross-asset-class (two equity entries,
+   * three option ones), so without it `opensPresented` is a mixed-sleeve denominator:
+   * on 2026-09-30 the demo book presented 60,592 candidates, rejected 0 and admitted
+   * 0 in BOTH sleeves, and nothing could say whether the equity leg contributed any
+   * of them — i.e. whether the equity zero sat upstream or downstream of this cap.
+   * It is a required positional (not an optional with a default) so a new chokepoint
+   * cannot compile while silently writing its verdict into the `unknown` cell.
    */
   private churnOpenCapVerdict(
     symbol: string,
+    assetClass: ChurnOpenAssetClass,
     now = Date.now(),
   ): { blocked: boolean; count: number; cap: number } {
     if (this.mode === 'live') return { blocked: false, count: 0, cap: 0 };
@@ -10782,12 +11049,16 @@ export class SignalEngine {
       // TRA-4335 — presented-but-DARK. Recorded so `opensEvaluated: 0` against a
       // non-zero `opensPresented` is readable as "the brake did not run", which a
       // bare reject count of 0 can never say (same denominator rule as TRA-2598).
+      // TRA-5026 — a DARK verdict still states its book: it counts into
+      // `opensPresentedByAssetClass` (not `opensEvaluatedByAssetClass`), which is
+      // what lets "the brake was off for the equity leg specifically" be read.
       recordChurnBrakeGuardEvent({
         ts: now,
         etDay: etDateString(new Date(now)),
         symbol,
         guardEnabled: false,
         blocked: false,
+        assetClass,
       });
       return { blocked: false, count: 0, cap: 0 };
     }
@@ -10812,6 +11083,7 @@ export class SignalEngine {
       blocked,
       count,
       cap,
+      assetClass,
     });
     return { blocked, count, cap };
   }
@@ -12332,15 +12604,37 @@ export class SignalEngine {
     if (hit && hit.dayKey === dayKey) return hit.atr;
     let bars = getSharedDailyBars(sym);
     if (!bars || bars.length < 15) {
-      bars = await fetchDailyCandles(sym, OTM_DAILY_ATR_BARS).catch(() => [] as Candle[]);
+      // TRA-4989 (ruling on TRA-4943) — the cold pull is `MTF_DAILY_BARS`, the
+      // SAME depth the warm technical-snapshot path serves. This used to be its
+      // own shallower constant (40 bars, now deleted), sized on the belief
+      // that "the only thing downstream is a 14-period average". `atr()` does
+      // not slice to its period — it SEEDS on 14 true ranges and Wilder-smooths
+      // to the END of the series — so depth is a CONVERGENCE parameter, and the
+      // two paths published different ATRs for the same symbol on the same day.
+      // Measured over the live 100-symbol universe (n=99, 2026-10-02): the
+      // 40-bar read deviated a median 1.90% / max 25.76% from the converged
+      // read, 85 of 99 names TIGHTER — i.e. the cold path put the invalidation
+      // level closer to entry than the warm path on 86% of the book. At depth 40
+      // a flat 15.68% of the published ATR is still the 14-bar simple seed from
+      // 27–40 sessions back, which also makes the number irreproducible: one bar
+      // of provider-window difference moves the median read up to ~1.1pp. The
+      // latency argument for the shallower pull was about ROUND TRIPS, and it is
+      // the same ONE `yf.chart` call at either depth — the delta is ~220 extra
+      // daily rows (single-digit KB) on a path that already waits on a broker.
+      // If this sleeve ever wants a genuinely shorter-memory ATR the knob is
+      // `period`, not the pull depth.
+      bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
     }
     if (bars.length >= 15) {
-      // Deepest-or-equal-wins, so this cold `OTM_DAILY_ATR_BARS` pull cannot
-      // clobber the deeper `MTF_DAILY_BARS` series the technical-snapshot pass
-      // maintains. When the write IS refused the ATR has to be taken off the
-      // series the store kept, not off the shallower local pull — otherwise the
-      // number published here would still depend on which writer ran last, which
-      // is the write-order dependence the shared store exists to remove.
+      // Deepest-or-equal-wins. Both writers now pull at `MTF_DAILY_BARS`, so
+      // this is a plain no-op rather than a tiebreak between two legitimate
+      // depths — which is the strictly simpler invariant to keep true, and the
+      // reason the second constant was deleted instead of retargeted. The rule
+      // still has to be obeyed: when a write IS refused (a short provider
+      // response), the ATR has to be taken off the series the store kept, not
+      // off the shallower local pull — otherwise the number published here would
+      // again depend on which writer ran last, which is the write-order
+      // dependence the shared store exists to remove.
       setSharedDailyBars(sym, bars);
       bars = getSharedDailyBars(sym) ?? bars;
     }
@@ -13983,7 +14277,8 @@ export class SignalEngine {
         // (DEMO-scoped, DARK until ENABLE_CHURN_LOSS_BRAKE). Rejects a new open on
         // a name that already hit N opens this ET session, before any Tradier
         // mirror. Same containment as the greeks gate / correlated cap above.
-        const rvChurnCap = this.churnOpenCapVerdict(signal.symbol);
+        // TRA-5026 — `option`: the RV sleeve opens option contracts.
+        const rvChurnCap = this.churnOpenCapVerdict(signal.symbol, 'option');
         if (rvChurnCap.blocked) {
           signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${rvChurnCap.count}/${rvChurnCap.cap})`;
           log.info('RV long rejected by churn brake (TRA-1408)', {
@@ -16426,7 +16721,8 @@ export class SignalEngine {
         // has hit N opens this ET session (the churn pathology). Placed after the
         // live-suppression bail so the demo book — the only book that opens here —
         // is the one gated.
-        const otmChurnCap = this.churnOpenCapVerdict(signal.symbol);
+        // TRA-5026 — `option`: the OTM sleeve opens option contracts.
+        const otmChurnCap = this.churnOpenCapVerdict(signal.symbol, 'option');
         if (otmChurnCap.blocked) {
           signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${otmChurnCap.count}/${otmChurnCap.cap})`;
           this.pushRecentSignal(signal);
@@ -16906,11 +17202,16 @@ export class SignalEngine {
    *     `refreshTechnicalSnapshot` (active interest, with a cold sweep every 4th
    *     cycle) and, failing that, by an ON-DEMAND fetch inside `otmDailyAtr` —
    *     which runs POST-FILL, only for symbols that already opened.
-   *  3. DEPTH. The cold path pulls `OTM_DAILY_ATR_BARS = 40`, below
-   *     `SETUP_TAXONOMY_MIN_BARS = 60`, because the only thing downstream of it
-   *     is a 14-period average. A taxonomy reading that cache would find some
-   *     symbols readable and others not for reasons having nothing to do with
-   *     the market.
+   *  3. DEPTH IS NOT GUARANTEED, AND THAT IS THE POINT. Both of its writers now
+   *     request `MTF_DAILY_BARS` (260) — the cold ATR path included, since
+   *     TRA-4989 — so depth is no longer systematically below
+   *     `SETUP_TAXONOMY_MIN_BARS = 60` the way the old 40-bar cold pull was. But
+   *     the store holds whatever the PROVIDER returned, not what was requested,
+   *     and it has no floor: a thin reply on a newly-listed or illiquid name
+   *     lands at whatever depth it lands at. A taxonomy reading that cache would
+   *     still find some symbols readable and others not for reasons having
+   *     nothing to do with the market — the difference is that the shortfall is
+   *     now per-symbol and silent rather than uniform and predictable.
    *
    * Reusing its 260-bar snapshot-path pull as a free side-fill is a real
    * optimisation and is deliberately NOT taken here: it would put a second
@@ -17592,7 +17893,8 @@ export class SignalEngine {
         // that gate was off. Reject the Nth+1 open exactly like the other
         // chokepoints; DEMO-SCOPED + DARK until ENABLE_CHURN_LOSS_BRAKE (caller is
         // already demo-only), so the live options path is untouched.
-        const dirChurnCap = this.churnOpenCapVerdict(sym, asOf);
+        // TRA-5026 — `option`: the directional sleeve opens option contracts.
+        const dirChurnCap = this.churnOpenCapVerdict(sym, 'option', asOf);
         if (dirChurnCap.blocked) {
           log.info('demo directional rejected by churn brake (TRA-1408)', {
             symbol: sym, count: dirChurnCap.count, cap: dirChurnCap.cap,
@@ -20910,7 +21212,9 @@ export class SignalEngine {
     // pathology). DEMO-SCOPED + DARK until ENABLE_CHURN_LOSS_BRAKE — a no-op on
     // the live path and when the flag is off, so prod is unchanged. Checked here,
     // before the broker order, so no Tradier OTOCO is submitted past the cap.
-    const churnCap = this.churnOpenCapVerdict(signal.symbol);
+    // TRA-5026 — `equity`: this is one of the cap's two equity chokepoints, and the
+    // reject below is the SAME event the equity funnel books as `churn_brake`.
+    const churnCap = this.churnOpenCapVerdict(signal.symbol, 'equity');
     if (churnCap.blocked) {
       signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${churnCap.count}/${churnCap.cap})`;
       this.pushRecentSignal(signal);

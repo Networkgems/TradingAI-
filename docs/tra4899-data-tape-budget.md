@@ -305,6 +305,153 @@ to be falsified. It does not change what gets built: still **one shared periodic
 `live-enforce-gate`, `churn-brake-guard`, `reversal-shadow-signals` and `otm-admission-tape`, whose
 first job is to measure which keying above is true. Successor: **TRA-5038**.
 
+#### TRA-5038 — the shared hook, built 2026-10-02; live on bqb1 since 2026-10-03 (build `a0344981`)
+
+`packages/server/src/shared-tape-compaction.ts` is **one** registry and **one** `setInterval`, armed
+once in `index.ts`, covering all four tapes. Each owner contributes only its path and its
+**predicate**, and the predicates genuinely differ — which is why the hook takes one per tape rather
+than assuming a cutoff:
+
+| tape | predicate | bound | cadence premium |
+|---|---|---|---|
+| `live-enforce-gate.jsonl` | `age` | 30 d | 6 h / 30 d = **+0.83%** |
+| `churn-brake-guard.jsonl` | `age` | 30 d | **+0.83%** |
+| `reversal-shadow-signals.jsonl` | `age` | 30 d | **+0.83%** |
+| `otm-admission-tape.jsonl` | `bytes_whole_day` | 144 MiB | n/a — a byte cap has no retention to overshoot |
+
+All four are well inside AC2's ceiling (`cost-aware-gate`'s +3.6%), and one cadence nobody has to
+re-check beats four tuned ones.
+
+**`otm-admission-tape` needed a third predicate kind, not the obvious `bytes` one.** Its prune must
+land on an **ET-day boundary**: its consumers divide by *sessions*, so a partial day biases its own
+within-day sample toward the afternoon, and a biased day is worse than an absent one — the reason
+`hydrateOtmAdmissionTapeFromDisk` has always pruned whole days. A plain byte-prefix cut would have
+silently changed that. The periodic pass deliberately does **not** reuse the hydrate's prune, which
+`JSON.parse`s every line and rebuilds the fold: affordable once at boot, and exactly what AC4 forbids
+four times a day at ~189k rows.
+
+**Two properties carried over from TRA-4904, per tape:**
+
+- **Does not parse what it keeps** — applies to all four. The walk reads `ts` (and `etDay` for
+  `otm-admission-tape`) off the first 96 bytes of each line with a regex, and only over the prefix it
+  is about to **delete**; the retained bytes are echoed verbatim and never deserialized, so no field
+  can be erased by the rewrite (TRA-1703) and the pass stays clear of the TRA-2111 tripwire.
+- **Buffered-and-flushed live appends** — applies to all four, and the flush happens **even on a
+  failed rewrite** (an erased row reads identically to a row never written, TRA-1681). Each owner's
+  append path checks the interlock *synchronously* and routes its flush back through its own raw
+  append, so `durability.appendErrors` stays the authority on what reached disk.
+  `reversal-shadow-ledger.ts` is the one whose append is `async`; the check is still sync and runs
+  before any `await`, so it cannot observe a stale `false` and then land inside the window.
+
+**One deliberate departure from the prototype: the rewrite is streamed, not a whole-file string.**
+`compactCostAwareGateLedgerNow` does `readFile(path, 'utf8')` and holds the tape as one string, which
+was affordable for one 80 MiB file. These four are 263 MiB on disk, and a JS string is UTF-16 — a
+94 MiB ASCII tape is ~188 MiB of heap. Four of those per pass, four times a day, on the box TRA-4158
+just cut 330 MB of RSS out of, would be a **memory** incident shipped to fix a **disk** problem. The
+scan is chunked and the rewrite is `createReadStream(start) → tmp → rename`, so memory is O(chunk).
+
+⚠️ **Consequence, deliberate:** the shared payload publishes no `linesBefore` / `linesAfter`. Neither
+can be computed without reading every retained byte, which is the cost just removed. `linesDropped`
+and `bytesDropped` are exact (the dropped prefix is walked) and `bytesBefore/After` come off `stat`.
+**Do not "complete" the payload by adding a full-file line count back.**
+
+**AC3 surface.** Each of the four publishes `sharedCompaction` carrying the same four-state
+arm-derived enum as `/api/health/cost-aware-gate`. The key is `sharedCompaction`, not `compaction`,
+on all four deliberately: `reversal-shadow-signals` already publishes `compaction` for its **boot**
+outcome, and one consistent name across the four beats a collision on one of them. The exact paths —
+the depth differs because one route nests its whole durable fold:
+
+| route | JSON path |
+|---|---|
+| `/api/health/live-enforce-gates` | `sharedCompaction` |
+| `/api/health/churn-brake` | `retained.sharedCompaction` |
+| `/api/health/reversal-shadow-signals` | `sharedCompaction` |
+| `/api/health/otm-admission-tape` | `sharedCompaction` |
+
+⚠️ **Being armed and being ON THE WIRE are two different things**, and this bit nearly shipped
+wrong. `/api/health/live-enforce-gates` **hand-picks** fields off its summary rather than spreading
+it, so the field added to `LiveEnforceSummary` typechecked, tested green, and would not have reached
+a single reader. The census now asserts the publication literal in the file that actually serves it
+(`publish` on each manifest row) as a third seam beside the predicate and the arm — verified by
+control: blanking that literal exits **BLIND (3)** naming the route.
+
+**AC1 is answered by `sharedCompaction.span`, and it is measured at boot, not only on a fire.** A
+span published only inside a timer outcome would be unreadable on bqb1, whose uptime is routinely
+under one interval — so `index.ts` runs a measure-only pass (no rewrite) right after arming, once
+each owner's own boot compaction has already run. `span.fill` reads `at_steady_state` when the pass
+dropped rows or the oldest row sits within one day of the cutoff (one day, because these tapes only
+write on sessions, so a weekend leaves a legitimate hole at the head), `still_filling` when the
+content begins well inside the cutoff, and `unknown` when it cannot be read — never guessed. When it
+reads `still_filling`, `size / retentionDays` **understates** the rate and `span.observedBytesPerDay`
+(`size / spanDays`) is the honest figure.
+
+**The census row cannot claim a timer that is not wired.** Each of the four manifest rows carries
+`bootOnly: false` + `compactEveryDays: 0.25`, and the needle check now asserts three further seams:
+the owner's own `predicate:` literal, `SHARED_TAPE_COMPACTION_INTERVAL_MS = 6 * …` in the shared
+module, and that `index.ts` still references that tape's spec factory, `registerSharedTape(` and
+`noteSharedTapeCompactionArmed()`, plus the per-tape **publication** literal above. A reverted
+registration leaves every other field on the health route reading healthy, so it exits
+**BLIND (3)** at desk time instead of at `minFreePct`. All three directions were run as controls: a
+row claiming a 12 h cadence, a spec factory `index.ts` never references, and a blanked publication
+literal each exit 3 naming the row.
+
+#### Verified live 2026-10-03T18:2xZ — AC1 settled, AC5 re-measured; AC3b still pending
+
+The hook reached the host without a deliberate deploy: live build `a0344981` (boot
+2026-10-03T17:42:22Z) carries both `4f127915` and `f48d0340` as ancestors. All four routes publish
+`sharedCompaction` with `hookState: armed_not_yet_due`, `timerArmedAt` 17:42:42Z,
+`nextFireDueAt` 23:42:42Z — the arm is on the wire on every tape, including the hand-picked
+`live-enforce-gates` payload `f48d0340` repaired.
+
+**AC1 — both contested tapes are AT STEADY STATE. The "still filling toward 141 MiB" branch is
+ruled out.** `sharedCompaction.span` off the live build (boot measure-only pass, 17:42:42Z):
+
+| tape | oldest retained `ts` | span | cutoff headroom | fill | size/span rate |
+|---|---|---|---|---|---|
+| `live-enforce-gate` | 2026-09-03T17:46:33Z | **29.09 d** | 0.003 d | **at_steady_state** | 3.52 MiB/d |
+| `churn-brake-guard` | 2026-09-04T13:53:22Z | **28.25 d** | 0.84 d (≤1 d session-gap tol) | **at_steady_state** | 2.40 MiB/d |
+| `reversal-shadow-signals` | 2026-09-03T17:45:00Z | 29.09 d | 0.002 d | at_steady_state | 1.43 MiB/d |
+| `otm-admission-tape` | 2026-09-18T13:30:24Z | 14.27 d | n/a (byte cap) | under cap (59.2 of 144.0 MiB) | 4.15 MiB/d |
+
+So the pooled trio rate is the **lower** keying, ~**7.35 MiB/d** at today's sizes (the 09-25→10-02
+growth was the tail of the fill plus boot-gap overshoot, not a rate change), and the ranking above
+stands — `live-enforce-gate` tops out near its observed 102.3 MiB, not 141–164.
+
+**AC5 — census re-run against the live build: CLEAN (exit 0).**
+
+```
+node scripts/tra4899-tape-census.mjs        # 2026-10-03T18:2xZ, host build a03449814210
+  144.0  HARD     144.0 MiB          59.2   otm-admission-tape.jsonl      ← cap now timer-enforced
+  103.1  DERIVED  30 d +6h timer    102.3   live-enforce-gate.jsonl       ← was 110.2 boot-only
+   68.4  DERIVED  30 d +6h timer     67.8   churn-brake-guard.jsonl       ← was 78.8
+   68.1  DERIVED  7 d +6h timer      65.7   cost-aware-gate.jsonl
+   42.0  DERIVED  30 d +6h timer     41.7   reversal-shadow-signals.jsonl ← was 51.6
+volume: 973.4 MiB total, 231.1 MiB free (23.745%)
+```
+
+The trio's overshoot premium drops from `bootGap/30` (+16.4% at the measured 4.93 d gap) to
+**+0.83%**, cutting ~27 MiB of worst-case reservation. Resulting `/data` growth and
+days-to-`minFreePct`: headroom to the 10% floor is `231.1 − 97.3` = **133.8 MiB**. With the trio at
+steady state its net growth is ~0 (oscillation ≤ one 6 h interval ≈ 1.8 MiB); the only catalogued
+net grower is `otm-admission-tape` at 4.15 MiB/d with 84.8 MiB left to its cap, so free bottoms out
+near **146 MiB around 2026-10-24 and the catalogued tape population never reaches `minFreePct`**.
+From that point the `/data` slope is owned by the FLOOR/external populations (`option-chains/` 73.2,
+`backups/` 43.3, `logs/` 25.0, `users/**/reports` — the last is TRA-4898's book-reap, not a tape
+cap). Four tapes that landed after 10-02 were catalogued to get the CLEAN exit:
+`equity-entry-funnel.jsonl` (30 d boot-only, TRA-5089), `tra3926-bound-exercise.jsonl` (5,000-row
+hard stop), `tra5061-chandelier-atr-shadow.jsonl` (20,000-row hard stop), `options-evaluation/`
+(newest-400-files cap).
+
+⛔ **Still open — one measurement, not code:**
+
+1. **AC3b — neither the prototype's timer nor the shared one has been observed firing.** The
+   10-02 window (`nextFireDueAt` 18:52:07Z, build `104bc8ed322c`) was lost to a wake delivered a
+   day late and an intervening reboot; uptime resets on every boot and bqb1 is routinely up for
+   under one 6 h interval. Current window: boot 2026-10-03T17:42Z ⇒ both `hookState`s must read
+   `firing` (never `overdue`) on the first read after **23:42:42Z**, if the host stays up. The
+   enum self-reports on every read, so the check costs one curl whenever an uptime >6 h occurs;
+   `overdue` on either surface means the `setInterval` wiring is dead and reopens TRA-5038.
+
 ---
 
 ## AC5 — the inode budget: the file-count leg does **not** become binding

@@ -2597,9 +2597,37 @@ export const DAILY_DRAWDOWN_HALT_PCT = 0.08; // halt if daily P&L < −8% of man
  * "+$1,599 → +$483" tail near +$960.
  */
 // Rule 1 — ATR chandelier trailing stop
-export const EXIT_CHANDELIER_ATR_MULT = 3.0;          // default trail width = 3.0 × ATR14 from the running extreme
+//
+// ⛔ ALL THREE OF THESE ARE CALIBRATED FOR A **DAILY** ATR (TRA-4992). They are
+// Chande's chandelier constants and his specification is a position-timeframe
+// ATR. They are UNITLESS MULTIPLIERS, so nothing in a type or a test can catch
+// them being applied to a different series — the caller owns the units, and the
+// options path applied them to ATR(14) on a **5-minute** cache for its whole
+// life, making the trail half-width three 70-MINUTE ranges instead of three
+// daily ones (on a $13 underlying, tens of cents — a level spot crosses on
+// noise; pooled median hold 1.04 h, shortest 1.9 s).
+//
+// So if you are reading these to wire up a new caller: name the timeframe of the
+// series you are feeding them, and if it is not daily these numbers are wrong
+// for you. The repair for a mis-scaled trail is the ATR INPUT, never the
+// multiplier — moving the multiplier to compensate masks the unit error and
+// leaves the next caller to rediscover it.
+//
+// Selection on the options path: `CHANDELIER_ATR_TIMEFRAME`
+// (`server/src/exit-risk-rules-flag.ts`), default `shadow_5m` = the defective
+// behaviour, pending QuantTrader's forward grade. The live-equity broker
+// stop-leg ratchet is a separate caller with its own series and is out of that
+// flag's scope.
+export const EXIT_CHANDELIER_ATR_MULT = 3.0;          // default trail width = 3.0 × ATR14(DAILY) from the running extreme
 export const EXIT_CHANDELIER_ATR_MULT_HIGHBETA = 3.5; // widen for high-beta names to avoid noise stop-outs
-export const EXIT_CHANDELIER_HIGHBETA_ATRPCT = 0.05;  // ATR/price above ~5% ⇒ treat as high-beta
+// ATR/price above ~5% ⇒ treat as high-beta. A **DAILY**-scale threshold: a 5%
+// DAILY range is a genuinely high-beta name, while a 5% 5-MINUTE range is a
+// near-unreachable extreme — so on a 5m `atrPct` this gate is effectively dead
+// and `EXIT_CHANDELIER_ATR_MULT_HIGHBETA` above is unreachable with it. Compared
+// against `atrPct = atr(series)/lastClose` on whatever series the caller chose
+// (`engine/src/indicators/atr.ts`), which is why the timeframe choice moves the
+// trail through two paths at once: the ATR level AND which multiplier scales it.
+export const EXIT_CHANDELIER_HIGHBETA_ATRPCT = 0.05;
 // Rule 2 — trade-level profit-lock (give-back cap per position)
 //
 // TRA-4006 (QuantTrader ruling, 2026-08-26) — the arm threshold and the give-back
@@ -2835,6 +2863,143 @@ export interface OptionProfitLockFire {
    * models a different sleeve's stop.
    */
   stopBasisPremium: number;
+}
+
+/**
+ * TRA-4991 (AC1, parent TRA-4945) — the UNDERLYING-space ATR chandelier's own
+ * inputs at the tick it chose to exit, stamped at the fire and folded onto the
+ * journal close row. Same contract as `OptionProfitLockFire`: first fire only,
+ * absent ⇔ no chandelier fire on this build, ⛔ never backfilled.
+ *
+ * ── Why this type exists ────────────────────────────────────────────────────
+ *
+ * Every published field about a chandelier close is in PREMIUM space
+ * (`peakPremium`, `entryBasisPremium`, `mae.*`, `stopBasisPremium`) and the
+ * chandelier decides in SPOT space. TRA-4945 was asked which condition stamped
+ * `exitReason: "chandelier"` on a 197-second zero-excursion close and could
+ * only answer by reading source bytes against the deployed commit, because a
+ * reader seeing `peakPremium == entryBasisPremium` and `mae.frac == 0`
+ * reasonably concludes "a trailing stop fired with no trail". The trail was
+ * real; it was in a space nothing published.
+ *
+ * ⛔ ABSENT, NEVER ZEROED, on a row the chandelier never armed. A `0` ATR reads
+ * as "no volatility" rather than "not measured", and the two license opposite
+ * conclusions about the same close.
+ */
+/**
+ * TRA-5101 (TRA-4991 residual) — the ratchet inputs at the tick the persisted
+ * `chandelierStop` was last SET. `peakUnderlying ∓ atrMult × atr` (− for a
+ * `buy`-side trail, + for `sell`) reproduces the stop to full precision by
+ * construction: the stamp is written only when the ratchet ACCEPTS that exact
+ * candidate. Carried on the open row beside the stop and published on the fire
+ * block when the firing tick's own inputs no longer recompose the level.
+ */
+export interface OptionChandelierStopBasis {
+  /** ms epoch of the tick the stop last moved. */
+  at: number;
+  /** The favorable extreme the accepted candidate was computed from. */
+  peakUnderlying: number;
+  /** The ATR consumed on that tick. */
+  atr: number;
+  /** ATR/price on that tick, `null` when none was served. */
+  atrPct: number | null;
+  /** The multiplier the ratchet resolved on that tick (base or high-beta). */
+  atrMult: number;
+}
+
+export interface OptionChandelierFire {
+  /** ms epoch of the tick the trail chose to exit. */
+  at: number;
+  /**
+   * The journal label this fire stamped — the TRA-3217 provenance split
+   * (`chandelier` · `chandelier_spot_seeded` · `chandelier_restarted` ·
+   * `chandelier_daily_close` · `chandelier_deferred_breach`). Carried HERE as
+   * well as on the row's `exitReason` so a supersede that relabels the row
+   * leaves the trail's own account of itself intact.
+   */
+  exitReason: string;
+  /**
+   * The side the trail ran on the UNDERLYING: `buy` for a call (trail the
+   * highest high), `sell` for a put (trail the lowest low). ⚠ Not the option
+   * side — the book is always LONG the premium.
+   */
+  side: 'buy' | 'sell';
+  /** `peakUnderlying` — the favorable extreme the stop was computed from. */
+  peakUnderlying: number;
+  /** When that extreme was last advanced by a print; `null` if it never moved off its seed. */
+  peakUnderlyingAt: number | null;
+  /** `chandelierStop` — the trail level, in SPOT terms, that the breach crossed. */
+  chandelierStop: number;
+  /** The spot compared against the stop on the firing tick. */
+  spotAtFire: number;
+  /**
+   * `underlyingEntryPrice` as the row carries it. ⚠ `0` is a ROUTINE state, not
+   * corruption: `reconcileTradierPositions` has no spot to seed it from on a
+   * `tradier_import` row, and the OTM/RV open paths fall back to `0` when the
+   * scanner's spot is missing (TRA-2893). A `0` here with
+   * `trailNote: 'spot_seeded'` is the documented pair.
+   */
+  underlyingEntryPrice: number;
+  /** The ATR value the ratchet consumed. Always > 0 — the ratchet refuses otherwise. */
+  atr: number;
+  /**
+   * ATR/price on the SAME series, the input the high-beta branch is gated on.
+   * `null` ⇒ none was served, in which case the high-beta multiplier was
+   * structurally unreachable on this row (not declined).
+   */
+  atrPct: number | null;
+  /** Period handed to `atr()`. */
+  atrPeriod: number;
+  /**
+   * Bar spacing MEASURED off the series this ATR was computed on, `null` when
+   * unmeasurable (fewer than two bars). ⛔ Never `0`. This is the measurement,
+   * not the configured constant the health route publishes — read this one.
+   */
+  atrTimeframeMs: number | null;
+  /** Bars in that series. */
+  atrBars: number;
+  /** The multiplier the ratchet resolved (base or high-beta). */
+  atrMult: number;
+  /** `true` ⇔ `atrMult` is the high-beta one, i.e. `atrPct` cleared the threshold. */
+  highBeta: boolean;
+  /** The base / high-beta multipliers and the threshold in force, for the comparison. */
+  atrMultBase: number;
+  atrMultHighBeta: number;
+  highBetaAtrPct: number;
+  /**
+   * `chandelierTrailNote` at the fire — `spot_seeded` (the anchor had to be
+   * seeded from the current spot) or `restarted_stale_breach` (TRA-3217
+   * re-anchor). Absent ⇔ an ordinary trail whose anchor was a real entry spot.
+   */
+  trailNote?: 'spot_seeded' | 'restarted_stale_breach';
+  /**
+   * TRA-5101 (TRA-4991 residual) — whether `peakUnderlying ∓ atrMult × atr`
+   * (− for `side: 'buy'`, + for `'sell'`) reproduces `chandelierStop` EXACTLY
+   * from the fields above. `false` is not corruption: the stop is a monotone
+   * ratchet, so when ATR rose (or the multiplier flipped) after the tick that
+   * last set the level, the ratchet holds the prior stop while this block
+   * publishes the firing tick's inputs — NU 2026-10-03 missed by 0.013% that
+   * way while XLF reconstructed to full precision. Absent ⇔ the row closed
+   * before TRA-5101 shipped. ⛔ Never backfilled.
+   */
+  stopReconstructs?: boolean;
+  /**
+   * TRA-5101 — present iff `stopReconstructs === false`; names WHY the firing
+   * tick's inputs cannot recompose the stop. `ratchet_held_prior_level` ⇒ the
+   * level predates the firing tick's (peak, atr, mult); `stopBasis` beside it
+   * carries the inputs that DO reconstruct it. `stop_predates_basis_stamp` ⇒
+   * the stop was persisted by a pre-TRA-5101 build and never advanced after,
+   * so the setting tick's inputs were never captured — ⛔ they are not
+   * reconstructed after the fact.
+   */
+  stopNonReconstructionReason?: 'ratchet_held_prior_level' | 'stop_predates_basis_stamp';
+  /**
+   * TRA-5101 — the ratchet inputs at the tick the stop was last SET, published
+   * only when the firing tick's inputs no longer recompose the level
+   * (`stopNonReconstructionReason: 'ratchet_held_prior_level'`). These
+   * reconstruct `chandelierStop` to full precision by construction.
+   */
+  stopBasis?: OptionChandelierStopBasis;
 }
 
 /**
@@ -3617,6 +3782,62 @@ export interface ExitBreakerTrip {
   count: number;
 }
 
+/**
+ * TRA-5010 — WHICH code path last assigned {@link OptionPosition.premiumPaid}.
+ *
+ * `basisRestatementCount` (TRA-4781) counts the rows the **durable restatement
+ * log** holds for a position, and that log has exactly four feeders. The basis
+ * itself is assigned at **twelve** sites under **ten** distinct writers
+ * (measured on `7c5ca6a6`; eight are position mints, four are mutations in
+ * place). So a readable census reading `0` next to a
+ * non-zero `basisDeltaUsd` is a perfectly ordinary live state — "the basis
+ * moved, through a path that does not append" — and a consumer cannot tell
+ * WHICH path from the census, because the census never saw it.
+ *
+ * This tag is the attribution the log cannot carry: stamped at the assignment,
+ * last-writer-wins, so it always names the writer that produced the basis the
+ * row is carrying NOW (which is exactly the basis a close settles against).
+ *
+ * LOGGED — these four also append to the restatement log, so a row carrying one
+ * of them should also carry `basisRestatementCount >= 1`:
+ *   • `broker_reconcile`       — the Tradier sweep moved an engine-opened row to
+ *     broker truth (TRA-3965). The one writer TRA-4781's census was built for.
+ *   • `recorded_fill_repair`   — TRA-3896, repaired from this engine's own fills.
+ *   • `operator_restatement`   — TRA-3958, the operator pin. ⚠️ TRA-5010's own
+ *     table listed this as UNLOGGED; it has appended since 2026-08-22
+ *     (`ea73fb029`), which is what rules the operator pin OUT as the cause of a
+ *     two-signed gap on a session the census shows nothing for.
+ *   • `desk_lot_split`         — TRA-3909, a blended row unsplit back to its fill.
+ *
+ * UNLOGGED — the gap TRA-5010 is about. None of these append anything:
+ *   • `engine_open_mark`       — the open-time mark. In demo it is biased up by
+ *     `demoSlippagePct` (TRA-374), so it is ONE-SIGNED, which is what rules it
+ *     out as the whole story of a both-ways gap.
+ *   • `defined_risk_max_loss`  — a spread/combo's `maxLossPerLot / 100`.
+ *   • `short_credit`           — premium SOLD per share (CSP / covered call).
+ *   • `atm_synthetic`          — `underlyingPrice × OPTIONS_ATM_PREMIUM_RATIO`.
+ *   • `average_on_add`         — the contract-weighted blend on an add.
+ *     TWO-SIGNED and unlogged: adding below the basis moves it down, above moves
+ *     it up. The leading suspect for a both-ways basis gap.
+ *   • `import_adopted`         — a broker/desk row minted or overwritten from
+ *     `incoming.premiumPaid`. Also two-signed and unlogged.
+ *
+ * ABSENT (`undefined`) is its own reading and must never be coerced to a value:
+ * the row predates this stamp, or it was opened by a writer added after it. Not
+ * "no writer".
+ */
+export type OptionBasisWriter =
+  | 'engine_open_mark'
+  | 'defined_risk_max_loss'
+  | 'short_credit'
+  | 'atm_synthetic'
+  | 'average_on_add'
+  | 'import_adopted'
+  | 'broker_reconcile'
+  | 'recorded_fill_repair'
+  | 'operator_restatement'
+  | 'desk_lot_split';
+
 export interface OptionPosition {
   id: string;
   symbol: string;
@@ -3627,6 +3848,12 @@ export interface OptionPosition {
   contracts: number;
   contractsRemaining: number; // after partial exit at TP1; starts equal to contracts
   premiumPaid: number;        // per-share premium at entry
+  /**
+   * TRA-5010 — the writer that last assigned `premiumPaid` above. See
+   * {@link OptionBasisWriter}; absent ⇒ unstamped, never "no writer".
+   * Persisted with the row (`exportSnapshot` serialises the whole object).
+   */
+  basisWriter?: OptionBasisWriter;
   currentPremium: number;     // current mark (updated on each tick)
   /**
    * TRA-2890 — the broker-tape LAST TRADE per share, refreshed on the same tick
@@ -3759,6 +3986,13 @@ export interface OptionPosition {
    * ⛔ Never backfilled.
    */
   takeProfitEarlyFire?: OptionTakeProfitEarlyFire;
+  /**
+   * TRA-4991 (AC1) — the underlying-space chandelier's inputs at its firing
+   * tick, stamped beside `profitLockFire` (first fire only, same rationale) and
+   * folded onto the journal close row. Absent ⇔ no chandelier fire on this
+   * build. ⛔ Never backfilled, ⛔ never zeroed.
+   */
+  chandelierFire?: OptionChandelierFire;
   trailingActive: boolean;    // true once price is up 20% and trailing mode engaged
   trailingStopPremium: number; // current trailing stop level (peak * (1 - 0.12))
   underlyingEntryPrice: number;
@@ -4728,6 +4962,35 @@ export interface OptionPosition {
    * Absent ↔ chandelier not yet armed / rules-off snapshot.
    */
   chandelierStop?: number;
+  /**
+   * TRA-5101 (TRA-4991 residual) — the ratchet inputs at the tick that last SET
+   * `chandelierStop`, i.e. the tick the ratchet accepted its raw candidate
+   * instead of holding `prevTrailStop`. The stop is a monotone ratchet, so the
+   * level can be CARRIED from an earlier tick whose ATR/multiplier differ from
+   * the firing tick's — these are the inputs that reconstruct it exactly when
+   * the firing tick's cannot (NU 2026-10-03: held stop 13.199253 vs final-tick
+   * candidate 13.200928). Stamped/refreshed only when the stop moves; deleted
+   * whenever `chandelierStop` is. Absent beside a present `chandelierStop` ⇔
+   * the stop was persisted by a pre-TRA-5101 build and has not advanced since.
+   */
+  chandelierStopBasis?: OptionChandelierStopBasis;
+  /**
+   * TRA-5102 (TRA-5101 residual) — the OPEN row's reconstruction verdict,
+   * re-derived in the same pass that writes `chandelierStop`. Present ⇔ the
+   * last maintenance tick's raw candidate was NOT the persisted level, i.e.
+   * `peakUnderlying ∓ atrMult × atr` off this row's live fields will not
+   * recompose `chandelierStop`, and the auditor needs a column saying why
+   * instead of inferring it from a 0.013% miss (NU 2026-10-04: stop implies
+   * extreme 13.058425 vs published peak 13.0601, nothing on the row said so).
+   * `ratchet_held_prior_level` ⇒ `chandelierStopBasis` beside it reconstructs
+   * the level to full precision; `stop_predates_basis_stamp` ⇒ the stop was
+   * persisted by a pre-TRA-5101 build and the setting tick's inputs were never
+   * captured — ⛔ never fabricated after the fact. Deleted whenever the
+   * ratchet ACCEPTS a tick (the row then reconstructs from its own live
+   * fields) and whenever `chandelierStop` is deleted. ⛔ Observe-only — no
+   * exit predicate reads it.
+   */
+  chandelierStopNonReconstructionReason?: 'ratchet_held_prior_level' | 'stop_predates_basis_stamp';
   /**
    * TRA-3217 — true while the chandelier stop is breached on ticks where the
    * exit decision is structurally unable (TRA-483 PDT hold, TRA-495/1136 swing

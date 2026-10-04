@@ -159,4 +159,42 @@ describe('summarizeSma200Sweeps (TRA-4457 — publishing the sweep census)', () 
     expect(r.unpublished).toBe(1);
     expect(r.graded).toBe(1);
   });
+
+  // ── TRA-5065 — the provider attribution ──────────────────────────────────
+  it('folds servedPrimary / servedFallback so "who served" survives the fleet Σ', () => {
+    const r = summarizeSma200Sweeps(
+      [
+        engine(census({
+          considered: 100, evaluated: 100, servedFallback: 100, servedPrimary: 0,
+        }), 'SWEPT'),
+        engine(census({
+          considered: 100, evaluated: 60, servedFallback: 20, servedPrimary: 40,
+          starvedBreakerOpen: 40, starvedFallbackBudget: 40,
+        }), 'SWEPT'),
+      ],
+      NOW,
+    );
+    // The pair this ticket exists to make readable: the fleet SWEPT, and it
+    // swept because TRADIER carried it.
+    expect(r.totals.servedFallback).toBe(120);
+    expect(r.totals.servedPrimary).toBe(40);
+    expect(r.totals.starvedFallbackBudget).toBe(40);
+    expect(r.totals.servedUnpublished).toBe(0);
+  });
+
+  it('ABSENT ≠ ZERO: a graded pre-TRA-5065 census counts as unpublished, not as "Tradier served nothing"', () => {
+    const r = summarizeSma200Sweeps(
+      [
+        // Carries the TRA-4457 census but none of the provider keys.
+        engine(census({ considered: 400, starvedBreakerOpen: 400 }), 'BLIND'),
+        engine(census({ considered: 100, evaluated: 100, servedFallback: 100 }), 'SWEPT'),
+      ],
+      NOW,
+    );
+    expect(r.graded).toBe(2);
+    expect(r.totals.servedUnpublished).toBe(1);
+    // …so `servedFallback: 100` is a LOWER BOUND over a partial fleet, and the
+    // reader is told so rather than reading it as the whole fleet's number.
+    expect(r.totals.servedFallback).toBe(100);
+  });
 });

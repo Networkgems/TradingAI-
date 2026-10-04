@@ -90,7 +90,10 @@ import { resetSweepCursors, sweepCursorSnapshot, type SweepPass } from './tick-s
 import { summarizeRvScanPath, __resetRvScanTelemetry } from './rv-scan-telemetry.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
+// TRA-5037 — the fixture-is-live control for the blank-DATA_DIR recorder test below
+// must go through the REAL resolveDemoFlagEnv, not a local mirror of it.
+import { resolveDemoFlagEnv } from './demo-flags.js';
 // TRA-4692 — the TRA-4650 equity-seam admit runs every live bracket through the
 // hard-controls choke point, whose kill/day-loss/idempotency state is module-
 // global AND disk-persisted (48h retention). The bracket fixtures pin a fresh
@@ -7971,8 +7974,20 @@ describe('SignalEngine — IV-RV mispriced routing (TRA-1203)', () => {
 describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
   type ChurnInternals = {
     mode: 'demo' | 'live';
-    churnOpenCapVerdict: (symbol: string, now?: number) => { blocked: boolean; count: number; cap: number };
-    recordChurnOpen: (symbol: string, sleeve?: 'directional' | 'other', now?: number) => void;
+    // TRA-5026 — `assetClass` is required on BOTH, and declared here as required on
+    // purpose: a seam that declares it optional lets this suite keep compiling while
+    // the real chokepoints drift out of the split (and silently grades `unknown`).
+    churnOpenCapVerdict: (
+      symbol: string,
+      assetClass: 'equity' | 'option',
+      now?: number,
+    ) => { blocked: boolean; count: number; cap: number };
+    recordChurnOpen: (
+      symbol: string,
+      assetClass: 'equity' | 'option',
+      sleeve?: 'directional' | 'other',
+      now?: number,
+    ) => void;
     isSameDayLoser: (realizedToday: number, unrealized: number) => boolean;
     realizedEquityPnlToday: (symbol: string, etDay: string) => number;
     allClosedPositions: Array<{ symbol: string; pnl?: number; closedAt?: number; mode?: 'demo' | 'live' }>;
@@ -8003,8 +8018,8 @@ describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
     const inner = engine as unknown as ChurnInternals;
     delete process.env.ENABLE_CHURN_LOSS_BRAKE;
     // Even after many opens the cap never binds while dark.
-    for (let i = 0; i < 10; i++) inner.recordChurnOpen('GIS');
-    expect(inner.churnOpenCapVerdict('GIS').blocked).toBe(false);
+    for (let i = 0; i < 10; i++) inner.recordChurnOpen('GIS', 'equity');
+    expect(inner.churnOpenCapVerdict('GIS', 'equity').blocked).toBe(false);
   });
 
   it('blocks a NEW open once a name hits the cap (default N=3); other names are independent', () => {
@@ -8013,14 +8028,14 @@ describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
     const inner = engine as unknown as ChurnInternals;
 
     // 0,1,2 opens all admitted; the 3rd puts the name at the cap and the next is blocked.
-    expect(inner.churnOpenCapVerdict('GIS')).toMatchObject({ blocked: false, count: 0, cap: 3 });
-    inner.recordChurnOpen('GIS');
-    inner.recordChurnOpen('GIS');
-    expect(inner.churnOpenCapVerdict('GIS')).toMatchObject({ blocked: false, count: 2 });
-    inner.recordChurnOpen('GIS'); // count → 3 == cap
-    expect(inner.churnOpenCapVerdict('GIS')).toMatchObject({ blocked: true, count: 3, cap: 3 });
+    expect(inner.churnOpenCapVerdict('GIS', 'equity')).toMatchObject({ blocked: false, count: 0, cap: 3 });
+    inner.recordChurnOpen('GIS', 'equity');
+    inner.recordChurnOpen('GIS', 'equity');
+    expect(inner.churnOpenCapVerdict('GIS', 'equity')).toMatchObject({ blocked: false, count: 2 });
+    inner.recordChurnOpen('GIS', 'equity'); // count → 3 == cap
+    expect(inner.churnOpenCapVerdict('GIS', 'equity')).toMatchObject({ blocked: true, count: 3, cap: 3 });
     // A different underlier is unaffected by GIS's churn.
-    expect(inner.churnOpenCapVerdict('AAPL').blocked).toBe(false);
+    expect(inner.churnOpenCapVerdict('AAPL', 'equity').blocked).toBe(false);
   });
 
   it('honours the CHURN_SAME_SESSION_OPEN_CAP override', () => {
@@ -8028,9 +8043,9 @@ describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
     process.env.CHURN_SAME_SESSION_OPEN_CAP = '1';
     const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
     const inner = engine as unknown as ChurnInternals;
-    expect(inner.churnOpenCapVerdict('GIS').cap).toBe(1);
-    inner.recordChurnOpen('GIS');
-    expect(inner.churnOpenCapVerdict('GIS').blocked).toBe(true);
+    expect(inner.churnOpenCapVerdict('GIS', 'equity').cap).toBe(1);
+    inner.recordChurnOpen('GIS', 'equity');
+    expect(inner.churnOpenCapVerdict('GIS', 'equity').blocked).toBe(true);
   });
 
   it('never binds on the LIVE path (demo-scoped by construction)', () => {
@@ -8038,9 +8053,9 @@ describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
     process.env.CHURN_SAME_SESSION_OPEN_CAP = '1';
     const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live' });
     const inner = engine as unknown as ChurnInternals;
-    inner.recordChurnOpen('GIS'); // no-op on live
-    inner.recordChurnOpen('GIS');
-    expect(inner.churnOpenCapVerdict('GIS').blocked).toBe(false);
+    inner.recordChurnOpen('GIS', 'equity'); // no-op on live
+    inner.recordChurnOpen('GIS', 'equity');
+    expect(inner.churnOpenCapVerdict('GIS', 'equity').blocked).toBe(false);
   });
 
   it('same-day-loss test: net-negative (realized + unrealized) halts, non-negative allows', () => {
@@ -10703,12 +10718,15 @@ describe('TRA-4424 — the OTM setup seam reads a DAILY series, off the order pa
   // feed stall would become an entry stall on a live order path.
   //
   // ⚠️ MEASURED, NOT ASSUMED: `runOtmScan` DOES reach `fetchDailyCandles` — once
-  // per OPEN, at `OTM_DAILY_ATR_BARS = 40`, from `stampOtmAtrInvalidation`
-  // (TRA-3943). That call is POST-FILL and pre-dates this item; it is not the
-  // seam. So the assertion is not "the scan never fetches" (false, and a test
-  // written to that belief would have been a lie the first time it ran) but
-  // "no fetch happens BEFORE the taxonomy scores" — which is the property that
-  // actually keeps latency off the nomination path.
+  // per OPEN, at `MTF_DAILY_BARS = 260`, from `stampOtmAtrInvalidation`
+  // (TRA-3943; depth raised from 40 by TRA-4989, implementing the TRA-4943
+  // ruling — `atr()` smooths to the END of the series, so 40 was a contaminated
+  // read of the same 14-period average, not a shorter one). That call is
+  // POST-FILL and pre-dates this item; it is not the seam. So the assertion is
+  // not "the scan never fetches" (false, and a test written to that belief would
+  // have been a lie the first time it ran) but "no fetch happens BEFORE the
+  // taxonomy scores" — which is the property that actually keeps latency off the
+  // nomination path.
   it('the SEAM never fetches — the nominee is scored before any daily call the scan makes', async () => {
     vi.mocked(fetchDailyCandles).mockResolvedValue(bars(40, DAY_MS));
     const engine = otmEngine();
@@ -10717,11 +10735,13 @@ describe('TRA-4424 — the OTM setup seam reads a DAILY series, off the order pa
     await runOtm(engine, ['AAPL']);
 
     const calls = vi.mocked(fetchDailyCandles).mock.calls;
-    // The only daily call on this path is TRA-3943's post-fill ATR pull, at its
-    // own depth — never `OTM_DAILY_SERIES_BARS`.
-    expect(calls.every(([, n]) => n === 40)).toBe(true);
+    // The only daily call on this path is TRA-3943's post-fill ATR pull, at
+    // `MTF_DAILY_BARS` — never `OTM_DAILY_SERIES_BARS` (120), which is what the
+    // seam would request. The two depths stay distinct after TRA-4989 raised the
+    // ATR pull to 260, so this still discriminates.
+    expect(calls.every(([, n]) => n === 260)).toBe(true);
     // ⛔ AND THE VERDICT WAS COMPUTED OFF THE COLD CACHE. If the seam had
-    // fetched, this would read the 40 bars it just pulled instead.
+    // fetched, this would read the bars it just pulled instead.
     expect(lastVerdict()!.readState).toBe('absent');
     expect(lastVerdict()!.reasonCode).toBe('series_unreadable');
     expect(lastVerdict()!.bars).toBe(0);
@@ -11083,5 +11103,75 @@ describe('TRA-4654 — decision panel assembles off the card ring with engine-ow
     engine.clearSignals();
     // After a feed clear the card is gone WITH its panel — no stale proposal survives.
     expect(engine.getDecisionPanel('tra4654-eq-1')).toBeNull();
+  });
+});
+
+// TRA-5037 — the RECORDER's own env resolution must treat a blank-but-present
+// DATA_DIR as unset. This is the site where the ineffective arm actually happens:
+// the writer (`index.ts` → `writeDemoFlagFile(resolveDataDir(), …)`) TRIMS, so with
+// `DATA_DIR=' '` the arm lands in `<bundle>/data/demo-flags.json` while a
+// truthiness-gated reader resolves `" "/demo-flags.json` — write returns 200, flag
+// never reaches the engine.
+//
+// ⚠️ A test that only sets `DATA_DIR=' '` and asserts the safe outcome passes
+// against the defect too (a MISSING overlay also falls back to process.env). The
+// planted `<tmp>/" "/demo-flags.json` fixture below, proven live through the real
+// `resolveDemoFlagEnv`, is what makes the assertion discriminate.
+describe('TRA-5037 blank DATA_DIR on SignalEngine.resolveDemoFlagEnv (the recorder)', () => {
+  const FLAG = 'EXIT_RISK_RULES_ENABLED'; // allowlisted; read by the exit-risk master gate
+  let tmp: string | null = null;
+  let cwd0: string | null = null;
+  let dataDir0: string | undefined;
+  let flag0: string | undefined;
+
+  const recorderEnv = (): NodeJS.ProcessEnv => {
+    const engine = new SignalEngine();
+    return (
+      engine as unknown as { resolveDemoFlagEnv: () => NodeJS.ProcessEnv }
+    ).resolveDemoFlagEnv();
+  };
+
+  beforeEach(() => {
+    dataDir0 = process.env.DATA_DIR;
+    flag0 = process.env[FLAG];
+    tmp = mkdtempSync(join(tmpdir(), 'tra5037-se-'));
+    delete process.env[FLAG];
+    delete process.env.DATA_DIR;
+  });
+
+  afterEach(() => {
+    if (cwd0) process.chdir(cwd0);
+    cwd0 = null;
+    if (dataDir0 === undefined) delete process.env.DATA_DIR;
+    else process.env.DATA_DIR = dataDir0;
+    if (flag0 === undefined) delete process.env[FLAG];
+    else process.env[FLAG] = flag0;
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    tmp = null;
+  });
+
+  it('BLANK ⇒ treated as UNSET: the planted " " overlay is live, yet the recorder must ignore it', () => {
+    cwd0 = process.cwd();
+    mkdirSync(join(tmp!, ' '), { recursive: true });
+    writeFileSync(join(tmp!, ' ', 'demo-flags.json'), JSON.stringify({ [FLAG]: '1' }), 'utf8');
+    process.chdir(tmp!);
+
+    // FIXTURE IS LIVE — the pre-TRA-5037 idiom (`' '` is truthy ⇒ resolveDemoFlagEnv(' '))
+    // demonstrably reads that file from here. Negative control, anchored to the REAL
+    // resolveDemoFlagEnv; without it the assertions below pass against the defect.
+    expect(resolveDemoFlagEnv(' ', {} as NodeJS.ProcessEnv)[FLAG]).toBe('1');
+
+    process.env.DATA_DIR = ' ';
+    expect(recorderEnv()[FLAG]).toBeUndefined();
+
+    // Blank is UNSET, not "overlay off": process.env still arms the recorder.
+    process.env[FLAG] = '1';
+    expect(recorderEnv()[FLAG]).toBe('1');
+
+    // `''` is the other blank spelling (already falsy under the old idiom — pinned so
+    // a future `!= null` "simplification" cannot un-fix it).
+    delete process.env[FLAG];
+    process.env.DATA_DIR = '';
+    expect(recorderEnv()[FLAG]).toBeUndefined();
   });
 });

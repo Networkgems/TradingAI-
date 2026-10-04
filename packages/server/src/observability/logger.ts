@@ -23,9 +23,12 @@ export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 const LEVEL_RANK: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 
 /** Where the on-disk log files live. Defaults under DATA_DIR so they land on
- *  the Render persistent disk rather than the ephemeral build directory. */
+ *  the Render persistent disk rather than the ephemeral build directory.
+ *  TRA-5037 — `||` over trimmed values, not `??`: `??` only guards
+ *  null/undefined, so a blank-but-present value (`' '`, bqb1 has reached it
+ *  twice) sent the log tree to `" "/logs` instead of the cwd fallback. */
 export const LOG_DIR =
-  process.env['LOG_DIR'] ?? join(process.env['DATA_DIR'] ?? process.cwd(), 'logs');
+  process.env['LOG_DIR']?.trim() || join(process.env['DATA_DIR']?.trim() || process.cwd(), 'logs');
 
 const APP_LOG_FILE = join(LOG_DIR, 'app.jsonl');
 

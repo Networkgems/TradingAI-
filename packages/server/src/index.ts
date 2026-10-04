@@ -36,7 +36,9 @@ import {
   WS_TICKET_TTL_MS,
 } from './ws-auth.js';
 import { cspReportRouter, initCspReportStore } from './csp-report-collector.js';
-import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
+// TRA-4998 — `stampLegacyRateBasis` is the read-time half of defect B; see
+// `stampReportOnRead` for why it lives at the response boundary.
+import { generateEodReport, wouldClobberSettledReport, stampLegacyRateBasis } from './reports/eod-report.js';
 import { decideEodReportWrite } from './reports/eod-write-gate.js';
 // TRA-2631 / TRA-3063 — read-time provenance stamp for stored top-movers rows.
 import { annotateReportProvenance } from './reports/mover-provenance.js';
@@ -256,7 +258,7 @@ import {
 } from './options-ideas-credit-width-ledger.js';
 import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
-import { hydrateChurnBrakeGuardFromDisk } from './churn-brake-ledger.js';
+import { hydrateChurnBrakeGuardFromDisk, churnBrakeGuardSharedTapeSpec } from './churn-brake-ledger.js';
 import { hydrateEquityEntryFunnelFromDisk } from './equity-entry-funnel-ledger.js';
 import { hydrateRvScanCensusFromDisk } from './rv-scan-census-ledger.js'; // TRA-4350
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
@@ -271,7 +273,7 @@ import {
 } from './cost-aware-gate-ledger.js';
 // TRA-4628 — the OTM candidate-admission tape (admitted AND refused scanner
 // candidates), hydrated at boot so a post-close read spans the whole session.
-import { hydrateOtmAdmissionTapeFromDisk } from './otm-admission-tape.js';
+import { hydrateOtmAdmissionTapeFromDisk, otmAdmissionTapeSharedTapeSpec } from './otm-admission-tape.js';
 // TRA-3434 — boot warm for the TRA-3391 tape-expectancy fold the live cost bar
 // admits on. Without it the first candidates after every process start decline
 // blind under a reason code that reads exactly like a measured verdict.
@@ -293,7 +295,17 @@ import {
 } from './boot-arm-repair-ledger.js';
 import { hydrateOptionsBreakerLedgerFromDisk, summarizeOptionsBreakerLedger } from './options-breaker-ledger.js'; // TRA-3218
 import { hydrateMarkSanityFromDisk } from './option-mark-sanity.js'; // TRA-2945
-import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
+import { hydrateLiveEnforceGateFromDisk, liveEnforceGateSharedTapeSpec } from './live-enforce-gate-ledger.js';
+// TRA-5038 — ONE shared periodic compaction hook for the four exposed tapes above.
+import {
+  SHARED_TAPE_COMPACTION_INTERVAL_MS,
+  measureSharedTapeSpan,
+  noteSharedTapeCompactionArmed,
+  registerSharedTape,
+  registeredSharedTapes,
+  runSharedTapeCompactionPass,
+  sharedTapeCompactionState,
+} from './shared-tape-compaction.js';
 import { registerHardControlRoutes } from './hard-controls-routes.js'; // TRA-4655
 import { bindHardControlsToEngines } from './hard-controls-bridge.js'; // TRA-4650
 import { registerPaperTradingRoutes } from './paper-trading-routes.js'; // TRA-4657
@@ -337,6 +349,8 @@ import {
   setBoundExerciseDataDir,
   summarizeBoundExercise,
 } from './tra3926-bound-exercise-store.js';
+// TRA-5061 — the durable half of the side-by-side chandelier ATR shadow.
+import { setChandelierAtrShadowDataDir } from './tra5061-chandelier-atr-shadow-store.js';
 // TRA-4476 — the durable half of the unknown-outcome state machine: a pre-submit
 // intent journal that survives a restart, and the health readout for the halt.
 import {
@@ -713,7 +727,9 @@ import {
   isReversalShadowEnabled,
   reversalHitRateByScore,
   reversalShadowCompaction,
+  reversalShadowSharedTapeSpec,
   REVERSAL_SHADOW_RETENTION_DAYS,
+  REVERSAL_SHADOW_TAPE,
 } from './reversal-shadow-ledger.js';
 import {
   initPreTradeGateLedger,
@@ -1053,6 +1069,7 @@ import {
   type ResearchReport,
   type EodReport,
   type EodMover,
+  type EodSignalAccuracy, // TRA-4998 — `stampReportOnRead`'s structural constraint
   type Position,
   type OptionPosition,
   ALERT_CHANNELS,
@@ -2589,6 +2606,18 @@ async function generateAndSaveReport(
         date: finalReport.date,
         symbols: finalSnapshot.state?.symbols ?? [],
         usersRoot: join(DATA_DIR, 'users'),
+        // TRA-5036 — the roster the ledger eviction's registry reservation is
+        // denominated in. THE SAME expression `getRegistryBooks` hands the
+        // census route, so the published eviction queue and the sweep that
+        // acts on it are tiered off one roster rather than two.
+        //
+        // `usersRoot` stays enumerated from DIRECTORIES (TRA-3064): the roster
+        // is used ONLY to move a book LATER in the queue, never to decide what
+        // exists and never to decide what to delete. A book missing from it is
+        // evicted exactly as it is today; a book present in it is protected.
+        // So an incomplete roster costs protection, never data — which is why a
+        // registry this module elsewhere declines to trust is admissible here.
+        registryBooks: getAllUsers().map((u) => u.username),
         log,
       });
     } catch (err) {
@@ -4546,8 +4575,14 @@ async function buildLiveTodayCellReport(
     availableCash: 0,
     trades: [],
     openPositionCount: 0,
-    winRate: 0,
-    avgRR: 0,
+    // TRA-4998 residual — `null`, not 0. This intraday cell carries `trades: []` and
+    // `totalTrades: 0` by construction (it is a BALANCE delta, not a trade fold), so a
+    // `0` here is the ticket's defect verbatim: measured on prod `afe4e34a` the live
+    // 2026-10-02 cell served `totalTrades: 0, winRate: 0, avgRR: 0` while its own
+    // `signalAccuracy` block two lines below correctly said `null`. One of the two
+    // sibling stubs got fixed and this one did not.
+    winRate: null,
+    avgRR: null,
     totalTrades: 0,
     winners: 0,
     losers: 0,
@@ -5109,6 +5144,17 @@ setJudgedOversoldDataDir(DATA_DIR);
 // an unset dir makes every capture a silent no-op, and the population this
 // records is the one that only ever appears on real money.
 setBoundExerciseDataDir(DATA_DIR);
+
+// TRA-5061 — and the side-by-side chandelier ATR shadow, for the same reason in
+// a different shape: the question it answers ("how often would the DAILY trail
+// have had a level at all?") is a RATE OVER SESSIONS, and a since-boot counter
+// cannot accumulate one. This process routinely boots mid-week after the prior
+// close, which is exactly why the live surface's own `sessionCoverage` reads
+// `boot_after_close` / `vacuous` (TRA-4343). Armed here, not lazily: an unset
+// dir silently degrades the instrument to the boot-scoped counter it replaces,
+// and the arming stamp written by this call is what lets a reader date a zero
+// instead of mistaking a 90-second-old store for a ten-session never.
+setChandelierAtrShadowDataDir(DATA_DIR);
 
 // TRA-3939 — ARM THE TWO CAPTURES. Both stores hang off the same resolved
 // DATA_DIR and neither is compacted (see the module docblock: they hold evidence
@@ -9736,14 +9782,14 @@ app.post('/api/auth/ws-ticket', requireAuth, (_req, res) => {
 });
 
 /**
- * TRA-4488 — WS auth counters, including whether the legacy `?token=` door is
- * still open and how many upgrades have come through it.
+ * TRA-4488 — WS ticket counters. The legacy `?token=` door and its counters are
+ * gone (TRA-4492), so a ticket is the only credential an upgrade can carry.
  *
- * ⚠ `legacyTokenUpgrades` is SINCE-BOOT. Reading 0 here is not clearance to
- * delete the compat branch — bqb1's watchdog restarts the process without any
- * deploy record (TRA-2203/TRA-2261), so a fresh 0 and a genuinely unused door
- * are the same number. `ws-auth.ts` emits one log line per legacy upgrade
- * precisely so the question is answered off the Render log tape instead.
+ * ⚠ These counters are SINCE-BOOT and bqb1's watchdog restarts the process
+ * without writing any deploy record (TRA-2203/TRA-2261), so a 0 here never
+ * discriminates "nothing happened" from "the process restarted a second ago".
+ * That is why the TRA-4492 removal was graded off the Render log tape and not
+ * off this route — see `UpgradeCredential` in `ws-auth.ts`.
  */
 app.get('/api/health/ws-auth', requireAuth, (_req, res) => {
   res.json(wsAuthCounters());
@@ -11422,6 +11468,12 @@ app.get('/api/health/reversal-shadow-signals', async (req, res) => {
       // one that works.
       retentionDays: REVERSAL_SHADOW_RETENTION_DAYS,
       compaction: reversalShadowCompaction(),
+      // TRA-5038 AC3 — `compaction` above is the BOOT hook's outcome; this is the
+      // shared PERIODIC hook, with the same four-state arm-derived enum every other
+      // registered tape publishes. Read `sharedCompaction.hookState`, not a fire
+      // count: `timer_not_armed` is the alarm and every other field here still reads
+      // healthy in that state. `sharedCompaction.span.fill` is the AC1 answer.
+      sharedCompaction: sharedTapeCompactionState(REVERSAL_SHADOW_TAPE),
       count: signals.length,
       hitRateByScore: reversalHitRateByScore(signals),
       signals,
@@ -15401,6 +15453,28 @@ function stampMoverProvenance<T extends { top5Movers?: EodMover[]; markdown?: st
   );
 }
 
+// TRA-4998 residual — the SAME response-boundary discipline, for the same reason.
+//
+// `stampMoverProvenance`'s header states why the movers filter lives here and not in
+// the readers: one call per serving path, so a new branch cannot quietly ship an
+// unstamped surface. The legacy rate-basis stamp has identical shape — a write-side
+// fix that cannot reach 108 archived cells — so it composes into the same boundary
+// rather than being sprinkled at the three `JSON.parse(...) as EodReport` sites, one
+// of which is the WS handshake (TRA-2631's "an unstamped socket surface beside a
+// stamped HTTP one is the partial fix that reads as complete").
+//
+// It is a strict no-op on a freshly built cell: those already carry `winRateBasis`.
+function stampReportOnRead<T extends {
+  top5Movers?: EodMover[];
+  markdown?: string;
+  totalTrades?: number;
+  winRate?: number | null;
+  avgRR?: number | null;
+  signalAccuracy?: EodSignalAccuracy;
+}>(report: T): T {
+  return stampMoverProvenance(stampLegacyRateBasis(report));
+}
+
 app.get('/api/reports/latest', requireAuth, async (req, res) => {
   const ctx = await userCtx(res);
   const mode = resolveStockReportMode(req, ctx.username);
@@ -15420,7 +15494,7 @@ app.get('/api/reports/latest', requireAuth, async (req, res) => {
       ctx, mode,
       await stampStaleBalanceAnchorAudit(ctx, mode, JSON.parse(raw) as EodReport),
     );
-    res.json(stampMoverProvenance(latest));
+    res.json(stampReportOnRead(latest));
   } catch {
     res.status(500).json({ error: 'Failed to read report' });
   }
@@ -15596,7 +15670,7 @@ app.get('/api/reports/desk/:date', requireAuth, requireAdmin, async (req, res) =
       res.status(404).json({ error: `No desk report for ${date}` });
       return;
     }
-    res.json(stampMoverProvenance(cell));
+    res.json(stampReportOnRead(cell));
   } catch (err) {
     log.warn('desk calendar day read failed', {
       date,
@@ -15637,7 +15711,7 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
     try {
       const liveToday = await buildLiveTodayCellReport(ctx, mode);
       if (liveToday) {
-        res.json(stampMoverProvenance(liveToday));
+        res.json(stampReportOnRead(liveToday));
         return;
       }
     } catch (err) {
@@ -15678,7 +15752,7 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
         // this fold (TRA-4199). `stampFirmWideDemoFoldScope` is the ONLY thing
         // this ticket changes on the fold path: it adds `cellScope`, and touches
         // neither the arithmetic above nor the gate above that.
-        res.json(stampMoverProvenance(stampFirmWideDemoFoldScope(cell)));
+        res.json(stampReportOnRead(stampFirmWideDemoFoldScope(cell)));
         return;
       }
     } catch (err) {
@@ -15700,7 +15774,7 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
   // 69 stored live cells are not, and the clobber guard means the write path can
   // never rewrite them either.
   res.json(
-    stampMoverProvenance(
+    stampReportOnRead(
       await stampBrokerSourceAudit(ctx, mode, await stampStaleBalanceAnchorAudit(ctx, mode, personal)),
     ),
   );
@@ -19465,9 +19539,10 @@ httpServer.on('upgrade', (req, socket, head) => {
   //
   // It used to be inline here, reading a FULL 24h session token out of
   // `?token=` — i.e. out of the request line, which is what every proxy access
-  // log records. It now prefers a single-use 30s `?ticket=` minted by
-  // `POST /api/auth/ws-ticket`, and accepts `?token=` for one deploy window so
-  // an in-flight client is not cut off mid-session.
+  // log records. It now takes a single-use 30s `?ticket=` minted by
+  // `POST /api/auth/ws-ticket`, and nothing else: the `?token=` compat window
+  // TRA-4488 opened was closed by TRA-4492 once the Render tape graded clean,
+  // so a token-bearing upgrade is simply `no_credential`.
   //
   // The TRA-2421 account-existence check (a deleted user must not reach
   // `ensureUserContext` through the WS, which would re-create the data
@@ -19507,7 +19582,7 @@ wss.on('connection', async (ws) => {
       // partial fix that reads as complete.
       ws.send(JSON.stringify({
         type: 'eod_report',
-        payload: stampMoverProvenance(JSON.parse(raw) as EodReport),
+        payload: stampReportOnRead(JSON.parse(raw) as EodReport),
       }));
     } catch { /* ignore */ }
   }
@@ -19752,6 +19827,51 @@ costAwareGateCompactionTimer.unref?.();
 // health route cannot tell "not due yet" from "never wired", and "never wired" is the
 // defect TRA-4904 is fixing.
 noteCostAwareGateCompactionTimerArmed();
+
+// ── TRA-5038 — ONE shared periodic compaction for the other four exposed tapes ──
+//
+// TRA-4904 (above) shipped a per-ledger timer because `cost-aware-gate.jsonl` was the
+// only exposed tape, and it ruled the four below did NOT need one — naming ~150 MiB of
+// headroom as a trigger that would flip the answer. Headroom reached 141.7 MiB in seven
+// days, so they need it now.
+//
+// It is ONE registry and ONE interval on purpose. Four bespoke copies of the timer +
+// `hookState` enum would be four chances to ship a retention whose hook was never
+// armed and whose payload reads healthy anyway — which is the exact failure the enum
+// exists to expose. Each tape contributes only its path and its PREDICATE, and the
+// predicates genuinely differ: three retain by age, `otm-admission-tape` by a 144 MiB
+// byte ceiling pruned on whole ET-day boundaries.
+for (const spec of [
+  liveEnforceGateSharedTapeSpec(),
+  churnBrakeGuardSharedTapeSpec(),
+  reversalShadowSharedTapeSpec(),
+  otmAdmissionTapeSharedTapeSpec(),
+]) {
+  registerSharedTape(spec);
+}
+const sharedTapeCompactionTimer = setInterval(() => {
+  void runSharedTapeCompactionPass().catch((err) => {
+    log.warn('TRA-5038 shared tape compaction pass failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  });
+}, SHARED_TAPE_COMPACTION_INTERVAL_MS);
+sharedTapeCompactionTimer.unref?.();
+noteSharedTapeCompactionArmed();
+// Measure the span WITHOUT rewriting, so TRA-5038 AC1 ("is each tape at its 30-day
+// steady state or still filling?") is answerable from the health routes immediately.
+// It has to happen here rather than inside the first fire: bqb1's uptime is routinely
+// under one 6h interval, so a span published only inside a fire outcome would be
+// unreadable on the one host that matters. Each owner's own boot compaction has
+// already run by this point, so what gets measured is the post-compaction file —
+// which is the file the AC asks about.
+void Promise.all(registeredSharedTapes().map((tape) => measureSharedTapeSpan(tape))).catch(
+  (err) => {
+    log.warn('TRA-5038 shared tape boot span measure failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  },
+);
 
 // ── Static frontend (production web) ────────────────────────────────────────
 const DIST_DIR = join(__dirname, '..', '..', '..', 'apps', 'desktop', 'dist');

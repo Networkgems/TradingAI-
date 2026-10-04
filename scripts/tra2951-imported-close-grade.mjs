@@ -40,7 +40,6 @@
  * Exit codes: 0 PASS · 1 FAIL · 2 NO-RUN (nothing to grade) · 3 BLIND (refusing).
  */
 
-import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';

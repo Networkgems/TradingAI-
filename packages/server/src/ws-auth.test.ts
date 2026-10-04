@@ -39,7 +39,6 @@ import {
   consumeWsTicket,
   issueWsTicket,
   resetWsAuthCountersForTest,
-  resolveLegacyTokenAccepted,
   revokeWsTicketsFor,
   wsAuthCounters,
   wsTicketsOutstanding,
@@ -61,7 +60,7 @@ interface Harness {
   accepted: string[];
 }
 
-async function startHarness(opts: { allowLegacyToken?: boolean } = {}): Promise<Harness> {
+async function startHarness(): Promise<Harness> {
   const accepted: string[] = [];
   const server = createServer((_req, res) => { res.writeHead(404); res.end(); });
   const wss = new WebSocketServer({ noServer: true });
@@ -69,7 +68,6 @@ async function startHarness(opts: { allowLegacyToken?: boolean } = {}): Promise<
   server.on('upgrade', (req, socket, head) => {
     const decision = authenticateUpgrade(req.url, {
       userExists: (u) => existingUsers.has(u),
-      ...(opts.allowLegacyToken === undefined ? {} : { allowLegacyToken: opts.allowLegacyToken }),
     });
     if (!decision.ok) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -253,51 +251,77 @@ describe('TRA-4488 WS upgrade over a real socket — ticket path', () => {
   });
 });
 
-describe('TRA-4488 legacy ?token= compatibility window', () => {
-  it('still accepts a valid session token while the window is open', async () => {
-    harness = await startHarness({ allowLegacyToken: true });
+describe('TRA-4492 the legacy ?token= door is GONE', () => {
+  // The discriminator in every case below is that the token is REAL —
+  // `createToken(USER)` mints exactly what `requireAuth` would accept on the
+  // header. So a refusal is the URL SHAPE being rejected, not an invalid
+  // credential. A test that fed garbage here would pass identically against the
+  // old accepting branch and prove nothing about the deletion.
+  it('refuses a VALID session token presented as ?token=', async () => {
+    harness = await startHarness();
     const token = createToken(USER);
 
     const out = await connect(`${harness.url}/?token=${encodeURIComponent(token)}`);
 
-    expect(out).toEqual({ ok: true, username: USER });
-    expect(wsAuthCounters()['legacyTokenUpgrades']).toBe(1);
+    expect(out.ok).toBe(false);
+    expect(harness.accepted).toEqual([]);
   });
 
-  it('refuses the same token once the window is shut', async () => {
-    harness = await startHarness({ allowLegacyToken: false });
+  it('reports a ?token= upgrade as no_credential, the reason that absorbed the legacy arm', () => {
     const token = createToken(USER);
 
-    const out = await connect(`${harness.url}/?token=${encodeURIComponent(token)}`);
+    // Asserted on the function rather than through the socket because the
+    // refusal reason never reaches the wire (the handler writes a bare 401).
+    // `bad_token` and `legacy_disabled` are gone from the enum, so a tokenless
+    // and a token-bearing upgrade are now the same case.
+    expect(authenticateUpgrade(`/?token=${encodeURIComponent(token)}`, {
+      userExists: () => true,
+    })).toEqual({ ok: false, reason: 'no_credential' });
 
-    // Same bytes as the passing case above, so this is the switch and nothing
-    // else. That pairing is what makes `WS_LEGACY_TOKEN_QUERY=off` a usable
-    // lever rather than a claim.
-    expect(out.ok).toBe(false);
-    expect(wsAuthCounters()['legacyTokenRefused']).toBe(1);
-    expect(wsAuthCounters()['legacyTokenUpgrades']).toBe(0);
+    expect(authenticateUpgrade('/', { userExists: () => true }))
+      .toEqual({ ok: false, reason: 'no_credential' });
   });
 
-  it('refuses a garbage token even while the window is open', async () => {
-    harness = await startHarness({ allowLegacyToken: true });
-
-    const out = await connect(`${harness.url}/?token=forged.signature`);
-
-    expect(out.ok).toBe(false);
-    expect(wsAuthCounters()['legacyTokenUpgrades']).toBe(0);
-  });
-
-  it('prefers the ticket when both are present, and does not fall back to the token when the ticket is bad', async () => {
-    harness = await startHarness({ allowLegacyToken: true });
+  it('does not fall back to a valid token when the ticket is bad', async () => {
+    harness = await startHarness();
     const token = createToken(USER);
 
     const out = await connect(`${harness.url}/?ticket=forged&token=${encodeURIComponent(token)}`);
 
-    // A fallback here would make every refusal above bypassable by appending a
-    // session token — i.e. it would reinstate the exact defect while every
-    // ticket test stayed green.
+    // A fallback here would make every ticket refusal bypassable by appending a
+    // session token — i.e. it would reinstate the exact defect TRA-4488 fixed
+    // while every ticket test stayed green.
     expect(out.ok).toBe(false);
-    expect(wsAuthCounters()['legacyTokenUpgrades']).toBe(0);
+    expect(harness.accepted).toEqual([]);
+  });
+
+  it('publishes no legacy counter and no door-state flag', () => {
+    const keys = Object.keys(wsAuthCounters());
+
+    // The counters were never the clearance (they are since-boot), but leaving
+    // a `legacyAccepted: false` on the route would invite exactly that reading
+    // on the next removal.
+    expect(keys).not.toContain('legacyTokenUpgrades');
+    expect(keys).not.toContain('legacyTokenRefused');
+    expect(keys).not.toContain('legacyAccepted');
+  });
+
+  it('ignores WS_LEGACY_TOKEN_QUERY entirely — the kill switch is gone, not defaulted', async () => {
+    const prev = process.env['WS_LEGACY_TOKEN_QUERY'];
+    process.env['WS_LEGACY_TOKEN_QUERY'] = 'on';
+    try {
+      harness = await startHarness();
+      const token = createToken(USER);
+
+      // The switch's documented fail-open value. If any resolver survived the
+      // deletion this is the setting that would re-open the door.
+      const out = await connect(`${harness.url}/?token=${encodeURIComponent(token)}`);
+
+      expect(out.ok).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env['WS_LEGACY_TOKEN_QUERY'];
+      else process.env['WS_LEGACY_TOKEN_QUERY'] = prev;
+    }
   });
 });
 
@@ -353,24 +377,6 @@ describe('TRA-4488 ticket store properties', () => {
   });
 });
 
-describe('TRA-4488 resolveLegacyTokenAccepted', () => {
-  it('defaults to ACCEPT when unset', () => {
-    expect(resolveLegacyTokenAccepted(undefined)).toBe(true);
-    expect(resolveLegacyTokenAccepted('')).toBe(true);
-  });
-
-  it('shuts the door on the off-ish values, case and whitespace insensitive', () => {
-    for (const v of ['off', 'OFF', ' off ', '0', 'false', 'FALSE', 'no']) {
-      expect(resolveLegacyTokenAccepted(v), v).toBe(false);
-    }
-  });
-
-  it('FAILS OPEN on an unrecognised value', () => {
-    // Deliberate. The failure mode of fail-closed here is "a typo logs every
-    // pre-upgrade client out", which is the outage this compat window exists to
-    // prevent. The leak it leaves open is the one the ticket already bounded.
-    for (const v of ['on', 'yes', '1', 'true', 'banana']) {
-      expect(resolveLegacyTokenAccepted(v), v).toBe(true);
-    }
-  });
-});
+// `resolveLegacyTokenAccepted` and its suite were deleted with the door it
+// gated (TRA-4492). The behaviour that replaced it is asserted above, in
+// "TRA-4492 the legacy ?token= door is GONE".

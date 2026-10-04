@@ -32,7 +32,7 @@
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { resolveDataDir } from './data-dir.js';
+import { type EphemeralDataDirReason, ephemeralDataDirReason, resolveDataDir } from './data-dir.js';
 
 export const LIVE_OTM_ONESHOT_GRANT_VAR = 'OPTION_LIVE_OTM_ONESHOT_COSTBAR_BYPASS';
 
@@ -100,8 +100,34 @@ const tallies = {
   consults: 0,
   grants: 0,
   commits: 0,
+  /**
+   * TRA-5020 — spends whose durable write FAILED. A shot burned with no record
+   * on disk: the position is real, the file does not say so, and a restart will
+   * re-grant the book. Previously invisible on every surface — `commits` does
+   * not increment on this path, so the failure rendered as "nothing happened".
+   */
+  commitsFailedDurable: 0,
   refusalsByReason: {} as Record<string, number>,
 };
+
+/**
+ * TRA-5020 — what the first-touch hydrate actually DID, so the health block can
+ * distinguish "the durable record says no book has spent" from "we never got a
+ * durable record to read". Both render `committed: {}`.
+ */
+export type LiveOtmOneShotHydrateOutcome =
+  /** No consult, commit or health read has touched the store yet. */
+  | 'not_run'
+  /** Hydrate ran; no commit file exists. A clean cold start looks like this. */
+  | 'file_absent'
+  /** Hydrate ran and parsed a commit file. The ONLY outcome that PROVES a read. */
+  | 'loaded'
+  /** A file exists and could not be trusted (torn, hand-edited, unparseable). */
+  | 'unreadable';
+
+let hydrateOutcome: LiveOtmOneShotHydrateOutcome = 'not_run';
+/** Rows the hydrate actually loaded off disk — pre-boot spends, measured. */
+let hydratedBooks = 0;
 
 function commitFilePath(): string {
   return join(dataDirOverride ?? resolveDataDir(), COMMIT_STATE_FILENAME);
@@ -111,7 +137,14 @@ function hydrateIfNeeded(): void {
   if (hydrated) return;
   hydrated = true;
   const file = commitFilePath();
-  if (!existsSync(file)) return; // clean cold start — normal
+  if (!existsSync(file)) {
+    // Clean cold start — normal. ⚠️ TRA-5020: this is NOT the same fact as
+    // "no book has spent its shot", and it only means that at all while the
+    // DATA_DIR is durable. On an ephemeral dir the file an earlier build wrote
+    // is simply gone, and this branch is indistinguishable from a first boot.
+    hydrateOutcome = 'file_absent';
+    return;
+  }
   try {
     const raw = JSON.parse(readFileSync(file, 'utf8')) as Partial<CommitFileShape>;
     if (raw && typeof raw === 'object' && raw.committed && typeof raw.committed === 'object') {
@@ -123,14 +156,24 @@ function hydrateIfNeeded(): void {
           // A half-shaped row means the file was hand-edited or torn: refuse
           // to guess which books already spent their shot.
           stateUnreadable = true;
+          // TRA-5020 — `committed` now holds the rows BEFORE the bad one, so it
+          // is a PARTIAL map. Every consult fails closed on the latch, so this
+          // costs no safety; it does mean the health block must never publish
+          // this map as the complete record (see `commitsDurable: null`).
+          hydrateOutcome = 'unreadable';
+          hydratedBooks = Object.keys(committed).length;
           return;
         }
       }
+      hydrateOutcome = 'loaded';
+      hydratedBooks = Object.keys(committed).length;
     } else {
       stateUnreadable = true;
+      hydrateOutcome = 'unreadable';
     }
   } catch {
     stateUnreadable = true;
+    hydrateOutcome = 'unreadable';
   }
 }
 
@@ -252,7 +295,189 @@ export function commitLiveOtmOneShotGrant(
   committed[owner] = { atIso: new Date(nowMs).toISOString(), optionSymbol, card: token.card };
   const durable = persistCommitted();
   if (durable) tallies.commits += 1;
+  // TRA-5020 — count the OTHER branch too. A spend whose write failed burned a
+  // real shot and left no durable trace; before this it incremented nothing and
+  // read exactly like a book that never consulted.
+  else tallies.commitsFailedDurable += 1;
   return durable;
+}
+
+/**
+ * TRA-5020 — the grant block's own provenance verdict. Precedence is
+ * `unreadable > ephemeral > durable`: the fail-closed latch dominates, because
+ * while it is set every consult is refusing and `committed` may be PARTIAL.
+ */
+export type LiveOtmOneShotCounterProvenanceVerdict =
+  /** Tallies boot-scoped; `committed` on a durable dir and trusted. The healthy read. */
+  | 'tallies_boot_scoped_committed_durable'
+  /**
+   * `committed` is on a dir that the next redeploy/re-stage ERASES, so it is
+   * boot-scoped too — there is then NO cross-boot witness on this block at all.
+   */
+  | 'tallies_boot_scoped_committed_ephemeral'
+  /** The fail-closed latch is set: `committed` is not a record of anything. */
+  | 'tallies_boot_scoped_committed_unreadable';
+
+/**
+ * TRA-5020 — says WHICH FIELDS of `oneShotCostBarGrant` survive a restart.
+ *
+ * TRA-4879 solved this one instrument over, and that label is explicitly scoped:
+ * `/api/health/live-enforce-gates` publishes `counterProvenance.scope:
+ * 'top_level'` covering `decisionsRecorded` and `byGate` ONLY, so its
+ * `countersDurable: true` says NOTHING about this block. This block had no label
+ * at all, and rendered two classes of counter side by side:
+ *
+ *   • DURABLE  — `committed`, `stateUnreadable` (persisted, hydrated from disk)
+ *   • SINCE-BOOT — `consults`, `grants`, `commits`, `refusalsByReason`
+ *     (module-level `const tallies`; zeroed by every restart)
+ *
+ * bqb1 reboots ~6x/day, so `commits: 0` read after a reboot is evidence about
+ * NOTHING, while rendering byte-identically to a genuine "the grant was never
+ * spent". Measured on build `73ab002533bc` (a post-close boot) the block read
+ * `commits: 0` beside `committed: {}`; on the build before it the same
+ * process-scoped counter read `consults: 5,907` the same ET day.
+ *
+ * ⛔ Two fields that are NOT the same fact, deliberately kept apart (the TRA-4879
+ * `countersDurable`-vs-`verdict` split):
+ *
+ *   • `committedDurable` describes the STORE — will the next redeploy keep this?
+ *   • `committedLoadedAtBoot` describes THIS READ — did a hydrate actually parse
+ *     a file into these values?
+ *
+ * They can disagree in both directions, and the disagreement is information: a
+ * durable dir on a genuine first boot is `true`/`false`, and an ephemeral dir
+ * that happened to survive a process restart is `false`/`true` — real history it
+ * will lose on the next redeploy.
+ *
+ * ⛔ An UNKNOWN never renders as the safe value. `committedLoadedAtBoot` is
+ * `true` ONLY on `hydrateOutcome: 'loaded'` — a missing file reads `false`
+ * (nothing was loaded) and an untrusted one reads `false` WITH
+ * `stateUnreadable: true`. `commitsDurable` is `null`, never `0`, while the
+ * latch is set, because the surviving map is a prefix of a torn file.
+ */
+export interface LiveOtmOneShotCounterProvenance {
+  issue: 'TRA-5020';
+  /**
+   * Which block this label covers. Named so it can never be read as the
+   * TRA-4879 `top_level` label, whose `covers` does not include these fields.
+   */
+  scope: 'one_shot_cost_bar_grant';
+  /** Per FIELD, because this block mixes two spans. Spelled out, not implied. */
+  covers: { sinceBoot: string; durable: string };
+  /**
+   * STRUCTURAL, not measured: `tallies` is a module-level const with no load
+   * path, so these four counters cannot be anything but boot-scoped.
+   */
+  talliesSinceBoot: true;
+  /** `build.startedAt` — the instant the tallies start at. `null` ⇒ UNKNOWN. */
+  talliesSinceIso: string | null;
+  /** FALSE ⇒ `talliesSinceIso` is unknown, so the tallies' span has no left edge. */
+  talliesSinceStamped: boolean;
+  /** The STORE: resolved and not erased by the next redeploy/re-stage. */
+  committedDurable: boolean;
+  /** Why the store is NOT durable, or `null` when it is (TRA-4896 markers). */
+  committedEphemeralReason: EphemeralDataDirReason;
+  /** MEASURED — a hydrate parsed a commit file into these values. */
+  committedLoadedAtBoot: boolean;
+  /** A commit file was present at first touch. */
+  commitFileFound: boolean;
+  /** Which of the four hydrate exits this read came through. */
+  hydrateOutcome: LiveOtmOneShotHydrateOutcome;
+  /** Rows the hydrate loaded off disk — pre-boot spends, measured. */
+  hydratedBooks: number;
+  /** The resolved commit-file directory. */
+  dataDir: string;
+  /** DURABLE spend count: `Object.keys(committed).length`. `null` = untrusted. */
+  commitsDurable: number | null;
+  /** The boot-scoped tally, under a name that says so. */
+  commitsSinceBoot: number;
+  /**
+   * Spends since boot whose durable write FAILED — a burned shot with no record
+   * on disk. `> 0` is an inconsistency: the position is real and a restart will
+   * re-grant that book.
+   */
+  commitsFailedDurableSinceBoot: number;
+  /** `commitsFailedDurableSinceBoot > 0`, named for the condition it detects. */
+  spentWithoutDurableRecord: boolean;
+  verdict: LiveOtmOneShotCounterProvenanceVerdict;
+  note: string;
+}
+
+/** TRA-5020 — compute the label. Pure over module state + the boot stamp. */
+function describeLiveOtmOneShotCounterProvenance(
+  processStartedAt: string | null,
+): LiveOtmOneShotCounterProvenance {
+  const dataDir = dataDirOverride ?? resolveDataDir();
+  // Grade the dir the commit file ACTUALLY resolves to. When a caller pinned it
+  // (tests, ops), grade that PATH — not the ambient DATA_DIR, which is not where
+  // the bytes are going. `data_dir_unset` would otherwise be reported for a dir
+  // chosen explicitly.
+  const ephemeralEnv: NodeJS.ProcessEnv =
+    dataDirOverride === null ? process.env : { ...process.env, DATA_DIR: dataDirOverride };
+  const committedEphemeralReason = ephemeralDataDirReason(dataDir, ephemeralEnv);
+  const committedDurable = committedEphemeralReason === null;
+  const committedLoadedAtBoot = hydrateOutcome === 'loaded';
+  const commitFileFound = hydrateOutcome === 'loaded' || hydrateOutcome === 'unreadable';
+  const commitsDurable = stateUnreadable ? null : Object.keys(committed).length;
+
+  const verdict: LiveOtmOneShotCounterProvenanceVerdict = stateUnreadable
+    ? 'tallies_boot_scoped_committed_unreadable'
+    : committedDurable
+      ? 'tallies_boot_scoped_committed_durable'
+      : 'tallies_boot_scoped_committed_ephemeral';
+
+  const verdictClause =
+    verdict === 'tallies_boot_scoped_committed_unreadable'
+      ? `⛔ COMMIT STATE UNREADABLE (hydrate: ${hydrateOutcome}) — the fail-closed latch is SET, every consult is refusing \`state_unreadable\`, and \`committed\` may be a PARTIAL prefix of a torn file. \`commitsDurable\` is null, NOT 0. This block currently has NO trustworthy cross-boot witness; an operator must inspect ${join(dataDir, COMMIT_STATE_FILENAME)}.`
+      : verdict === 'tallies_boot_scoped_committed_ephemeral'
+        ? `⛔ \`committed\` IS NOT DURABLE: ${dataDir} is ephemeral (${committedEphemeralReason}), so the next redeploy/re-stage erases it with no error to catch. EVERY field on this block is then boot-scoped and NOTHING here witnesses a spend by a previous build — \`committed: {}\` does not mean the shot is unspent.`
+        : `\`committed\` + \`stateUnreadable\` are DURABLE on ${dataDir} (not ephemeral), and ${
+          committedLoadedAtBoot
+            ? `this process hydrated ${hydratedBooks} committed row(s) off disk — pre-boot spends are already inside \`committed\`.`
+            : hydrateOutcome === 'file_absent'
+              ? 'no commit file exists yet, so NOTHING was loaded: `committedLoadedAtBoot` is false. On a durable dir that is a genuine "no book has spent its shot", but it is an ABSENCE, not a hydrated record.'
+              : 'no hydrate has run yet on this read.'
+        }`;
+
+  return {
+    issue: 'TRA-5020',
+    scope: 'one_shot_cost_bar_grant',
+    covers: {
+      sinceBoot:
+        'consults, grants, commits (= commitsSinceBoot), commitsFailedDurableSinceBoot, '
+        + 'refusalsByReason — module-level `const tallies`, ZEROED BY EVERY RESTART'
+        + (processStartedAt === null ? ' (start instant UNKNOWN)' : `, since ${processStartedAt}`),
+      durable:
+        'committed, stateUnreadable (and commitsDurable, derived from committed) — '
+        + 'persisted write-through and hydrated at first touch'
+        + (committedDurable ? '' : ` ⛔ BUT THE DIR IS EPHEMERAL (${committedEphemeralReason})`),
+    },
+    talliesSinceBoot: true,
+    talliesSinceIso: processStartedAt,
+    talliesSinceStamped: processStartedAt !== null,
+    committedDurable,
+    committedEphemeralReason,
+    committedLoadedAtBoot,
+    commitFileFound,
+    hydrateOutcome,
+    hydratedBooks,
+    dataDir,
+    commitsDurable,
+    commitsSinceBoot: tallies.commits,
+    commitsFailedDurableSinceBoot: tallies.commitsFailedDurable,
+    spentWithoutDurableRecord: tallies.commitsFailedDurable > 0,
+    verdict,
+    note:
+      `${verdictClause} ⛔ \`consults\`/\`grants\`/\`commits\`/\`refusalsByReason\` are SINCE-BOOT and MUST NOT be cited as a cross-boot zero — bqb1 reboots ~6x/day, so a post-reboot \`commits: 0\` is evidence about NOTHING while rendering byte-identically to "the grant was never spent" (TRA-2879's disarm tripwire was re-keyed onto the durable \`committed\` for exactly this reason). Read \`commitsDurable\` for the cross-boot answer. `
+      + `⛔ \`committedDurable\` describes the STORE; \`committedLoadedAtBoot\` describes THIS READ. They can disagree and the disagreement is information, not a contradiction. `
+      + `⛔ TRA-4879's \`counterProvenance\` on /api/health/live-enforce-gates is scoped \`top_level\` and covers \`decisionsRecorded\`/\`byGate\` ONLY — its \`countersDurable: true\` has never extended to this block. `
+      + (tallies.commitsFailedDurable > 0
+        ? `🔴 ${tallies.commitsFailedDurable} spend(s) since boot FAILED their durable write: a real shot was burned with no record on disk, and a restart will re-grant that book. `
+        : '')
+      + (processStartedAt === null
+        ? '⚠️ `talliesSinceIso` is null: the boot stamp was not supplied, so the tallies are still boot-scoped but their start instant is UNKNOWN — do not substitute the read time.'
+        : ''),
+  };
 }
 
 export interface LiveOtmOneShotGrantPublicState {
@@ -269,8 +494,19 @@ export interface LiveOtmOneShotGrantPublicState {
   pendingBooks: string[];
   consults: number;
   grants: number;
+  /**
+   * SINCE-BOOT. Retained at its original name and original value so no existing
+   * reader silently changes meaning; `counterProvenance.commitsDurable` is the
+   * cross-boot integer. Prefer `commitsSinceBoot`, which says what it is.
+   */
   commits: number;
+  /** TRA-5020 — `commits` under a name that cannot be misread. Same value. */
+  commitsSinceBoot: number;
+  /** TRA-5020 — the DURABLE spend count. `null` while `stateUnreadable`. */
+  commitsDurable: number | null;
   refusalsByReason: Record<string, number>;
+  /** TRA-5020 — which fields here survive a restart. READ THIS FIRST. */
+  counterProvenance: LiveOtmOneShotCounterProvenance;
 }
 
 /** The health block — published beside the OTM `arm` state so tomorrow's
@@ -278,9 +514,17 @@ export interface LiveOtmOneShotGrantPublicState {
 export function getLiveOtmOneShotGrantState(
   env: NodeJS.ProcessEnv = process.env,
   nowMs: number = Date.now(),
+  /**
+   * TRA-5020 — `build.startedAt`, the instant the since-boot tallies start at.
+   * The module cannot know it, so the ROUTE supplies it. Omitted/null renders
+   * `talliesSinceStamped: false` and says the span's left edge is UNKNOWN; it is
+   * never back-filled from the read time.
+   */
+  opts?: { processStartedAt?: string | null },
 ): LiveOtmOneShotGrantPublicState {
   hydrateIfNeeded();
   const spec = parseLiveOtmOneShotGrant(env[LIVE_OTM_ONESHOT_GRANT_VAR]);
+  const counterProvenance = describeLiveOtmOneShotCounterProvenance(opts?.processStartedAt ?? null);
   return {
     armed: spec !== null,
     card: spec?.card ?? null,
@@ -295,7 +539,10 @@ export function getLiveOtmOneShotGrantState(
     consults: tallies.consults,
     grants: tallies.grants,
     commits: tallies.commits,
+    commitsSinceBoot: tallies.commits,
+    commitsDurable: counterProvenance.commitsDurable,
     refusalsByReason: { ...tallies.refusalsByReason },
+    counterProvenance,
   };
 }
 
@@ -306,8 +553,11 @@ export function __resetLiveOtmOneShotGrantForTest(opts?: { dataDir?: string }): 
   stateUnreadable = false;
   committed = {};
   pending.clear();
+  hydrateOutcome = 'not_run';
+  hydratedBooks = 0;
   tallies.consults = 0;
   tallies.grants = 0;
   tallies.commits = 0;
+  tallies.commitsFailedDurable = 0;
   tallies.refusalsByReason = {};
 }

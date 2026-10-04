@@ -252,6 +252,38 @@ pool at once. That upgrades H4a from hardening to a plausible takeover path, and
 > clean. Untreated this was not darkness — both dashboards fall back to 5s REST polling — but it was loss of
 > live push for every Pages user plus a retry loop against a 404, shipped deliberately for no gain.
 >
+> ✅ **COMPAT WINDOW CLOSED, 2026-10-03 (TRA-4492, LeadDev).** Both halves above are deleted — the server's
+> `token` branch, `resolveLegacyTokenAccepted`, `LEGACY_TOKEN_ACCEPTED`, the `legacyTokenUpgrades` /
+> `legacyTokenRefused` counters and the `legacy_disabled` / `bad_token` reasons; and the client's
+> `buildLegacySocketUrl` with the `status === 404` arm that called it. A tokenless upgrade is `no_credential`.
+> **No session token is put in a URL anywhere in the repo**, and that property is now asserted by
+> `apps/desktop/src/lib/ws-ticket.no-token-in-url.test.ts` rather than left to a hand-run grep.
+>
+> The clearance was the **log tape, not the counter**: zero `TRA-4488 WS upgrade authenticated by LEGACY`
+> lines over `2026-09-26T14:20:18Z → 2026-10-03T16:20Z` — 7.08 days spanning five RTH sessions
+> (09-28…10-02) and the 09-26/27 weekend — with the door measured **OPEN** for the whole window
+> (`WS_LEGACY_TOKEN_QUERY` absent from all 97 of bqb1's env keys, so the resolver returned accept). The search
+> instrument was positively controlled before the zero was trusted: a known-present string returned hits, a
+> nonsense string returned none, and warn-level structured lines were confirmed present on the tape.
+>
+> ⚠ **Two limits on that grade, recorded because they are the part a re-reader would otherwise assume away.**
+> (1) bqb1 has served a build containing TRA-4488 since `9472ced3` on 2026-09-20T22:07Z, but the Render tape
+> for this service **begins at 2026-09-26T14:20:18Z** — 09-20→09-26 is unreadable, so the graded window is
+> shorter than the deploy's life. It still exceeds the gate's stated minimum of one RTH session plus one
+> weekend. (2) There is **no per-connection WS logging**, so the window cannot be shown to have contained any
+> upgrade attempt at all; the only `WebSocket` lines on the tape are 23 boot banners. The zero therefore means
+> "no legacy upgrade was logged", not "clients connected and none used the old door". The load-bearing
+> evidence against an empty-population reading is structural rather than observational: no shipped client can
+> reach the branch, since `deploy-pages.yml` promotes the web client only from a CI-green `main` SHA and the
+> ticket handshake landed there 2026-09-10. The residual exposure is a locally-installed desktop build nobody
+> has restarted since 09-10, whose cost is a 401 on upgrade until it updates — bounded, reversible by revert,
+> and not a money or data path.
+>
+> The `WS_LEGACY_TOKEN_QUERY=off` intermediate step the ticket offered was **deliberately skipped**, and the
+> reason is worth keeping: the refusal path writes a bare `401` and destroys the socket **without logging**,
+> so shutting the door by env would have been behaviourally identical to deleting the code (both yield a 401)
+> while *destroying the only discriminator* — it buys rollback speed, not information.
+>
 > Query-string **values** are now redacted wherever a request URL reaches a log (`redactQueryString`,
 > `http-security.ts`), names kept, so the class does not come back through the next parameter.
 

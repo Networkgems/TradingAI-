@@ -37,6 +37,18 @@ import { LIVE_TRADIER_TAPE } from './tra2864-live-tradier-tape.fixture.js';
 // is the test that must be deliberately changed — not one that quietly starts
 // passing for a new reason.
 //
+// ✅ **That happened, on 2026-10-02 under TRA-5017, and CONTROL A was inverted
+// deliberately.** The attributor now matches the company-name axis as well, so
+// the live action pins to `TDIC` alone and the global arm no longer fires. The
+// assertion below is the INVERSE of the one this file shipped with; what it still
+// pins is the same live row, verbatim, and the same fact that made the old
+// behaviour wrong — the ticker token is still nowhere in the action text, so the
+// TICKER axis alone still scores 0. If a future change breaks the name axis, that
+// is the assertion that goes red, and it cannot go green for a new reason because
+// the ticker-axis zero is asserted beside it. The TRA-5017 controls — subset
+// containment vs the IREN/TDIC `LIMITED` collision, the 2-token floor, and the
+// untouched fail-closed arm — live in `tra5017-corporate-action-company-name.test.ts`.
+//
 // ── THE DEFECT THIS FILE CLOSES ─────────────────────────────────────────────
 //
 // `equityIncluded: false` is PASS-level. It says equity was withheld; it does not
@@ -83,21 +95,39 @@ const LIVE_CORPORATE_ACTION = {
 
 const AT = '2026-10-01T20:20:10.367Z';
 
-describe('TRA-4979 CONTROL A — the live corporate action is unattributable, so the global arm is correct-but-blind', () => {
-  it('names the COMPANY not the ticker, so the ticker intersection is empty', () => {
-    const scope = equitySymbolsInvalidatedByCorporateActions(
-      [LIVE_CORPORATE_ACTION],
-      LIVE_TRADIER_TAPE,
+describe('TRA-4979 CONTROL A — INVERTED by TRA-5017: the live corporate action pins to TDIC by company name', () => {
+  it('still names the COMPANY not the ticker — and that is now attributable, to TDIC alone', () => {
+    const actionTokens = new Set(
+      LIVE_CORPORATE_ACTION.description.toUpperCase().split(/[^A-Z0-9.]+/).filter(Boolean),
     );
-    // TDIC IS on the tape — so this is not "the symbol is unknown to us".
+    // ── The premise CONTROL A shipped with, unchanged and still true ────────
+    // The ticker token is NOT in the broker's text. So this assertion cannot
+    // start passing because someone quietly re-shaped the fixture into
+    // `"REVERSE SPLIT - TDIC"`; it passes only via the name axis.
+    expect(actionTokens.has('TDIC')).toBe(false);
+    expect([...actionTokens]).toEqual(['REVERSE', 'SPLIT', 'DREAMLAND', 'LIMITED']);
+    // TDIC IS on the tape — so this was never "the symbol is unknown to us".
     const tickers = new Set(
       LIVE_TRADIER_TAPE.filter(f => f.tradeType === 'equity').map(f => f.symbol.toUpperCase()),
     );
     expect(tickers.has('TDIC')).toBe(true);
+    // …and the company name is on TDIC's own fill rows, which is the axis.
+    expect(
+      LIVE_TRADIER_TAPE.filter(f => f.tradeType === 'equity' && f.symbol === 'TDIC').map(
+        f => f.description,
+      ),
+    ).toEqual(['DREAMLAND LIMITED', 'DREAMLAND LIMITED']);
 
-    expect(scope.withholdAllEquity).toBe(true);
-    expect([...scope.excludeSymbols]).toEqual([]);
-    expect(scope.reasons.join(' ')).toContain('0 candidates');
+    // ── The inversion ───────────────────────────────────────────────────────
+    const scope = equitySymbolsInvalidatedByCorporateActions(
+      [LIVE_CORPORATE_ACTION],
+      LIVE_TRADIER_TAPE,
+    );
+    expect(scope.withholdAllEquity).toBe(false);
+    expect([...scope.excludeSymbols]).toEqual(['TDIC']);
+    expect(scope.reasons.join(' ')).toContain('attributed by company name');
+    // The global arm's own signature must be ABSENT, not merely outvoted.
+    expect(scope.reasons.join(' ')).not.toContain('all equity withheld');
   });
 
   it('TDIC closed NOTHING in the window, so the quarantine it deserves would cost $0.00', () => {

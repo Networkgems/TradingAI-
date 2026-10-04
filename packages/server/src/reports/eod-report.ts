@@ -1515,3 +1515,63 @@ export function wouldClobberSettledReport(
     || (existing.combinedPnl ?? 0) !== 0
   );
 }
+
+/**
+ * TRA-4998 residual — READ-TIME basis stamp for the 108 ARCHIVED report cells.
+ *
+ * The write-side fix (`generateEodReport`, above) only reaches days generated after
+ * it shipped. `/api/reports/:date` serves a STORED SNAPSHOT for every past day, so
+ * measured on prod `afe4e34a` 2026-10-02T12:0xZ the archive still answered exactly
+ * the defect this ticket is about:
+ *
+ *   2026-09-30 → `{totalSignals: 557, winningSignals: 0, winRate: 0, avgRR: 0}`
+ *   2026-10-01 → `{totalSignals: 558, winningSignals: 0, winRate: 0, avgRR: 0}`
+ *
+ * — no `winRateBasis` key at all, and a `0` that renders identically to a signal set
+ * that fired 557 times and was wrong every time. `winRateBasis: 'legacy_unknown'` was
+ * declared in the shared type by the same commit and had **ZERO WRITERS**: a field
+ * with a full docblock and nothing that ever sets it.
+ *
+ * ⛔ This does NOT restate the archive. The stored file is never rewritten (same rule
+ * as the TRA-2631 movers stamp beside it, and for the same reason: the inputs to
+ * recompute these days — per-signal `outcome` at archive time — were not retained).
+ * What it does is refuse to serve an uninterpretable number as if it were measured:
+ *
+ *   - top-level `winRate`/`avgRR`: nulled only when `totalTrades === 0`, which is
+ *     FULLY DETERMINABLE from the stored cell. 0 closed trades has no win rate.
+ *   - `signalAccuracy`: an exactly-`0` rate becomes `null` because the archive's
+ *     denominator was `totalSignals` (every unresolved signal counted as a loser) and
+ *     `resolvedSignals` was not stored, so the real rate is UNKNOWABLE, not 0. Any
+ *     NON-zero stored rate is preserved — it is a real, if conservatively biased,
+ *     reading and destroying it would be the sign-flipped version of this defect.
+ *   - the basis is `no_signals` when `totalSignals === 0` (determinable) and
+ *     `legacy_unknown` otherwise (the honest "this day predates the fix").
+ *
+ * ⚠️ Both directions stay alive. A go-forward day already carries a basis, so this is
+ * a strict no-op on it: a day whose signals RESOLVED and all lost still serves a real
+ * `winRate: 0` with `winRateBasis: 'resolved'`, and the alarm stays reachable. The
+ * presence of the key is the discriminator — never the value.
+ */
+export function stampLegacyRateBasis<T extends {
+  totalTrades?: number;
+  winRate?: number | null;
+  avgRR?: number | null;
+  signalAccuracy?: EodSignalAccuracy;
+}>(report: T): T {
+  const out: T = { ...report };
+  if (out.totalTrades === 0) {
+    if (out.winRate === 0) out.winRate = null;
+    if (out.avgRR === 0) out.avgRR = null;
+  }
+  const sa = out.signalAccuracy;
+  // A basis already present means the cell was produced by the fixed write path (or
+  // by one of the synthesized stubs, which set `no_signals` explicitly). Leave it.
+  if (!sa || sa.winRateBasis != null) return out;
+  out.signalAccuracy = {
+    ...sa,
+    winRate: sa.winRate === 0 ? null : sa.winRate,
+    avgRR: sa.avgRR === 0 ? null : sa.avgRR,
+    winRateBasis: (sa.totalSignals ?? 0) === 0 ? 'no_signals' : 'legacy_unknown',
+  };
+  return out;
+}

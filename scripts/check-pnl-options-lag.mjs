@@ -134,7 +134,6 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { spawnSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gradedAncestry } from './lib/shallow-ancestry.mjs';

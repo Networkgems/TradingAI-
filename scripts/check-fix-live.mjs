@@ -92,12 +92,23 @@ const EXIT_BLIND = 3;
  * which are byte-identical. The old knownSha screens were necessary but NOT sufficient
  * (both objects can be present while the path between them is cut).
  *
+ * ⛔ TRA-5031: THE ORACLE IS INJECTED, AND THAT IS NOT COSMETIC. The TRA-3740 rewrite kept
+ * accepting the old `knownSha` / `isAncestor` probes in the signature but stopped reading them,
+ * so this function always probed the REAL repo. The five selftest controls below inject
+ * synthetic SHAs (`'a'`, `'b'`) that no checkout knows, so every one of them collapsed to the
+ * same `blind`: the two directional controls FAILED (they have been red on `main` since
+ * TRA-3740) and — worse — the three blind controls PASSED FOR THE WRONG REASON. A control suite
+ * whose every row returns one constant cannot go red for the defect it exists to catch, which is
+ * this repo's recurring bug. Same seam, same name, as `gradeAncestry` in
+ * check-deploy-train-window.mjs (TRA-4977).
+ *
+ * @param {(held: string, target: string) => {answer: boolean|null}} [ancestryOracle]
  * @returns {'present'|'absent'|'blind'}
  */
-export function gradeAncestry({ commit, liveSha, knownSha, isAncestor }) {
+export function gradeAncestry({ commit, liveSha, ancestryOracle = libGradedAncestry }) {
   // The library function is the canonical remedy (TRA-3699, TRA-3721, TRA-3740).
   // It handles object presence, shallow detection, and unrelated-graph detection.
-  const { answer } = libGradedAncestry(commit, liveSha);
+  const { answer } = ancestryOracle(commit, liveSha);
   if (answer === true) return 'present';
   if (answer === false) return 'absent';
   return 'blind'; // answer === null
@@ -159,13 +170,23 @@ if (process.argv.includes('--selftest')) {
     if (g !== w) fail.push(`${name}: got ${g}, want ${w}`);
     else console.log(`  ok  ${name}`);
   };
-  const known = () => true;
+  // Rows 1-3 drive the PREDICATE through an injected oracle: they are the only three
+  // answers ancestry has, and each must map to a distinct state. Rows 4-5 deliberately
+  // use the DEFAULT oracle (the real library against this checkout) — that is the wiring
+  // leg, and it is a separate claim from the mapping leg. Before TRA-5031 all five ran
+  // against the default oracle on synthetic SHAs, so all five returned `blind`: rows 1-2
+  // were red and rows 3-5 were vacuously green.
   console.log('gradeAncestry — both directions:');
-  t('present when ancestor', gradeAncestry({ commit: 'a', liveSha: 'b', knownSha: known, isAncestor: () => true }), 'present');
-  t('absent when not ancestor', gradeAncestry({ commit: 'a', liveSha: 'b', knownSha: known, isAncestor: () => false }), 'absent');
-  t('blind on unknown commit (shallow)', gradeAncestry({ commit: 'a', liveSha: 'b', knownSha: s => s !== 'a', isAncestor: () => false }), 'blind');
-  t('blind on unknown live sha', gradeAncestry({ commit: 'a', liveSha: 'b', knownSha: s => s !== 'b', isAncestor: () => true }), 'blind');
-  t('blind on missing live sha', gradeAncestry({ commit: 'a', liveSha: null, knownSha: known, isAncestor: () => true }), 'blind');
+  t('present when the oracle answers true',
+    gradeAncestry({ commit: 'a', liveSha: 'b', ancestryOracle: () => ({ answer: true }) }), 'present');
+  t('absent when the oracle answers false',
+    gradeAncestry({ commit: 'a', liveSha: 'b', ancestryOracle: () => ({ answer: false }) }), 'absent');
+  t('blind when the oracle answers null',
+    gradeAncestry({ commit: 'a', liveSha: 'b', ancestryOracle: () => ({ answer: null }) }), 'blind');
+  t('blind on a sha unknown to this checkout (default oracle)',
+    gradeAncestry({ commit: 'a', liveSha: 'b' }), 'blind');
+  t('blind on missing live sha (default oracle)',
+    gradeAncestry({ commit: 'a', liveSha: null }), 'blind');
 
   console.log('gradeWindow — both directions:');
   const W = Date.parse('2026-07-30T13:30:00Z');
@@ -233,7 +254,10 @@ const git = args => {
   return { ok: r.status === 0, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
 };
 const knownSha = sha => git(['cat-file', '-e', `${sha}^{commit}`]).ok;
-const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).ok;
+// No bare `isAncestor` probe here on purpose: `merge-base --is-ancestor` exits 1 for both
+// "not an ancestor" and "grafted away by a shallow clone", so the only caller that wanted
+// one now goes through the shallow-aware library oracle (TRA-3740). `knownSha` survives
+// because the BLIND branch below still has to name WHICH sha this checkout is missing.
 const shortOf = sha => (git(['rev-parse', '--short', sha]).out || String(sha).slice(0, 8));
 
 async function liveSha() {
@@ -266,7 +290,7 @@ if (git(['rev-parse', '--is-shallow-repository']).out === 'true') {
   console.log('[fix-live]          the shallow window; an unknown SHA below exits BLIND, not ABSENT.');
 }
 
-const ancestry = gradeAncestry({ commit: COMMIT, liveSha: live, knownSha, isAncestor });
+const ancestry = gradeAncestry({ commit: COMMIT, liveSha: live });
 
 if (ancestry === 'blind') {
   const missing = [COMMIT, live].filter(s => !knownSha(s)).map(shortOf);

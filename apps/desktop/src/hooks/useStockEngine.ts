@@ -10,7 +10,7 @@ import { SERVER_URL, HTTP_URL } from '../server-url';
 import { logger } from '../lib/logger';
 import { createReconnectController } from '../lib/backoff';
 // TRA-4488 — the session token no longer rides in the upgrade URL.
-import { buildLegacySocketUrl, buildSocketUrl, fetchWsTicket, WsTicketError } from '../lib/ws-ticket';
+import { buildSocketUrl, fetchWsTicket, WsTicketError } from '../lib/ws-ticket';
 import { pickOptionsDailyLimit } from '../lib/settings';
 import type { AppState } from '../types/app';
 
@@ -99,17 +99,13 @@ export function useStockEngine(
         // A 401 means the session itself is gone; no amount of backoff recovers
         // it, and retrying would spin until the user gave up on a dead page.
         if (err instanceof WsTicketError && err.status === 401) { onLogout(); return; }
-        // A 404 means the SERVER predates the ticket endpoint. Pages auto-deploys
-        // this client on CI green; bqb1 does not auto-deploy, so this client is
-        // routinely newer than the server it is talking to. Fall back to the old
-        // URL shape for that case only — see `buildLegacySocketUrl`.
-        if (err instanceof WsTicketError && err.status === 404) {
-          url = buildLegacySocketUrl(SERVER_URL, token);
-        } else {
-          logger.warn('stock-ws', 'ws-ticket fetch failed; will retry', err);
-          reconnectTimer.current = setTimeout(() => { void connect(); }, reconnect.nextDelay());
-          return;
-        }
+        // TRA-4492 — the `?token=` fallback for a server predating the ticket
+        // endpoint is gone, with the server branch that honoured it. A 404 here
+        // is now just another retryable fault: every deployed bqb1 build has had
+        // `POST /api/auth/ws-ticket` since the TRA-4488 deploy.
+        logger.warn('stock-ws', 'ws-ticket fetch failed; will retry', err);
+        reconnectTimer.current = setTimeout(() => { void connect(); }, reconnect.nextDelay());
+        return;
       }
       if (cancelled) return;
       const ws = new WebSocket(url);
