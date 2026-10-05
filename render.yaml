@@ -871,9 +871,16 @@ services:
       # `supertrend_shadow_5m`, atrTimeframeMs != 300000; per-row proof is each
       # close's own `chandelier.atrTimeframeMs`. A symbol outside the `mtfSymbols`
       # snapshot sweep lands in `skipped.no_daily_atr` (no level, NO fire at all) —
-      # watch that counter post-arm. Revert = clear this value + redeploy. NOTE:
-      # a single-key API env write applies NOTHING on this host (TRA-3724) — this
-      # render.yaml row + push to main (autoDeploy, TRA-1289) is the only path.
+      # watch that counter post-arm. Revert = clear this value + redeploy.
+      # ⛔ APPLY-PATH CORRECTION (measured 2026-10-05, TRA-5099): this render.yaml
+      # row is SOURCE-OF-RECORD ONLY — Render does NOT blueprint-sync envVars on
+      # srv-d7mb7rr7uimc73ev0chg (28 of this file's 80 keys were absent from the
+      # service env, this one included, after the 4172134a deploy went live;
+      # autoDeploy=no). The working path is TRA-3718/TRA-3724's env-only apply:
+      # PUT /v1/services/{id}/env-vars/CHANDELIER_ATR_TIMEFRAME, re-GET it, then
+      # `node scripts/render-redeploy.mjs --commit=<sha already serving>` to bake
+      # it with a zero-byte code delta. An env write alone applies NOTHING (no
+      # self-deploy here since 2026-07-23), and POST /restart replays the OLD env.
       - key: CHANDELIER_ATR_TIMEFRAME
         value: "daily"
       # TRA-1408 (parent TRA-1406, board confirmation `3f248ea1` = accepted 07-07)
