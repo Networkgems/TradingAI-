@@ -109,6 +109,27 @@ export const DETECTABILITY_FLOOR_CONSTRAINT =
   'HARDER; it can never manufacture one, and it is deliberately NOT applied to the FAIL ' +
   'branch (there it would convert imprecision into an irreversible condemnation).';
 
+/**
+ * TRA-5131 — condition of the CEO ratification that made `adjustedUplift = raw - placebo`
+ * binding (TRA-5122, 2026-10-04), quoted verbatim: "publish both numbers side by side,
+ * permanently. `raw` stays visible with an explicit `not promotable` marker."
+ *
+ * The marker is a single exported string for the same reason `effectiveBar` is a single
+ * function: the table renderer, the verdict's reasons[] and the test that measures the page
+ * all read THIS copy. A retyped marker drifts, and a marker that lives only in a source
+ * comment is invisible to the person who, in November, reads a verdict off a table
+ * (TRA-1830) — which is exactly where the unmarked `rawUp` column was sitting.
+ */
+export const RAW_NOT_PROMOTABLE_MARKER = 'NOT PROMOTABLE';
+/** The raw-uplift column's on-page header. `(NP)` is expanded by the legend line below. */
+export const RAW_UPLIFT_COLUMN_HEADER = 'rawUp(NP)';
+/** The legend line that expands the marker on the report surface itself. */
+export const RAW_NOT_PROMOTABLE_LEGEND =
+  `(NP) = ${RAW_NOT_PROMOTABLE_MARKER}. rawUp is biased upward on a short sample and is ` +
+  'published only because the pre-registration named it — the gap rawUp - ADJ_UP IS the ' +
+  'finite-sample artifact. No promotion, verdict or ticket may quote rawUp as the result; ' +
+  'the binding, promotable number is ADJ_UP. Condition of the TRA-5122 ratification (2026-10-04).';
+
 /** How the effective bar was decided, and out of what. Reported on every cell. */
 export interface EffectiveBar {
   /** The ECONOMIC floor — `PCR_UPLIFT_BAR_R`. Never moves. */
@@ -1337,8 +1358,8 @@ export function runPcrExpectancy(
       `DECISIVE NO-GO: session-clustered 90% CI upper bound ${ciUpper.toFixed(4)}R < ` +
         `${PCR_UPLIFT_BAR_R}R bar — even the optimistic end of the interval cannot clear it ` +
         `(bias-adjusted uplift ${primary.adjustedUpliftR.toFixed(4)}R; raw ` +
-        `${primary.rawUpliftR.toFixed(4)}R, of which ${primary.placeboUpliftR.toFixed(4)}R is ` +
-        `earned by a zero-information placebo)`,
+        `${primary.rawUpliftR.toFixed(4)}R [${RAW_NOT_PROMOTABLE_MARKER} — TRA-5122], of which ` +
+        `${primary.placeboUpliftR.toFixed(4)}R is earned by a zero-information placebo)`,
     );
   } else {
     verdict = 'HELD';

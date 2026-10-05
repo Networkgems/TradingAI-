@@ -30,7 +30,12 @@
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { runPcrCrossSectional, runPcrExpectancy } from '../packages/backtest/dist/index.js';
+import {
+  RAW_NOT_PROMOTABLE_LEGEND,
+  RAW_UPLIFT_COLUMN_HEADER,
+  runPcrCrossSectional,
+  runPcrExpectancy,
+} from '../packages/backtest/dist/index.js';
 
 function arg(name, fallback = null) {
   const i = process.argv.indexOf(`--${name}`);
@@ -147,9 +152,12 @@ for (const [h, d] of Object.entries(report.diagnostics)) {
 line();
 console.log('COHORT TABLE — every pre-registered cell, published whether or not it clears.');
 console.log('  adjUplift = rawUplift - placeboUplift. The PLACEBO is a zero-information signal;');
-console.log('  whatever IT earns is the finite-sample artifact, not an edge. adjUplift is BINDING.\n');
+console.log('  whatever IT earns is the finite-sample artifact, not an edge. adjUplift is BINDING.');
+// TRA-5131 — condition of the TRA-5122 ratification: the raw figure never appears on this
+// surface without an explicit NOT PROMOTABLE marker. The text is the package's, not retyped.
+console.log(`  ${RAW_NOT_PROMOTABLE_LEGEND}\n`);
 console.log(
-  '  H  carrier  read        nTrio nAgr nDis nSil |   E[R]trio  E[R]agr |  rawUp  placebo  ADJ_UP | clustered 90% CI    | naive CI (illusion)',
+  `  H  carrier  read        nTrio nAgr nDis nSil |   E[R]trio  E[R]agr | ${RAW_UPLIFT_COLUMN_HEADER}  placebo  ADJ_UP | clustered 90% CI    | naive CI (illusion)`,
 );
 line('·');
 for (const c of report.cells) {
@@ -158,7 +166,7 @@ for (const c of report.cells) {
     `${star}${String(c.horizon).padStart(3)}  ${c.carrier.padEnd(7)} ${c.interpretation.padEnd(11)} ` +
       `${String(c.n.trioAlone).padStart(5)} ${String(c.n.agreeing).padStart(4)} ${String(c.n.disagreeing).padStart(4)} ${String(c.n.silent).padStart(4)} | ` +
       `${f(c.meanR.trioAlone).padStart(9)} ${f(c.meanR.agreeing).padStart(8)} | ` +
-      `${f(c.rawUpliftR).padStart(6)} ${f(c.placeboUpliftR).padStart(8)} ${f(c.adjustedUpliftR).padStart(7)} | ` +
+      `${f(c.rawUpliftR).padStart(9)} ${f(c.placeboUpliftR).padStart(8)} ${f(c.adjustedUpliftR).padStart(7)} | ` +
       `[${f(c.clustered.lo).padStart(7)}, ${f(c.clustered.hi).padStart(7)}] | ` +
       `[${f(c.naive.lo).padStart(7)}, ${f(c.naive.hi).padStart(7)}]`,
   );

@@ -18,6 +18,7 @@ import {
   PRIMARY_FEASIBILITY_GATE_N,
   PRIMARY_HW30_FEASIBILITY_R,
   PRIMARY_POWER_CONSTRAINT,
+  RAW_NOT_PROMOTABLE_MARKER,
   rawUpliftStat,
   runPcrExpectancy,
   sessionClusteredBootstrap,
@@ -514,6 +515,27 @@ describe('the decisive-NO-GO rule (TRA-1726)', () => {
     expect(counts.PASS).toBe(0);                    // never promotes noise (safety)
     expect(counts.HELD).toBeGreaterThanOrEqual(6);  // ...but mostly ABSTAINS
     expect(counts.FAIL).toBeLessThanOrEqual(2);     // ...and only sometimes refutes
+  });
+});
+
+describe('TRA-5131 — the NOT PROMOTABLE marker travels WITH the raw figure (TRA-5122 condition)', () => {
+  it('stamps the marker into the reasons[] line that quotes rawUpliftR, on the figure itself', () => {
+    // The same pinned decisive-refusal draw as the FAIL test above (seed 528) — the one
+    // reasons[] site that quotes the raw figure is the DECISIVE NO-GO line. The assertion is
+    // on the RENDERED reason string, not on the constant existing in the module: deleting the
+    // marker from the reason fails here even with the export intact (negative control).
+    const { ledger, bars } = synth({ sessions: 90, seed: 528, edge: 'none' });
+    const report = runPcrExpectancy(ledger, bars, { iters: 500, seed: 11 });
+
+    const quotingRaw = report.reasons.filter((r) => /\braw -?\d+\.\d{4}R/.test(r));
+    expect(quotingRaw.length).toBeGreaterThan(0);
+    for (const r of quotingRaw) {
+      // Adjacent to the figure — same bracket — not merely somewhere in the array.
+      expect(r).toMatch(new RegExp(`\\braw -?\\d+\\.\\d{4}R \\[${RAW_NOT_PROMOTABLE_MARKER}`));
+    }
+
+    // AC4 — this is a labelling change: the verdict leg this draw pins did not move.
+    expect(report.verdict).toBe('FAIL');
   });
 });
 
