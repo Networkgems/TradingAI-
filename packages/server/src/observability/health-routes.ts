@@ -3352,8 +3352,26 @@ export interface OptionJournalReleaseForensic {
   stopBasisPremium: number | null;
   markAtFire: number | null;
   execBidAtFire: number | null;
+  /**
+   * TRA-5162 — why `execBidAtFire` is null, so "the tick was dark" and "never
+   * attempted" stop sharing a bare null. The stamp's own reason code when it
+   * carries one (`no_usable_quote_at_fire` / `bid_zero_at_fire` /
+   * `halt_flat_no_exit_tick`); `stamp_predates_reason_codes` for a stamped
+   * null written by a pre-TRA-5162 build; `null` when the bid was measured or
+   * the row carries no stamp at all (`stamped: false` already names that case).
+   */
+  execBidUnquotedReason: string | null;
   /** Broker exit fill — TRA-2819 restated rows only. ⛔ Never the mark standing in. */
   exitFillPremium: number | null;
+  /**
+   * TRA-5162 — why `exitFillPremium` is null, same convention.
+   * `not_broker_fill_restated` ⇒ the row was never TRA-2819-restated (demo /
+   * desk modeled closes live here permanently — the fill basis only ever
+   * exists on live broker closes); `fill_premium_absent_on_restated_row` ⇒
+   * restated but the fill column is missing (a defect, loud on purpose);
+   * `null` ⇔ `exitFillPremium` is measured.
+   */
+  exitFillUnmeasuredReason: string | null;
   /** `exitFillPremium − levelPremium`: the execution slip. Null unless both are measured. */
   fillVsLevelPremium: number | null;
   /** The same slip in stop-basis R (÷ `stopBasisPremium`). */
@@ -3606,6 +3624,27 @@ function crossTabStructureExit(
         ...(() => {
           const num = (v: unknown): number | null =>
             typeof v === 'number' && Number.isFinite(v) ? v : null;
+          // TRA-5162 — the two null-reason reads. A null instrument column now
+          // always travels with its cause, so the AC3 grader (one unrepeatable
+          // live row) can tell a dark tick from a dropped field from a row that
+          // was never restated — without holding the host's disk.
+          const execBidReason = (
+            stamped: boolean,
+            execBid: number | null,
+            stampReason: unknown,
+          ): string | null => {
+            if (!stamped || execBid !== null) return null;
+            return typeof stampReason === 'string' ? stampReason : 'stamp_predates_reason_codes';
+          };
+          const exitFillReason = (
+            r: OptionTradeJournalRecord,
+            exitFillPremium: number | null,
+          ): string | null => {
+            if (exitFillPremium !== null) return null;
+            return r.pnlBasis === 'broker-fill'
+              ? 'fill_premium_absent_on_restated_row'
+              : 'not_broker_fill_restated';
+          };
           const trail = list
             .filter((r) =>
               r.profitLockFire !== undefined
@@ -3666,7 +3705,13 @@ function crossTabStructureExit(
                   stopBasisPremium,
                   markAtFire,
                   execBidAtFire: num(tpf.execBidAtFire),
+                  execBidUnquotedReason: execBidReason(
+                    true,
+                    num(tpf.execBidAtFire),
+                    tpf.execBidUnquotedReason,
+                  ),
                   exitFillPremium,
+                  exitFillUnmeasuredReason: exitFillReason(r, exitFillPremium),
                   fillVsLevelPremium,
                   fillVsLevelR:
                     fillVsLevelPremium !== null && stopBasisPremium !== null && stopBasisPremium > 0
@@ -3707,7 +3752,13 @@ function crossTabStructureExit(
                 stopBasisPremium,
                 markAtFire,
                 execBidAtFire: num(f?.execBidAtFire),
+                execBidUnquotedReason: execBidReason(
+                  f !== undefined,
+                  num(f?.execBidAtFire),
+                  f?.execBidUnquotedReason,
+                ),
                 exitFillPremium,
+                exitFillUnmeasuredReason: exitFillReason(r, exitFillPremium),
                 fillVsLevelPremium,
                 fillVsLevelR:
                   fillVsLevelPremium !== null && stopBasisPremium !== null && stopBasisPremium > 0

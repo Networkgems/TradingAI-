@@ -29,6 +29,7 @@ import type {
   ProfitFloorLadderStep,
   OptionProfitFloorPdtHold,
   OptionMarkProvenance,
+  OptionExecBidUnquotedReason,
 } from '@trading-app/shared';
 import {
   EXIT_CHANDELIER_ATR_MULT,
@@ -1664,6 +1665,28 @@ function stampProfitFloorPdtFire(opt: OptionPosition, mark: number): void {
  */
 function stampExitMarkProvenance(opt: OptionPosition, provenance: OptionMarkProvenance): void {
   if (opt.exitMarkProvenance === undefined) opt.exitMarkProvenance = provenance;
+}
+
+/**
+ * TRA-5162 — the reason-code half of the executable-bid stamp, shared by the
+ * profit-lock and take-profit-early fire sites (the TRA-4759 cross-link). Both
+ * sites compute `execBid = quoteAtFire !== null && quoteAtFire.bid > 0 ?
+ * quoteAtFire.bid : null`; this names WHICH disjunct nulled it, so a null on
+ * the journal row stops being indistinguishable from "never attempted" —
+ * 19/19 `profit_lock` forensics rows read bare-null when TRA-5162 was filed,
+ * and attributing the one stamped one took a raw-row read of `markProvenance`.
+ * Returns a spreadable fragment: empty when the bid was served (the stamp
+ * carries no reason beside a measured value), the discriminated reason
+ * otherwise. The `book_halt_flat` relabel site stamps its own
+ * `halt_flat_no_exit_tick` constant instead — that path evaluates no tick, so
+ * there is no `quoteAtFire` to discriminate on.
+ */
+function execBidUnquotedReasonFragment(
+  quoteAtFire: { bid: number; ask: number } | null,
+): { execBidUnquotedReason?: OptionExecBidUnquotedReason } {
+  if (quoteAtFire === null) return { execBidUnquotedReason: 'no_usable_quote_at_fire' };
+  if (!(quoteAtFire.bid > 0)) return { execBidUnquotedReason: 'bid_zero_at_fire' };
+  return {};
 }
 
 /**
@@ -12760,6 +12783,8 @@ export class PaperOptionsAccount {
                 captureFrac: tp.captureFrac,
                 markAtFire: mark,
                 execBidAtFire: execBid,
+                // TRA-5162 — a null bid carries its cause; a served bid carries nothing.
+                ...execBidUnquotedReasonFragment(quoteAtFire),
                 tp1Premium: opt.tp1Premium,
                 peakPremium: opt.peakPremium,
                 peakPremiumExec:
@@ -13030,6 +13055,11 @@ export class PaperOptionsAccount {
                   levelPremium: opt.premiumPaid + levelR * lock.R,
                   markAtFire: mark,
                   execBidAtFire: execBid,
+                  // TRA-5162 — a null bid carries its cause; a served bid carries
+                  // nothing. The NOK261016C00011000 2026-09-11 fire (4 stale-mark
+                  // ticks, `delta_backstop` mark, dark quote) would have stamped
+                  // `no_usable_quote_at_fire` here instead of a bare null.
+                  ...execBidUnquotedReasonFragment(quoteAtFire),
                   // TRA-4246 (AC2) — the decision's own operands, off the SAME
                   // `lock` the level came from. `peakPremiumAtFire` is the peak
                   // the rule CONSUMED, which under TRA-4285 is the executable
@@ -17710,6 +17740,9 @@ export class PaperOptionsAccount {
             levelPremium: opt.premiumPaid + levelR * lock.R,
             markAtFire: closePrice,
             execBidAtFire: null,
+            // TRA-5162 — and the null names its cause: this path evaluates no
+            // quoted exit-pass tick, so the basis can never be executable here.
+            execBidUnquotedReason: 'halt_flat_no_exit_tick',
             // TRA-4246 (AC2) — same operands, same decision. `execBidAtFire` is
             // null here by construction, so `peakPremiumAtFire` is the MID
             // high-water mark: this path evaluated the mid basis, and the stamp
