@@ -850,6 +850,32 @@ services:
       # to main triggers the redeploy via autoDeploy. Accepts a negative fraction.
       - key: RV_EXIT_FLIP_MIN_LOSS_PCT
         value: "-0.20"
+      # TRA-5099 (CFO arm authorization off the 2026-10-04 weekly roll-up, parent
+      # TRA-5097; design + opt-in offer TRA-4992) — point the option swing-exit
+      # chandelier trail at a DAILY ATR(14) instead of the 5-minute shadow series.
+      # 3.0x is Chande's constant SPECIFIED against a daily ATR; fed ATR(14) on a
+      # 300000 ms series it trails 0.2-1.0% of spot above entry and released 35-DTE
+      # positions in under 90 minutes (both graded rows of 2026-09-27..10-03; a
+      # specification repair, NOT a parameter tune — atrMult/atrMultHighBeta/
+      # highBetaAtrPct/atrPeriod are deliberately untouched, multSource stays
+      # `compiled`). Reaches DEMO directional + RV single-leg rows only: otmArmed,
+      # directionalArmed and rvArmed were all false at arm time and
+      # otmSleeveExitRule.chandelierRetired is true, so no real money moves. Gated
+      # pre-arm on a NON-VACUOUS in-RTH `chandelier.ratchets` read (rowsSeen 141 >
+      # 0, skipped.no_daily_atr structural-0 pre-flip, daily-cold share 19.1% <
+      # 25% stop — TRA-5099 comment `f7330634`) and on the pre-registered
+      # comparator `prereg-chandelier-daily-atr-20261004` rev 1 (TRA-5098; cell
+      # `strategyExits`, NOT H0c and NOT the chandelier sub-cell). Grade the arm
+      # from deployed bytes: `GET /api/health/option-swing-exits -> chandelier`
+      # must read atrTimeframe.source=env, timeframe=daily, atrSeries off
+      # `supertrend_shadow_5m`, atrTimeframeMs != 300000; per-row proof is each
+      # close's own `chandelier.atrTimeframeMs`. A symbol outside the `mtfSymbols`
+      # snapshot sweep lands in `skipped.no_daily_atr` (no level, NO fire at all) —
+      # watch that counter post-arm. Revert = clear this value + redeploy. NOTE:
+      # a single-key API env write applies NOTHING on this host (TRA-3724) — this
+      # render.yaml row + push to main (autoDeploy, TRA-1289) is the only path.
+      - key: CHANDELIER_ATR_TIMEFRAME
+        value: "daily"
       # TRA-1408 (parent TRA-1406, board confirmation `3f248ea1` = accepted 07-07)
       # — arm the per-name churn + same-day-loss brake on the DEMO book. GIS
       # churned 95 closes for -$2,236 in one session while conviction-DCA kept
