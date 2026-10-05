@@ -171,6 +171,12 @@ interface RvScanCensusRecord {
    * "Why this is urgent" case.
    */
   blindRejectionsByGate: Record<string, number>;
+  /**
+   * TRA-5154 — `<gate>:<sub>` refinement of `rejectionsByGate` (see
+   * {@link RvScanRecord.rejectionSubReasons}). Optional: absent on lines written
+   * before 2026-10-05 = NOT MEASURED, never a zero split.
+   */
+  rejectionSubReasons?: Record<string, number>;
   /** First scan under this key during this boot, ms epoch. */
   firstAt: number;
 }
@@ -195,6 +201,8 @@ interface CensusTally {
   blindScansByGate: Map<string, number>;
   /** TRA-4357 AC4 — see {@link RvScanCensusRecord.blindRejectionsByGate}. */
   blindRejectionsByGate: Map<string, number>;
+  /** TRA-5154 — see {@link RvScanCensusRecord.rejectionSubReasons}. */
+  rejectionSubReasons: Map<string, number>;
   firstAt: number;
   lastAt: number;
   /** ms epoch of the last line appended for this tally (0 ⇒ never appended). */
@@ -303,6 +311,7 @@ function flushCensus(tally: CensusTally): void {
       universeSum: tally.universeSum,
       blindScansByGate: gatesToObject(tally.blindScansByGate),
       blindRejectionsByGate: gatesToObject(tally.blindRejectionsByGate),
+      ...(tally.rejectionSubReasons.size > 0 ? { rejectionSubReasons: gatesToObject(tally.rejectionSubReasons) } : {}),
       firstAt: tally.firstAt,
     };
     appendFileSync(path, JSON.stringify(rec) + '\n', 'utf8');
@@ -406,6 +415,7 @@ export function recordRvScanCensus(
       universeSum: 0,
       blindScansByGate: new Map(),
       blindRejectionsByGate: new Map(),
+      rejectionSubReasons: new Map(),
       firstAt: now,
       lastAt: now,
       lastFlushedAt: 0,
@@ -417,6 +427,7 @@ export function recordRvScanCensus(
   tally.candidatesPassed += record.candidatesPassed;
   tally.opensPlaced += record.opensPlaced;
   mergeGates(tally.rejectionsByGate, record.rejectionsByGate);
+  mergeGates(tally.rejectionSubReasons, record.rejectionSubReasons ?? {});
   const blindGate = blindGateOf(record);
   if (blindGate !== null) {
     tally.blindScans += 1;
@@ -538,6 +549,7 @@ export function hydrateRvScanCensusFromDisk(
       // before these maps existed contributes nothing, never a fabricated split.
       blindScansByGate: gateMap(rec.blindScansByGate),
       blindRejectionsByGate: gateMap(rec.blindRejectionsByGate),
+      rejectionSubReasons: gateMap(rec.rejectionSubReasons),
       firstAt: Number.isFinite(rec.firstAt) ? rec.firstAt : rec.ts,
       lastAt: rec.ts,
       // Hydrated tallies belong to a PREVIOUS boot (different bootId ⇒ different
@@ -570,6 +582,7 @@ export function hydrateRvScanCensusFromDisk(
       universeSum: t.universeSum,
       blindScansByGate: gatesToObject(t.blindScansByGate),
       blindRejectionsByGate: gatesToObject(t.blindRejectionsByGate),
+      ...(t.rejectionSubReasons.size > 0 ? { rejectionSubReasons: gatesToObject(t.rejectionSubReasons) } : {}),
       firstAt: t.firstAt,
     };
     kept.push(JSON.stringify(rec));
@@ -671,6 +684,13 @@ export interface RvScanCensusCell {
    * predates this field, and the subtraction is not yet trustworthy.
    */
   blindRejectionsByGate: Record<string, number>;
+  /**
+   * TRA-5154 — `<gate>:<sub>` refinement of `rejectionsByGate`, summed across the
+   * day's boots. For a gate with subs, `sum(<gate>:*) === rejectionsByGate[<gate>]`
+   * ONLY when every contributing boot postdates this field — compare the sum to
+   * the parent before reading the split (a short sum = a pre-2026-10-05 boot).
+   */
+  rejectionSubReasons: Record<string, number>;
   firstAt: number;
   lastAt: number;
 }
@@ -716,6 +736,7 @@ export function summarizeRvScanCensus(): RvScanCensusDay[] {
     universeSum: number;
     blindScansByGate: Map<string, number>;
     blindRejectionsByGate: Map<string, number>;
+    subs: Map<string, number>;
     firstAt: number;
     lastAt: number;
   }
@@ -744,6 +765,7 @@ export function summarizeRvScanCensus(): RvScanCensusDay[] {
         universeSum: 0,
         blindScansByGate: new Map(),
         blindRejectionsByGate: new Map(),
+        subs: new Map(),
         firstAt: t.firstAt,
         lastAt: t.lastAt,
       };
@@ -761,6 +783,7 @@ export function summarizeRvScanCensus(): RvScanCensusDay[] {
     agg.blindScans += t.blindScans;
     mergeGates(agg.blindScansByGate, gatesToObject(t.blindScansByGate));
     mergeGates(agg.blindRejectionsByGate, gatesToObject(t.blindRejectionsByGate));
+    mergeGates(agg.subs, gatesToObject(t.rejectionSubReasons));
     agg.universeSum += t.universeSum;
     if (t.firstAt < agg.firstAt) agg.firstAt = t.firstAt;
     if (t.lastAt > agg.lastAt) agg.lastAt = t.lastAt;
@@ -787,6 +810,7 @@ export function summarizeRvScanCensus(): RvScanCensusDay[] {
           universeSum: a.universeSum,
           blindScansByGate: gatesToObject(a.blindScansByGate),
           blindRejectionsByGate: gatesToObject(a.blindRejectionsByGate),
+          rejectionSubReasons: gatesToObject(a.subs),
           firstAt: a.firstAt,
           lastAt: a.lastAt,
         }))

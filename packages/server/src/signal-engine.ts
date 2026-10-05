@@ -13835,8 +13835,14 @@ export class SignalEngine {
             spot: result.spot,
           });
         }
-        if (result.reason !== 'ok' || result.candidates.length === 0) {
-          scanRun.reject(result.reason !== 'ok' ? `scan:${result.reason}` : 'no_candidates');
+        if (result.reason !== 'ok') {
+          scanRun.reject(`scan:${result.reason}`);
+          continue;
+        }
+        if (result.candidates.length === 0) {
+          // TRA-5154 — same `no_candidates` bucket, now split by the first-binding
+          // reason the scanner stamped. One call, so parent and split agree.
+          scanRun.rejectSub('no_candidates', result.noCandidatesReason ?? 'unattributed');
           continue;
         }
 

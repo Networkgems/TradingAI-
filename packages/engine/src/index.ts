@@ -534,6 +534,8 @@ export type {
 } from './options/short-premium-scanner.js';
 export {
   findRelativeValueOpportunities,
+  // TRA-5154 — one-label-per-call attribution of an empty scan.
+  explainRelativeValueNoCandidates,
   // TRA-4413 item 4 — the per-(expiration, type) skew fit as a read surface,
   // and the cross-expiration term-structure pass (grouped type|deltaBucket,
   // IV fitted against √T). Both pure; shadow wiring/flagging is the caller's.

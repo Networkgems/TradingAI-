@@ -439,6 +439,14 @@ export interface RvScanRecord {
   /** Opens the account actually accepted (≤ candidatesPassed). */
   opensPlaced: number;
   rejectionsByGate: Record<string, number>;
+  /**
+   * TRA-5154 — a SUB-attribution of selected `rejectionsByGate` buckets, keyed
+   * `<gate>:<sub>` (e.g. `no_candidates:row_gate:max_spread_pct`). It is a
+   * REFINEMENT, never a second count: for every gate that carries subs,
+   * `sum(rejectionSubReasons[<gate>:*]) === rejectionsByGate[<gate>]`, so the
+   * parent bucket and the pass-level balance are unchanged. Omitted when empty.
+   */
+  rejectionSubReasons?: Record<string, number>;
   /** True iff `sum(rejectionsByGate) === candidatesEvaluated - candidatesPassed`. */
   bucketsBalance: boolean;
   /**
@@ -495,6 +503,8 @@ export class RvScanRun {
   private passed = 0;
   private opens = 0;
   private readonly gates = new Map<string, number>();
+  /** TRA-5154 — `<gate>:<sub>` refinement of `gates`; see {@link RvScanRecord.rejectionSubReasons}. */
+  private readonly subs = new Map<string, number>();
   private stoppedEarly: string | null = null;
   private sweep: RvScanSweepSlice | null = null;
   private done = false;
@@ -516,6 +526,17 @@ export class RvScanRun {
   /** Tag the gate that rejected the current symbol. One call per rejected symbol. */
   reject(gate: string): void {
     this.gates.set(gate, (this.gates.get(gate) ?? 0) + 1);
+  }
+
+  /**
+   * TRA-5154 — {@link reject} plus a sub-reason, in ONE call so the parent bucket
+   * and its split cannot disagree. The gate count is the same as `reject(gate)`;
+   * the sub is bookkeeping on top of it.
+   */
+  rejectSub(gate: string, sub: string): void {
+    this.reject(gate);
+    const key = `${gate}:${sub}`;
+    this.subs.set(key, (this.subs.get(key) ?? 0) + 1);
   }
 
   /** The current symbol cleared every gate and is about to be routed to the account. */
@@ -612,6 +633,7 @@ export class RvScanRun {
       candidatesPassed: this.passed,
       opensPlaced: this.opens,
       rejectionsByGate,
+      ...(this.subs.size > 0 ? { rejectionSubReasons: Object.fromEntries(this.subs) } : {}),
       bucketsBalance: tagged === expected,
       reconciliation,
       stoppedEarlyReason: this.stoppedEarly,
