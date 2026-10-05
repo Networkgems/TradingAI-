@@ -2286,7 +2286,7 @@ export function renderUsage() {
     '',
     'EXIT CODES',
     '  0  deploy triggered (or --dry-run allowed, or --help printed)',
-    '  2  usage / unknown argument / auth / API error',
+    '  2  usage / unknown argument / auth / API error — this run created NO deploy',
     '  4  REFUSED — RTH freeze on the soak host, no override',
     '  5  REFUSED — a dated embargo covers this instant, no override',
     '  6  REFUSED — the deploy would carry a HELD COMMIT, or cannot be proven not to',
@@ -2294,6 +2294,11 @@ export function renderUsage() {
     '  8  REFUSED — the deploy would ROLL THE HOST BACK, or cannot be proven not to',
     '  9  REFUSED — an open hold in ops/deploy-hold.json covers this service (or it is BLIND)',
     ' 10  REFUSED — this window\'s CADENCE CEILING is spent by earlier commit advances (or is BLIND)',
+    ' 11  TRIGGERED-UNCONFIRMED — the deploy POST was ACCEPTED (2xx) but the response/history',
+    '     could not confirm it (TRA-5180). NOT a refusal: a deploy almost certainly EXISTS.',
+    '     ⛔ Do NOT re-run on exit 11. Read the deploy history first (GET /v1/services/{id}/',
+    '     deploys?limit=5, or scripts/render-deploy-status.mjs) and retry only once you have',
+    '     PROVEN no deploy was created — a blind re-run is a SECOND real deploy.',
     '',
     'THIS PRINTS AND EXITS. It deploys nothing. Before TRA-4420 it deployed the branch tip.',
   ].join('\n');
@@ -2311,6 +2316,78 @@ export function renderArgRefusal(problems) {
   );
 }
 
+// ── TRA-5180: the deploy POST's RESPONSE is not the deploy ───────────────────
+//
+// Measured 2026-10-05T20:06Z on the TRA-5175 deploy: the POST succeeded (Render's history
+// shows dep-db206j569bns73dppih0, created by that invocation), the response body came back
+// EMPTY, the unconditional JSON.parse threw, and the script exited 2 — the refusal family,
+// whose documented remedy is "fix the arguments and RE-RUN". A re-run is a SECOND real
+// deploy. "Deploy created, confirmation lost" and "deploy refused" must never share an exit
+// code — the same BROKEN-vs-BLIND separation check:deploy-build is built on.
+//
+// So the deploy POST's response is classified, never blindly parsed:
+//   REFUSED             — non-2xx. Render did not create a deploy for this request.
+//   CONFIRMED           — 2xx with a parseable body naming the deploy. The normal path.
+//   CREATED_UNCONFIRMED — 2xx with an empty/unparseable body. The deploy almost certainly
+//                         EXISTS; only the confirmation was lost. main() then re-reads the
+//                         deploy history: a newest row matching the requested commit inside
+//                         UNCONFIRMED_MATCH_WINDOW_MS confirms it (exit 0); anything else
+//                         exits EXIT_TRIGGERED_UNCONFIRMED, which is NOT a refusal and must
+//                         never be answered with a blind re-run.
+export const EXIT_TRIGGERED_UNCONFIRMED = 11;
+// Generous against clock skew and queue latency, far too short to reach back to yesterday's
+// deploy of the same sha: the thing it must exclude is "an EARLIER deploy of this commit
+// reads as my confirmation" (a same-SHA env-apply is a routine invocation of this script).
+export const UNCONFIRMED_MATCH_WINDOW_MS = 10 * 60 * 1000;
+
+export function classifyDeployPostResponse({ ok, status, statusText = '', bodyText }) {
+  const text = typeof bodyText === 'string' ? bodyText.trim() : '';
+  if (!ok) {
+    return { kind: 'REFUSED', status, detail: `${status} ${statusText} ${text}`.trim() };
+  }
+  if (text === '') return { kind: 'CREATED_UNCONFIRMED', status, why: `HTTP ${status} with an EMPTY body` };
+  try {
+    return { kind: 'CONFIRMED', status, json: JSON.parse(text) };
+  } catch (e) {
+    return {
+      kind: 'CREATED_UNCONFIRMED',
+      status,
+      why: `HTTP ${status} with an unparseable body (${e?.message ?? String(e)}): ${text.slice(0, 120)}`,
+    };
+  }
+}
+
+// Pure, so the control suite can drive it without a network. `rows` is the raw page from
+// GET /services/{id}/deploys?limit=1 (entries may be {deploy,cursor}-wrapped, like
+// fetchDeployHistory's), `requestedSha` is the sha this run asked Render to build.
+export function confirmDeployAgainstHistory(rows, requestedSha, nowMs = Date.now(), windowMs = UNCONFIRMED_MATCH_WINDOW_MS) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { confirmed: false, row: null, why: 'the deploy-history read returned no rows' };
+  }
+  const d = rows[0]?.deploy ?? rows[0];
+  const sha = typeof d?.commit?.id === 'string' ? d.commit.id : null;
+  const createdAt = typeof d?.createdAt === 'string' ? d.createdAt : null;
+  const row = { id: d?.id ?? '(unknown id)', sha, status: d?.status ?? '(unknown status)', createdAt };
+  if (!requestedSha) {
+    return { confirmed: false, row, why: 'this run\'s target sha is unresolved, so the newest row cannot be matched to it' };
+  }
+  if (!sha || !sameCommitSha(sha, requestedSha)) {
+    return { confirmed: false, row, why: `the newest deploy carries ${sha ?? '(no commit)'}, not the requested ${requestedSha}` };
+  }
+  const createdMs = Date.parse(createdAt ?? '');
+  if (!Number.isFinite(createdMs) || Math.abs(nowMs - createdMs) > windowMs) {
+    return {
+      confirmed: false,
+      row,
+      why:
+        `the newest matching deploy was created at ${createdAt ?? '(unreadable createdAt)'}, outside the ` +
+        `±${Math.round(windowMs / 60000)}min confirmation window — it may be an EARLIER deploy of the same commit, ` +
+        'not the one this run POSTed',
+    };
+  }
+  return { confirmed: true, row };
+}
+
 async function api(path, init) {
   const r = await fetch(`${API}${path}`, {
     ...init,
@@ -2321,11 +2398,24 @@ async function api(path, init) {
       ...(init?.headers ?? {}),
     },
   });
+  // TRA-5180: body as TEXT first, never an unconditional r.json(). A 2xx with an empty body
+  // used to throw `SyntaxError: Unexpected end of JSON input` out of here, land in main()'s
+  // catch, and exit 2 — the refusal family — AFTER the request had already taken effect.
+  // ⛔ This helper must never carry the deploy POST for exactly that reason: a mutating verb
+  // needs the CREATED_UNCONFIRMED path in main(), not a fail(2). Reads only.
+  const body = await r.text().catch(() => '');
   if (!r.ok) {
-    const body = await r.text().catch(() => '');
     fail(2, `${init?.method ?? 'GET'} ${path} → ${r.status} ${r.statusText} ${body}`.trim());
   }
-  return r.json();
+  try {
+    return JSON.parse(body);
+  } catch {
+    fail(
+      2,
+      `${init?.method ?? 'GET'} ${path} → ${r.status} with an empty/unparseable JSON body ` +
+        `(${body.trim() === '' ? 'empty' : `${body.length} bytes`}) — the read failed, nothing was decided from it.`,
+    );
+  }
 }
 
 // Read the service's live env vars for the AUTH_SECRET gate.
@@ -3060,14 +3150,95 @@ async function main() {
     process.exit(0);
   }
 
-  const deploy = await api(`/services/${service.id}/deploys`, {
-    method: 'POST',
-    body: JSON.stringify(body),
+  // ── TRA-5180: the POST, with its response CLASSIFIED rather than blindly parsed ──
+  // Deliberately NOT api(): that helper exits 2 on any read problem, and once this request
+  // is on the wire an exit from the refusal family is a lie that invites a double-deploy.
+  // See classifyDeployPostResponse above for the three outcomes and why they exist.
+  const postPath = `/services/${service.id}/deploys`;
+  const authHeaders = { Authorization: `Bearer ${API_KEY}`, Accept: 'application/json' };
+  let postRes;
+  try {
+    postRes = await fetch(`${API}${postPath}`, {
+      method: 'POST',
+      headers: { ...authHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    // The fetch itself threw — usually nothing reached Render, but a connection dropped
+    // mid-flight is also this shape, so the remedy line still says: read the history first.
+    fail(
+      2,
+      `POST ${postPath} threw before a response was read: ${e?.message ?? String(e)}. ` +
+        `Most likely nothing reached Render — but confirm with GET /v1${postPath}?limit=1 BEFORE any retry.`,
+    );
+  }
+  const postBodyText = await postRes.text().catch(() => '');
+  const outcome = classifyDeployPostResponse({
+    ok: postRes.ok,
+    status: postRes.status,
+    statusText: postRes.statusText,
+    bodyText: postBodyText,
   });
-  const d = deploy.deploy ?? deploy;
-  console.log(`deploy  : ${d.id ?? '(unknown id)'} — ${d.status ?? 'triggered'}`);
-  console.log('[render-redeploy] deploy triggered. Poll with scripts/render-deploy-status.mjs (RENDER_WATCH_MS=…).');
-  process.exit(0);
+
+  if (outcome.kind === 'REFUSED') {
+    fail(2, `POST ${postPath} → ${outcome.detail} — Render REFUSED the request; this run created no deploy.`);
+  }
+
+  if (outcome.kind === 'CONFIRMED') {
+    const d = outcome.json.deploy ?? outcome.json;
+    console.log(`deploy  : ${d.id ?? '(unknown id)'} — ${d.status ?? 'triggered'}`);
+    console.log('[render-redeploy] deploy triggered. Poll with scripts/render-deploy-status.mjs (RENDER_WATCH_MS=…).');
+    process.exit(0);
+  }
+
+  // CREATED_UNCONFIRMED. Say the dangerous half FIRST, before anything else can throw: the
+  // POST was accepted, so as of this line a deploy almost certainly exists on the host.
+  console.error(
+    `[render-redeploy] ⚠ the deploy POST was ACCEPTED (${outcome.why}), but the response did not name the deploy.\n` +
+      `[render-redeploy] ⚠ A DEPLOY WAS ALMOST CERTAINLY CREATED. DO NOT RE-RUN THIS SCRIPT ON THIS EXIT — a re-run is a SECOND real deploy.`,
+  );
+  console.error(`[render-redeploy] confirming against GET ${postPath}?limit=1 …`);
+  let historyRows = null;
+  let historyErr = null;
+  try {
+    const hr = await fetch(`${API}${postPath}?limit=1`, { headers: authHeaders });
+    const ht = await hr.text().catch(() => '');
+    if (!hr.ok) {
+      historyErr = `GET ${postPath}?limit=1 → ${hr.status} ${hr.statusText} ${ht}`.trim();
+    } else {
+      try {
+        historyRows = JSON.parse(ht);
+      } catch {
+        historyErr = `GET ${postPath}?limit=1 returned an unparseable body`;
+      }
+    }
+  } catch (e) {
+    historyErr = `GET ${postPath}?limit=1 threw: ${e?.message ?? String(e)}`;
+  }
+  const confirmation = historyErr
+    ? { confirmed: false, row: null, why: historyErr }
+    : confirmDeployAgainstHistory(historyRows, target.sha ?? null);
+  if (confirmation.row) {
+    console.error(
+      `[render-redeploy] newest deploy row: ${confirmation.row.id} — commit ${confirmation.row.sha ?? '(no commit)'}, ` +
+        `status ${confirmation.row.status}, createdAt ${confirmation.row.createdAt ?? '(unreadable)'}`,
+    );
+  }
+  if (confirmation.confirmed) {
+    console.log(
+      `deploy  : ${confirmation.row.id} — ${confirmation.row.status} ` +
+        `(confirmed from the deploy history after an empty POST response; commit ${short(confirmation.row.sha)})`,
+    );
+    console.log('[render-redeploy] deploy triggered. Poll with scripts/render-deploy-status.mjs (RENDER_WATCH_MS=…).');
+    process.exit(0);
+  }
+  console.error(
+    `[render-redeploy] TRIGGERED-UNCONFIRMED (exit ${EXIT_TRIGGERED_UNCONFIRMED}): the POST was accepted but the deploy ` +
+      `could not be confirmed — ${confirmation.why}.\n` +
+      `[render-redeploy] This is NOT a refusal and NOT a usage error. Read the deploy history ` +
+      `(GET /v1${postPath}?limit=5, or scripts/render-deploy-status.mjs) and only retry once you have PROVEN no deploy was created.`,
+  );
+  process.exit(EXIT_TRIGGERED_UNCONFIRMED);
 }
 
 // Run only when invoked directly, so the gate predicates above can be imported and
