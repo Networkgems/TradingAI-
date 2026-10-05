@@ -1337,8 +1337,8 @@ export function runPcrExpectancy(
       `DECISIVE NO-GO: session-clustered 90% CI upper bound ${ciUpper.toFixed(4)}R < ` +
         `${PCR_UPLIFT_BAR_R}R bar — even the optimistic end of the interval cannot clear it ` +
         `(bias-adjusted uplift ${primary.adjustedUpliftR.toFixed(4)}R; raw ` +
-        `${primary.rawUpliftR.toFixed(4)}R, of which ${primary.placeboUpliftR.toFixed(4)}R is ` +
-        `earned by a zero-information placebo)`,
+        `${primary.rawUpliftR.toFixed(4)}R [NOT PROMOTABLE — TRA-5122], of which ` +
+        `${primary.placeboUpliftR.toFixed(4)}R is earned by a zero-information placebo)`,
     );
   } else {
     verdict = 'HELD';
