@@ -15797,16 +15797,17 @@ export class SignalEngine {
             && nowMs < otmDedupeSuppressionEndMs(s, otmDedupeWindows),
         );
         if (recentDup) {
-          // TRA-5155 — distinguish parked-echo rejections from genuine duplicates.
-          // If the recent signal was parked by a downstream gate (entry_window,
-          // cost_bar, etc.), tag this rejection distinctly so the census can
-          // reconcile the echo against the origin gate's count instead of
-          // double-counting it as an upstream death.
-          const originGate = recentDup.signalSkipReasonCode;
-          const rejectReason = originGate
-            ? `recent_duplicate:parked_echo:${originGate}`
-            : 'recent_duplicate';
-          scanRun.reject(rejectReason);
+          // TRA-5155 — telemetry only, same `continue`. A token that is a PARKED
+          // REFUSAL (TRA-4974 cost bar, entry window, ...) carries a skip reason;
+          // re-rejecting it here is an ECHO of a downstream death, and counting
+          // it as the plain duplicate label inflates this upstream stage ~12x/hour.
+          // A genuine fresh-signal duplicate carries none and keeps the old label.
+          const parked = recentDup as { signalSkipReason?: string; signalSkipReasonCode?: string };
+          if (!parked.signalSkipReason && !parked.signalSkipReasonCode) {
+            scanRun.reject('recent_duplicate');
+          } else {
+            scanRun.reject(`recent_duplicate:parked_echo:${parked.signalSkipReasonCode ?? 'unclassified'}`);
+          }
           continue;
         }
 
