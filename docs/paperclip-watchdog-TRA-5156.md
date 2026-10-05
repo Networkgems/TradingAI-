@@ -17,3 +17,11 @@ it tree-kills the listener's own ancestor chain only, then runs `Paperclip-Autos
 
 **The probe loads on the NEXT server start.** Installing the tasks does not restart the live server (that would orphan every in-flight agent run).
 Until then the watchdog reads `tick_probe_absent`.
+
+**Grade the watchdog off `logs/watchdog-state.json` (`checkedAt`, `outcome`, `armed`), never `LastTaskResult`.**
+`Get-ScheduledTaskInfo Paperclip-Watchdog` reads `LastTaskResult = 1` whenever the watchdog correctly exits non-zero
+on `tick_probe_absent`; that is indistinguishable from a crashed watchdog at the task-info surface. Do not "fix" it.
+
+**The port guard cannot restart a live server** (it triggers on an absent listener), and the probe loads only into a freshly
+spawned process. So `tick_probe_absent` persists until a hand-start or an unattended reboot. Closing it on a schedule
+means a bounded restart in a quiet window (not an armed kill).
