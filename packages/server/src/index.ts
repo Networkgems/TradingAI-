@@ -502,7 +502,7 @@ import {
 import { initStateDb, getStateDb, getStateDbStatus } from './sqlite.js'; // TRA-1052 — durable hot-state SQLite store
 import { evaluateDurability, enforceDurabilityPolicy } from './durability.js'; // TRA-1681 — fail CLOSED
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
-import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
+import { getSettings, loadSettings, mergeScopedRiskSettings, revokeTradierCredentials, saveSettings } from './account-settings.js';
 import { resolveLiveBrokerOperator, isLiveBrokerOperator, shouldBootArmLiveEquity, resolveLiveBrokerArmDrift, applyLiveBrokerArm, resolvePinnedOperatorDemotionWhileIneligible } from './signal-engine.js';
 // TRA-3112 — the ONE copy of the market-data / account endpoint-class split that
 // decides whether the shared `process.env.TRADIER_*` fallback is lendable.
@@ -16036,6 +16036,33 @@ app.put('/api/account/trading-memory', requireAuth, async (req, res, next) => {
 // instead of only from a Render log dig (which is how TRA-2649 had to be found).
 let liveBrokerArmWriteRepairs = 0;
 let liveBrokerArmLastWriteRepairAt: string | null = null;
+
+// TRA-5125 AC3 — first-class revoke for the caller's OWN saved Tradier pair.
+// Clears the stored token + account id for `env` and persists (encrypted at
+// rest). The next account-verb call then hits the TRA-3112 refusal pair
+// (403 tradier_operator_pinned / 409 tradier_no_creds) — it can never fall
+// back to a borrowed operator client, because the fallback is operator-pinned
+// at the resolver. Rotation = this verb (or simply a settings PUT) followed by
+// saving the new pair.
+app.post('/api/account/tradier/credentials/revoke', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const env = (req.body as { env?: string } | undefined)?.env;
+  if (env !== 'production' && env !== 'sandbox') {
+    res.status(400).json({ ok: false, error: 'Body must be { env: "production" | "sandbox" }.' });
+    return;
+  }
+  try {
+    const { cleared } = await revokeTradierCredentials(username, env);
+    res.json({ ok: true, env, cleared });
+  } catch (err: unknown) {
+    log.error('TRA-5125 revoke failed', {
+      username,
+      env,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ ok: false, error: 'Revoke failed to persist; stored credentials unchanged. Retry.' });
+  }
+});
 
 app.put('/api/account/settings', requireAuth, async (req, res) => {
   const username = res.locals['authUser'] as string;

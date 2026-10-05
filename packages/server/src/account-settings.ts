@@ -6,6 +6,11 @@ import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { getStateDb, type StateDb } from './sqlite.js';
 import { resolveDataDir } from './data-dir.js';
+import {
+  decryptCredentialFields,
+  encryptCredentialFields,
+  resolveSettingsCryptoKeys,
+} from './settings-crypto.js';
 
 const log = logger.child({ module: 'account-settings' });
 
@@ -27,15 +32,69 @@ function settingsDb(): StateDb | null {
   if (!settingsTableReady.has(db)) {
     db.exec('CREATE TABLE IF NOT EXISTS account_settings (username TEXT PRIMARY KEY, settings_json TEXT NOT NULL)');
     settingsTableReady.add(db);
+    // TRA-5125 — one pass per db handle: wrap any plaintext credential still
+    // sitting in `settings_json`. Idempotent; failure is logged, never fatal
+    // (a migration crash must not take settings persistence down with it).
+    try {
+      migrateSettingsRowsAtRest(db);
+    } catch (err) {
+      log.error('TRA-5125 at-rest migration failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
   return db;
+}
+
+// ─── TRA-5125 — broker credentials are encrypted AT THE PERSIST BOUNDARY ────
+// Plaintext lives only in process memory (the per-user cache). Every byte that
+// reaches `state.db` or a settings JSON file has the PERSISTED_CREDENTIAL_FIELDS
+// wrapped as `enc:v1:gcm:` AES-256-GCM ciphertext; every load unwraps them. A
+// field that cannot be decrypted is served BLANK so the account-verb resolution
+// (tradier-client-scope.ts) answers its loud 403/409 — it never falls back to a
+// borrowed operator client and never ships ciphertext to the broker.
+let warnedNoKey = false;
+
+/** Encrypt credential fields for persistence. Logs (names only) when no key resolves. */
+function encryptForPersist(settings: AccountSettings): AccountSettings {
+  const keys = resolveSettingsCryptoKeys();
+  const outcome = encryptCredentialFields(
+    settings as unknown as Record<string, unknown>,
+    PERSISTED_CREDENTIAL_FIELDS,
+    keys,
+  );
+  if (outcome.plaintextRetained.length > 0 && !warnedNoKey) {
+    warnedNoKey = true;
+    log.warn(
+      'TRA-5125 settings-crypto: NO KEY — set SETTINGS_ENCRYPTION_KEY or ADMIN_PASSWORD; broker credentials are being persisted in PLAINTEXT',
+      { fields: outcome.plaintextRetained },
+    );
+  }
+  return outcome.settings as unknown as AccountSettings;
+}
+
+/** Decrypt credential fields after a load. Failed fields are blanked and named in the log. */
+function decryptLoaded(parsed: Partial<AccountSettings>, context: { username: string; source: string }): Partial<AccountSettings> {
+  const keys = resolveSettingsCryptoKeys();
+  const outcome = decryptCredentialFields(
+    parsed as unknown as Record<string, unknown>,
+    PERSISTED_CREDENTIAL_FIELDS,
+    keys,
+  );
+  if (outcome.failed.length > 0) {
+    log.warn('TRA-5125 settings-crypto: undecryptable credential fields served BLANK (fail closed)', {
+      ...context,
+      fields: outcome.failed,
+    });
+  }
+  return outcome.settings as unknown as Partial<AccountSettings>;
 }
 
 function writeSettingsRow(db: StateDb, username: string, settings: AccountSettings): void {
   db.prepare(
     `INSERT INTO account_settings (username, settings_json) VALUES (?, ?)
      ON CONFLICT(username) DO UPDATE SET settings_json = excluded.settings_json`,
-  ).run(username, JSON.stringify(settings));
+  ).run(username, JSON.stringify(encryptForPersist(settings)));
 }
 
 // TRA-142 — settings, watchlist, equity, and trades are now per-user. Each
@@ -104,7 +163,7 @@ async function persistMigrated(username: string, settings: AccountSettings): Pro
   if (!existsSync(dir)) {
     await mkdir(dir, { recursive: true });
   }
-  await writeFile(userSettingsFile(username), JSON.stringify(settings, null, 2), 'utf-8');
+  await writeFile(userSettingsFile(username), JSON.stringify(encryptForPersist(settings), null, 2), 'utf-8');
 }
 
 export async function loadSettings(username: string): Promise<AccountSettings> {
@@ -140,7 +199,10 @@ async function loadSettingsViaDb(db: StateDb, username: string): Promise<Account
     | { settings_json: string }
     | undefined;
   if (row) {
-    const parsed = JSON.parse(row.settings_json) as Partial<AccountSettings>;
+    const parsed = decryptLoaded(JSON.parse(row.settings_json) as Partial<AccountSettings>, {
+      username,
+      source: 'sqlite',
+    });
     return { ...DEFAULT_ACCOUNT_SETTINGS, ...parsed } as AccountSettings;
   }
   // No row yet — ONE-TIME import from the legacy per-user JSON file, if present.
@@ -165,7 +227,7 @@ async function readMigratedJsonFile(username: string): Promise<AccountSettings |
   const file = userSettingsFile(username);
   if (!existsSync(file)) return null;
   const raw = await readFile(file, 'utf-8');
-  const parsed = JSON.parse(raw) as Partial<AccountSettings>;
+  const parsed = decryptLoaded(JSON.parse(raw) as Partial<AccountSettings>, { username, source: 'json-import' });
   const merged = { ...DEFAULT_ACCOUNT_SETTINGS, ...parsed } as AccountSettings;
   const credsResult = migrateLegacyLiveCredentials(merged);
   const flagsResult = migrateLegacyAutoTradingFlags(credsResult.settings);
@@ -182,7 +244,7 @@ async function loadSettingsFromJsonFile(username: string): Promise<AccountSettin
   }
   try {
     const raw = await readFile(file, 'utf-8');
-    const parsed = JSON.parse(raw) as Partial<AccountSettings>;
+    const parsed = decryptLoaded(JSON.parse(raw) as Partial<AccountSettings>, { username, source: 'json-file' });
     const merged = { ...DEFAULT_ACCOUNT_SETTINGS, ...parsed } as AccountSettings;
     const credsResult = migrateLegacyLiveCredentials(merged);
     const flagsResult = migrateLegacyAutoTradingFlags(credsResult.settings);
@@ -286,7 +348,7 @@ export async function saveSettings(username: string, settings: AccountSettings):
   // the next GET /api/account/settings reload pulls the old (or empty) file.
   // Exactly the divergence the TRA-505 screenshot captured.
   const file = userSettingsFile(username);
-  await writeFile(file, JSON.stringify(settings, null, 2), 'utf-8');
+  await writeFile(file, JSON.stringify(encryptForPersist(settings), null, 2), 'utf-8');
   cache.set(username, { ...settings });
   logSavePersisted(username, settings);
 }
@@ -472,6 +534,145 @@ export function deleteSettingsRow(
   } finally {
     clearSettingsCache(username);
   }
+}
+
+// ─── TRA-5125 — at-rest migration + rotation/revoke ─────────────────────────
+
+export interface AtRestMigrationReport {
+  /** All rows in `account_settings` at migration time. */
+  totalRows: number;
+  /** Rows rewritten this pass (held ≥1 plaintext or previous-key credential). */
+  rowsMigrated: number;
+  /** Credential fields newly wrapped across all rows. */
+  fieldsEncrypted: number;
+  /** Rows re-wrapped because a field decrypted only via SETTINGS_ENCRYPTION_KEY_PREVIOUS. */
+  rowsRewrapped: number;
+  /** Rows whose JSON failed to parse — left untouched, named in the log. */
+  rowsFailed: number;
+  /** True when no key resolved: nothing was (or could be) encrypted. */
+  noKey: boolean;
+}
+
+let lastAtRestMigrationReport: AtRestMigrationReport | null = null;
+
+/** The report of the most recent at-rest migration pass (AC4 enumeration source). */
+export function getAtRestMigrationReport(): AtRestMigrationReport | null {
+  return lastAtRestMigrationReport;
+}
+
+/**
+ * Wrap every plaintext credential sitting in `account_settings.settings_json`.
+ *
+ * Runs once per db handle from {@link settingsDb} (so: every boot, before the
+ * first settings read). Idempotent — already-encrypted fields pass through —
+ * and it also RE-WRAPS fields that only the previous key could open, which is
+ * what makes the two-key rotation story converge instead of leaving old-key
+ * ciphertexts behind forever.
+ *
+ * Counts are logged and retained for {@link getAtRestMigrationReport}; the AC4
+ * requirement is an ENUMERATED row count, and this is where it comes from.
+ */
+export function migrateSettingsRowsAtRest(db: StateDb): AtRestMigrationReport {
+  const keys = resolveSettingsCryptoKeys();
+  const rows = db.prepare('SELECT username, settings_json FROM account_settings').all() as Array<{
+    username: string;
+    settings_json: string;
+  }>;
+  const report: AtRestMigrationReport = {
+    totalRows: rows.length,
+    rowsMigrated: 0,
+    fieldsEncrypted: 0,
+    rowsRewrapped: 0,
+    rowsFailed: 0,
+    noKey: keys === null,
+  };
+  if (keys === null) {
+    lastAtRestMigrationReport = report;
+    log.warn('TRA-5125 at-rest migration: NO KEY resolved — rows left as stored', { totalRows: rows.length });
+    return report;
+  }
+  const update = db.prepare('UPDATE account_settings SET settings_json = ? WHERE username = ?');
+  for (const row of rows) {
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(row.settings_json) as Record<string, unknown>;
+    } catch {
+      report.rowsFailed += 1;
+      log.warn('TRA-5125 at-rest migration: unparseable settings_json row skipped', { username: row.username });
+      continue;
+    }
+    // Decrypt first so previous-key ciphertexts come back to plaintext, then
+    // re-encrypt everything under the primary. Fields that fail to decrypt are
+    // left EXACTLY as stored (not blanked): a migration must never destroy a
+    // ciphertext a later, correctly-keyed boot could still recover.
+    const dec = decryptCredentialFields(parsed, PERSISTED_CREDENTIAL_FIELDS, keys);
+    const needsRewrap = dec.usedPreviousKey.length > 0;
+    const working: Record<string, unknown> = { ...parsed };
+    for (const field of [...dec.decrypted]) working[field] = (dec.settings as Record<string, unknown>)[field];
+    const enc = encryptCredentialFields(working, PERSISTED_CREDENTIAL_FIELDS, keys);
+    const newlyWrapped = enc.encrypted.filter((f) => !dec.decrypted.includes(f));
+    if (newlyWrapped.length === 0 && !needsRewrap) continue;
+    update.run(JSON.stringify(enc.settings), row.username);
+    clearSettingsCache(row.username);
+    report.rowsMigrated += 1;
+    report.fieldsEncrypted += newlyWrapped.length;
+    if (needsRewrap) report.rowsRewrapped += 1;
+  }
+  if (report.rowsMigrated > 0) {
+    // The UPDATE alone is not at-rest: the PLAINTEXT row images it replaced
+    // still sit in the WAL frames and freelist pages of state.db. Checkpoint
+    // then VACUUM so the migrated plaintext is actually gone from the bytes
+    // on disk — AC1's grep is over the file, not over the live rows.
+    try {
+      db.pragma('wal_checkpoint(TRUNCATE)');
+      db.exec('VACUUM');
+      db.pragma('wal_checkpoint(TRUNCATE)');
+    } catch (err) {
+      log.warn('TRA-5125 at-rest migration: post-migration VACUUM/checkpoint failed — stale plaintext pages may remain until the next checkpoint', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  lastAtRestMigrationReport = report;
+  log.info('TRA-5125 at-rest migration complete', { ...report });
+  return report;
+}
+
+/**
+ * Credential fields cleared by a revoke, per env. Sandbox also clears the
+ * legacy un-suffixed pair because `savedCreds` (tradier-client-scope.ts) falls
+ * back to it — leaving it populated would make a sandbox revoke a no-op for
+ * pre-TRA-226 accounts.
+ */
+export const TRADIER_REVOKE_FIELDS: Readonly<Record<'production' | 'sandbox', ReadonlyArray<keyof AccountSettings>>> = {
+  production: ['liveApiKeyOptionsProduction', 'liveAccountIdOptionsProduction'],
+  sandbox: ['liveApiKeyOptionsSandbox', 'liveAccountIdOptionsSandbox', 'liveApiKeyOptions', 'liveAccountIdOptions'],
+};
+
+/**
+ * TRA-5125 AC3 — rotation/revoke. Blanks the stored Tradier credential pair for
+ * `env` and persists. After this, the next account-verb call resolves to the
+ * loud refusal pair (403 `tradier_operator_pinned` / 409 `tradier_no_creds`,
+ * TRA-3112) — never a borrowed operator client. Rotation is the same verb with
+ * a save of the new pair afterwards (the ordinary settings PUT).
+ *
+ * Returns the NAMES of fields that actually held a value. Never the values.
+ */
+export async function revokeTradierCredentials(
+  username: string,
+  env: 'production' | 'sandbox',
+): Promise<{ cleared: string[] }> {
+  const current = await loadSettings(username);
+  const next: AccountSettings = { ...current };
+  const cleared: string[] = [];
+  for (const field of TRADIER_REVOKE_FIELDS[env]) {
+    const raw = next[field];
+    if (typeof raw === 'string' && raw.trim() !== '') cleared.push(String(field));
+    (next as unknown as Record<string, unknown>)[String(field)] = '';
+  }
+  await saveSettings(username, next);
+  log.info('TRA-5125 revoke: Tradier credentials cleared', { username, env, cleared });
+  return { cleared };
 }
 
 /**
