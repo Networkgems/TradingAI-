@@ -689,6 +689,10 @@ import {
   isIvArchiveSeedEnabled,
   IV_ARCHIVE_SEED_FLAG,
 } from './iv-rank-archive.js';
+// TRA-5171 — the read-only seedable-depth census behind the TRA-5170 seed
+// decision, warmed in the background at boot so /api/health/short-premium can
+// state the archive's depth as a number instead of a stale code comment.
+import { ensureArchiveSeedCensusFresh } from './iv-seed-census.js';
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
 import {
@@ -1528,6 +1532,11 @@ void runMacroRefresh();
 // synchronous `ivRankSync` read used by the AI Options Ideas fusion has data
 // available right after boot. The store is appended to as chains are pulled.
 await initIvRankStore();
+
+// TRA-5171 — kick the chain-archive seedable-depth census (a cached disk walk)
+// in the background. Deliberately NOT awaited: a large archive must never delay
+// boot, and the health route reads an honest `pending` until it lands.
+void ensureArchiveSeedCensusFresh();
 
 // TRA-2206 (TRA-1965) — optionally deepen that store from the recorded chain
 // archive. The store only starts accumulating for a symbol once that symbol

@@ -123,6 +123,10 @@ import {
 } from '../rv-scan-telemetry.js'; // TRA-2193 / TRA-2245
 import { gradeRvScanRthStaleness } from '../rv-scan-rth-staleness.js'; // TRA-5087
 import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
+// TRA-5171 — WHY the trailing-IV store is what it is: boot-load provenance plus
+// the chain-archive seedable-depth census behind the TRA-5170 seed decision.
+import { readIvStoreProvenanceSync } from '../iv-rank-store.js';
+import { readArchiveSeedCensusSync, summarizeSeedableUniverse } from '../iv-seed-census.js';
 import { buildWheelPromotionGateSummary } from '../wheel-promotion-gate-store.js'; // TRA-2028
 import {
   summarizeConvictionDca,
@@ -5750,12 +5754,21 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // ever placed off these structures — demo routing / graduation is a separate
   // board decision.
   app.get('/api/health/short-premium', (_req, res) => {
+    const summary = summarizeShortPremiumScans(now());
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       enabled: isOptionShortPremiumScannerEnabled(),
-      ...summarizeShortPremiumScans(now()),
+      ...summary,
+      // TRA-5171 — the empty-store WHY, in one read. `ivStoreProvenance.bootLoad`
+      // separates file-absent / parse-error / parsed-but-shallow (three states
+      // that used to serialise identically); the census blocks state what the
+      // deferred archive seed (TRA-5170) would actually deliver. Observe-only:
+      // nothing here gates, and the fail-open IVR floor is untouched.
+      ivStoreProvenance: readIvStoreProvenanceSync(),
+      archiveSeedCensus: readArchiveSeedCensusSync(Date.now()),
+      seedableUniverse: summarizeSeedableUniverse(summary.scans.map((s) => s.symbol)),
     });
   });
 

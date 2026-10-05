@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { OptionChainRow } from '@trading-app/engine';
@@ -13,6 +13,7 @@ import {
   atmIvFromRows,
   setIvStoreFileForTests,
   MIN_IV_SAMPLES,
+  readIvStoreProvenanceSync,
   readIvRankCoverageSync,
   isIvRankStoreLoaded,
   IV_RANK_COVERAGE_CODES,
@@ -294,5 +295,83 @@ describe('readIvRankCoverageSync (TRA-4917) — the five null branches are separ
       expect(IV_RANK_COVERAGE_CODES).toContain(extra);
       expect(IV_PERCENTILE_COVERAGE_CODES as readonly string[]).not.toContain(extra);
     }
+  });
+});
+
+// TRA-5171 — boot-load provenance: the three ways the store can read empty
+// (file absent / corrupt / parsed-but-shallow) must never serialise identically.
+describe('iv-store boot-load provenance (TRA-5171)', () => {
+  let dir: string;
+  let path: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'iv-prov-'));
+    path = join(dir, 'iv-history.json');
+    setIvStoreFileForTests(path);
+  });
+  afterEach(() => {
+    setIvStoreFileForTests(null);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reads loaded:false with bootLoad:null (never zeros) before the store loads', () => {
+    const view = readIvStoreProvenanceSync();
+    expect(view.loaded).toBe(false);
+    expect(view.bootLoad).toBeNull();
+    expect(view.storeFile).toBe(path);
+  });
+
+  it('file absent: storeFileExisted:false, parseError:null, zero samples', async () => {
+    await initIvRankStore();
+    const b = readIvStoreProvenanceSync().bootLoad!;
+    expect(b.storeFileExisted).toBe(false);
+    expect(b.parseError).toBeNull();
+    expect(b.symbolsLoadedAtBoot).toBe(0);
+    expect(b.samplesLoadedAtBoot).toBe(0);
+  });
+
+  it('NEGATIVE CONTROL: a TRUNCATED store file surfaces parseError — never the file-absent shape', async () => {
+    const valid = JSON.stringify({
+      version: 1,
+      updatedAt: 1,
+      symbols: { AAPL: [{ day: '2026-09-01', iv: 0.3 }] },
+    });
+    // A kill mid-write: syntactically broken JSON, exactly the TRA-5170 wipe mechanism.
+    writeFileSync(path, valid.slice(0, Math.floor(valid.length / 2)), 'utf-8');
+    await initIvRankStore();
+    const b = readIvStoreProvenanceSync().bootLoad!;
+    expect(b.storeFileExisted).toBe(true);
+    expect(b.parseError).not.toBeNull();
+    expect(b.samplesLoadedAtBoot).toBe(0);
+    // The forbidden serialisation: corrupt must NOT read as { samples: 0, parseError: null }.
+    expect(b.parseError === null && b.samplesLoadedAtBoot === 0).toBe(false);
+  });
+
+  it('a VALID 30-day store reads samplesLoadedAtBoot:30 with the depth histogram keyed at 30 — depth is a measurement, not an instrument ceiling', async () => {
+    const nowMs = Date.now();
+    const thirty = Array.from({ length: 30 }, (_, i) => ({
+      day: new Date(nowMs - (30 - i) * DAY).toISOString().slice(0, 10),
+      iv: 0.2 + i * 0.01,
+    }));
+    writeFileSync(path, JSON.stringify({ version: 1, updatedAt: nowMs, symbols: { AAPL: thirty } }), 'utf-8');
+    await initIvRankStore();
+    const b = readIvStoreProvenanceSync().bootLoad!;
+    expect(b.storeFileExisted).toBe(true);
+    expect(b.parseError).toBeNull();
+    expect(b.symbolsLoadedAtBoot).toBe(1);
+    expect(b.samplesLoadedAtBoot).toBe(30);
+    expect(b.distinctDaysInStore).toBe(30);
+    expect(b.depthHistogram).toEqual({ '30': 1 });
+    expect(b.oldestSampleDay).toBe(thirty[0]!.day);
+    expect(b.newestSampleDay).toBe(thirty[29]!.day);
+  });
+
+  it('counts successful persists since boot', async () => {
+    await initIvRankStore();
+    await recordDailyIv('AAA', 0.3);
+    await recordDailyIv('AAA', 0.4, Date.now() + DAY);
+    const view = readIvStoreProvenanceSync();
+    expect(view.persistCount).toBe(2);
+    expect(view.persistErrors).toBe(0);
+    expect(view.lastPersistError).toBeNull();
   });
 });

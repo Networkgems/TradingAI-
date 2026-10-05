@@ -31,6 +31,10 @@ let storeFileOverride: string | null = null;
 export function setIvStoreFileForTests(path: string | null): void {
   storeFileOverride = path;
   cache = null;
+  bootProvenance = null;
+  persistCount = 0;
+  persistErrors = 0;
+  lastPersistError = null;
 }
 function storeFile(): string {
   return storeFileOverride ?? defaultStoreFile();
@@ -64,11 +68,82 @@ function utcDay(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
+// ── Boot-load provenance (TRA-5171) ─────────────────────────────────────────
+//
+// bqb1 published `ivSampleDepth: 2` on 82/82 scans after THREE MONTHS of daily
+// recording, and no surface could say WHY the store was that shallow. The three
+// candidate mechanisms serialise identically without this block:
+//   file absent      → storeFileExisted:false, parseError:null,  samples 0
+//   file corrupt     → storeFileExisted:true,  parseError:"...", samples 0
+//   parsed + shallow → storeFileExisted:true,  parseError:null,  samples N>0
+// Those three MUST never read the same — that identity is the defect this
+// exists to kill. Captured at the moment the store is actually loaded (boot via
+// `initIvRankStore`, or the first lazy `recordDailyIv`), never re-derived.
+
+/** What the trailing-IV store found the moment it loaded from disk. */
+export interface IvStoreBootProvenance {
+  /** Resolved store path, so a reader can see which disk root it lives under. */
+  storeFile: string;
+  /** Did the file exist when the load ran. */
+  storeFileExisted: boolean;
+  /** The load's catch reason, verbatim — non-null means the file was unreadable/corrupt. */
+  parseError: string | null;
+  symbolsLoadedAtBoot: number;
+  samplesLoadedAtBoot: number;
+  oldestSampleDay: string | null;
+  newestSampleDay: string | null;
+  distinctDaysInStore: number;
+  /**
+   * Usable in-window depth (as of load time) → symbol count. The live incident's
+   * uniform depth-2 shape is itself evidence; publish it rather than making a
+   * grader re-derive it from 82 per-scan rows.
+   */
+  depthHistogram: Record<string, number>;
+  loadedAt: string;
+}
+
+let bootProvenance: IvStoreBootProvenance | null = null;
+let persistCount = 0;
+let persistErrors = 0;
+let lastPersistError: string | null = null;
+
+function captureBootProvenance(
+  map: Map<string, IvSample[]>,
+  path: string,
+  storeFileExisted: boolean,
+  parseError: string | null,
+  loadedAtMs: number,
+): void {
+  let samplesLoaded = 0;
+  const days = new Set<string>();
+  const depthHistogram: Record<string, number> = {};
+  for (const arr of map.values()) {
+    samplesLoaded += arr.length;
+    for (const s of arr) days.add(s.day);
+    const depth = usableInWindowDepth(arr, loadedAtMs);
+    depthHistogram[String(depth)] = (depthHistogram[String(depth)] ?? 0) + 1;
+  }
+  const sortedDays = [...days].sort();
+  bootProvenance = {
+    storeFile: path,
+    storeFileExisted,
+    parseError,
+    symbolsLoadedAtBoot: map.size,
+    samplesLoadedAtBoot: samplesLoaded,
+    oldestSampleDay: sortedDays[0] ?? null,
+    newestSampleDay: sortedDays[sortedDays.length - 1] ?? null,
+    distinctDaysInStore: days.size,
+    depthHistogram,
+    loadedAt: new Date(loadedAtMs).toISOString(),
+  };
+}
+
 async function ensureLoaded(): Promise<Map<string, IvSample[]>> {
   if (cache) return cache;
   const path = storeFile();
   if (!existsSync(path)) {
     cache = new Map();
+    captureBootProvenance(cache, path, false, null, Date.now());
     return cache;
   }
   try {
@@ -92,11 +167,15 @@ async function ensureLoaded(): Promise<Map<string, IvSample[]>> {
       }
     }
     cache = map;
+    captureBootProvenance(cache, path, true, null, Date.now());
   } catch (err) {
-    log.error('failed to read IV store, starting empty', {
-      reason: err instanceof Error ? err.message : String(err),
-    });
+    const reason = err instanceof Error ? err.message : String(err);
+    log.error('failed to read IV store, starting empty', { reason });
     cache = new Map();
+    // ⚠️ The very next persist() will overwrite the file with this empty map —
+    // which is the leading wipe hypothesis on TRA-5170. The provenance block is
+    // what makes that mechanism readable from the health route after the fact.
+    captureBootProvenance(cache, path, true, reason, Date.now());
   }
   return cache;
 }
@@ -111,7 +190,48 @@ async function persist(): Promise<void> {
     updatedAt: Date.now(),
     symbols: Object.fromEntries(cache),
   };
-  await writeFile(path, JSON.stringify(payload), 'utf-8');
+  try {
+    await writeFile(path, JSON.stringify(payload), 'utf-8');
+    persistCount++;
+  } catch (err) {
+    // Counted, then rethrown — behaviour is unchanged (TRA-5171 is observability
+    // only); the counters just make a failing writer visible on the health route.
+    persistErrors++;
+    lastPersistError = err instanceof Error ? err.message : String(err);
+    throw err;
+  }
+}
+
+/** Provenance + since-boot persist counters, as published on /api/health/short-premium. */
+export interface IvStoreProvenanceView {
+  /** Whether the store has been loaded in this process (false ⇒ `bootLoad` is null). */
+  loaded: boolean;
+  /** Resolved store path — readable even before the store loads. */
+  storeFile: string;
+  /** Null until the store loads; never fabricated from defaults. */
+  bootLoad: IvStoreBootProvenance | null;
+  /** Successful whole-store writes since boot. */
+  persistCount: number;
+  /** Failed whole-store writes since boot. */
+  persistErrors: number;
+  lastPersistError: string | null;
+}
+
+/**
+ * TRA-5171 — synchronous read of the boot-load provenance for the health route.
+ * Honest-null discipline: an unloaded store reads `bootLoad: null`, which can
+ * never be confused with a loaded-but-empty one (`bootLoad.samplesLoadedAtBoot: 0`
+ * plus the file-existed/parse-error discriminators).
+ */
+export function readIvStoreProvenanceSync(): IvStoreProvenanceView {
+  return {
+    loaded: cache != null,
+    storeFile: storeFile(),
+    bootLoad: bootProvenance,
+    persistCount,
+    persistErrors,
+    lastPersistError,
+  };
 }
 
 /** Eagerly load the store so the sync accessor has data right after boot. */
@@ -258,6 +378,17 @@ function windowFor(samples: readonly IvSample[], asOf: number): IvSample[] {
   const cutoffMs = asOf - TRAILING_DAYS * 86_400_000;
   const cutoff = utcDay(cutoffMs);
   return samples.filter((s) => s.day >= cutoff);
+}
+
+/**
+ * TRA-5171 — USABLE in-window sample depth: the trailing window further filtered
+ * to finite positive IVs, i.e. exactly the count {@link MIN_IV_SAMPLES} binds
+ * against inside {@link computeIvRank}. Exported so the boot-provenance depth
+ * histogram and the chain-archive seedable-depth census measure the SAME
+ * statistic the live gate does, not a near-miss of it.
+ */
+export function usableInWindowDepth(samples: readonly IvSample[], asOf: number = Date.now()): number {
+  return windowFor(samples, asOf).filter((s) => Number.isFinite(s.iv) && s.iv > 0).length;
 }
 
 /**
