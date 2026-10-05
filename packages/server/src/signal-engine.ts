@@ -22385,6 +22385,18 @@ export class SignalEngine {
     this.optionsBreaker.reset();
   }
 
+  /**
+   * TRA-5127 — the broker-mirror predicate for a manual equity close, exposed
+   * so the close route can gate the ORDER verb without duplicating the
+   * decision `manualClosePosition` makes internally: a row in
+   * `liveEquityPositions` with a constructed live client routes a REAL
+   * Tradier market sell via `closeTradierEquityPosition`; everything else is
+   * a paper close and must stay open to every book.
+   */
+  wouldMirrorEquityCloseToBroker(positionId: string): boolean {
+    return this.liveEquityPositions.has(positionId) && this.tradierLiveEquityClient !== null;
+  }
+
   manualClosePosition(positionId: string, currentPrice: number): Position | null {
     // TRA-952 — refuse a same-session / sub-swing-floor discretionary close so the
     // demo (and live) equity book stops day-trading. Risk exits bypass this path.
