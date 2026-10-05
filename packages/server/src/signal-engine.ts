@@ -15724,7 +15724,19 @@ export class SignalEngine {
             && (s as OtmMispricingSignal).optionSymbol === cheap.optionSymbol
             && nowMs < otmDedupeSuppressionEndMs(s, otmDedupeWindows),
         );
-        if (recentDup) { scanRun.reject('recent_duplicate'); continue; }
+        if (recentDup) {
+          // TRA-5155 — distinguish parked-echo rejections from genuine duplicates.
+          // If the recent signal was parked by a downstream gate (entry_window,
+          // cost_bar, etc.), tag this rejection distinctly so the census can
+          // reconcile the echo against the origin gate's count instead of
+          // double-counting it as an upstream death.
+          const originGate = recentDup.signalSkipReasonCode;
+          const rejectReason = originGate
+            ? `recent_duplicate:parked_echo:${originGate}`
+            : 'recent_duplicate';
+          scanRun.reject(rejectReason);
+          continue;
+        }
 
         const stopLoss = cheap.mark * 0.75;
         const takeProfit = cheap.mark * 1.5;
