@@ -56,6 +56,18 @@ describe('TRA-5131 — the CLI report surface marks the raw column NOT PROMOTABL
     fileURLToPath(new URL(`../dist/${f}`, import.meta.url)),
   );
   const distBuilt = distModules.every((p) => existsSync(p));
+  if (!distBuilt) {
+    // TRA-5178 — vitest's default reporter prints no skipped-test titles, so the
+    // named reason in the title suffix below never reaches a reader running the
+    // suite by hand; without this the gate trips as a silent green hole.
+    const missing = distModules.filter((p) => !existsSync(p));
+    console.warn(
+      `[TRA-5177] SKIPPING the spawned-CLI marker test: packages/backtest/dist is unbuilt ` +
+        `(missing: ${missing.join(', ')}). The spawned CLI cannot load, so the rendered-table ` +
+        `leg of the TRA-5131 marker guard DID NOT RUN this pass. ` +
+        `Run \`pnpm --filter @trading-app/backtest build\` and re-run to restore it.`,
+    );
+  }
   const cliIt = distBuilt ? it : it.skip;
 
   cliIt(
