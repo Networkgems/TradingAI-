@@ -138,6 +138,7 @@ import { accountDeletedAt, recordAccountTombstone } from './deleted-accounts.js'
 // TRA-2410 — the ADOPTION side of the same hazard: registering a name whose book
 // is still on disk hands the new account the previous holder's positions.
 import { retireOrphanedBook, shapeRetiredOrphanReceipt } from './orphaned-books.js';
+import { sweepOrphanedBooks } from './orphaned-books-sweep.js';
 import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-env-label.js';
 // TRA-3990 — entry-quote stamp health surface (since-boot + durable fold).
 import { entryQuoteStampSinceBoot, summarizeEntryQuoteStamp } from './entry-quote-stamp.js';
@@ -10193,6 +10194,42 @@ app.delete('/api/admin/users/:username', requireAuth, requireAdmin, async (req, 
   // registers it next — the same reasoning as `wipeAccountData` step 4.
   const resetTokensRevoked = revokeResetTokensFor(username);
   res.json({ ok: true, resetTokensRevoked });
+});
+
+// TRA-5134 — execute the TRA-5132 ruling: bulk-retire orphaned book trees via
+// the TRA-2410 machinery. MOVE-ONLY; nothing on this path deletes a byte.
+//
+// Deliberately a route and not a boot hook (ruling text): every run is an
+// explicit admin POST, dry-run by default — `{"apply": true}` is the only way
+// anything moves. The sweep module carries the fail-closed registry guards and
+// the per-tree zero-deletion witnesses; this route adds the two things only the
+// process boundary knows: the live credential roster, and the clock. Applying
+// inside RTH is refused outright — the ruling scopes execution outside
+// 13:30–20:00Z Mon–Fri, and an override belongs to a new ruling, not a flag.
+app.post('/api/admin/orphaned-books/retire-sweep', requireAuth, requireAdmin, async (req, res) => {
+  const { apply, limit } = (req.body ?? {}) as { apply?: boolean; limit?: number };
+  if (apply === true) {
+    const now = new Date();
+    const day = now.getUTCDay();
+    const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+    const insideRth = day >= 1 && day <= 5 && mins >= 13 * 60 + 30 && mins < 20 * 60;
+    if (insideRth) {
+      res.status(423).json({
+        error: 'retire-sweep apply is refused inside RTH (13:30–20:00Z Mon–Fri) per TRA-5132',
+      });
+      return;
+    }
+  }
+  try {
+    const result = await sweepOrphanedBooks({
+      registeredUsernames: getAllUsers().map((u) => u.username),
+      apply: apply === true,
+      limit: typeof limit === 'number' && Number.isFinite(limit) ? limit : undefined,
+    });
+    res.status(result.refused ? 409 : 200).json(result);
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 // TRA-217 — admin sets a user's password directly (no current-password check).
