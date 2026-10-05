@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -48,7 +48,23 @@ describe('TRA-5131 — the CLI report surface marks the raw column NOT PROMOTABL
   const dir = mkdtempSync(join(tmpdir(), 'tra5131-'));
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
-  it('rendered table header tags the raw column, and the legend expands the tag', () => {
+  // TRA-5177 — the spawned CLI loads compiled dist, not src, so on a checkout where
+  // packages/backtest/dist is unbuilt the spawn can only crash — and that red would
+  // read exactly like a deleted marker. Skip loudly with the cause in the title
+  // instead; the reasons[] leg above runs in-process and still guards the marker.
+  const distModules = ['pcr-expectancy.js', 'pcr-cross-sectional.js'].map((f) =>
+    fileURLToPath(new URL(`../dist/${f}`, import.meta.url)),
+  );
+  const distBuilt = distModules.every((p) => existsSync(p));
+  const cliIt = distBuilt ? it : it.skip;
+
+  cliIt(
+    'rendered table header tags the raw column, and the legend expands the tag' +
+      (distBuilt
+        ? ''
+        : ' — SKIPPED: packages/backtest/dist is unbuilt so the spawned CLI cannot load;' +
+          ' run `pnpm --filter @trading-app/backtest build` (TRA-5177)'),
+    () => {
     // A real spawned run of the actual script — the page itself, not the module.
     // Small zero-edge world: the marker claim is about the rendering, not the verdict.
     const { ledger, bars } = synth({ sessions: 6, seed: 77, edge: 'none' });
@@ -62,7 +78,18 @@ describe('TRA-5131 — the CLI report surface marks the raw column NOT PROMOTABL
       encoding: 'utf-8',
       timeout: 110_000,
     });
-    expect(run.error).toBeUndefined();
+    // TRA-5177 — a crashed child must say "the CLI crashed", never "the header is
+    // missing". spawnSync sets `.error` only on spawn failure, and the CLI exits 1 BY
+    // DESIGN on any non-PASS verdict (this zero-edge world grades non-PASS), so neither
+    // `.error` nor a bare `status === 0` can tell "ran and graded" from "died on
+    // import". The discriminator is the render itself: a run that printed the report
+    // banner executed; one that printed nothing crashed, and stderr says why.
+    expect(run.error, `spawn failed: ${String(run.error)}`).toBeUndefined();
+    expect(
+      run.stdout,
+      `the CLI crashed before rendering (exit ${run.status}, signal ${run.signal}).\n` +
+        `stderr:\n${run.stderr}`,
+    ).toContain('TRA-1664 — PCR shadow expectancy');
     const out = run.stdout;
 
     // (1) The column header itself carries the tag, one space left of ADJ_UP — a

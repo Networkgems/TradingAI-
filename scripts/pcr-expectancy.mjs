@@ -30,7 +30,14 @@
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { runPcrCrossSectional, runPcrExpectancy } from '../packages/backtest/dist/index.js';
+// TRA-5177 — deep imports, deliberately NOT the package barrel. The barrel re-exports
+// agent-replay, which imports @trading-app/agents — a live-LLM package this offline
+// harness must not depend on. The real chain is pcr-cross-sectional → pcr-expectancy →
+// overfitting-stats, nothing else; importing dist/index.js crashed this script with
+// ERR_MODULE_NOT_FOUND whenever @trading-app/agents' dist was incomplete (it is RED on
+// main today, TRA-3744 family), which misread as a missing NOT PROMOTABLE marker.
+import { runPcrExpectancy } from '../packages/backtest/dist/pcr-expectancy.js';
+import { runPcrCrossSectional } from '../packages/backtest/dist/pcr-cross-sectional.js';
 
 function arg(name, fallback = null) {
   const i = process.argv.indexOf(`--${name}`);
