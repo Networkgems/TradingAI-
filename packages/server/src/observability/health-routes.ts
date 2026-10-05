@@ -8027,8 +8027,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
             {
               code: 'cost_bar_edge_input_stale',
               issue: 'TRA-4875',
-              /** TRA-4978 — the remedy ticket: attribution split + stand-down. */
-              remedyIssue: 'TRA-4978',
+              /**
+               * TRA-4925 (in passing) — the remedy is DELIVERED, not pending:
+               * TRA-4978 (closed 2026-10-03) shipped the attribution split and
+               * the per-cell stand-down verdicts that ride on this very payload
+               * (`cells[].standDown`, `standDown`). The field used to be
+               * `remedyIssue: 'TRA-4978'`, which promised an OPEN remedy row and
+               * sent every reader to a closed ticket once it landed (it cost
+               * TRA-5164 a hop). A pointer at delivered history cannot go stale
+               * the same way; the live instrument to read is `standDown`.
+               */
+              remedyShipped: 'TRA-4978',
               gate: COST_BAR_GATE,
               /**
                * `degraded`, not `critical`: the gate is REFUSING, which is the
