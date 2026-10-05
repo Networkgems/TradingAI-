@@ -125,10 +125,13 @@ export interface PromotionThresholds {
      */
     minCadenceConsistencyRatio: number;
     /**
-     * Value/invested ratio net of the tiered per-fill cost model must be ≥ this
-     * (1.0 → fills are net-positive of fees; the cost model does not eat the
-     * accumulation). Guards against a strategy whose edge is entirely consumed by
-     * per-fill trading costs.
+     * Value/invested ratio net of the tiered per-fill cost model must be ≥ this.
+     * ⚠️ This is an ABSOLUTE RETURN FLOOR, not a fee-drag test: the ratio is
+     * `finalValue / invested` after fees, which is `1 + oosReturn` by
+     * construction, so 1.0 requires `oosReturn ≥ 0` over the OOS window.
+     * Isolating fee drag would need a zero-fee counterfactual the harness does
+     * not compute. (TRA-1631 measurement, 2026-09-16; label corrected per the
+     * board ruling of 2026-10-04.)
      */
     minFeeAdjustedValueRatio: number;
   };
@@ -164,7 +167,7 @@ export const DEFAULT_PROMOTION_THRESHOLDS: PromotionThresholds = {
     maxValueInvestedDrawdownPct: 0.35, // bounded accumulation-curve drawdown (DCA smooths beta but is still long the market)
     minDrawdownImprovementVsLumpSum: 0, // must at least not be WORSE than lump-sum on drawdown (or beat it on return)
     minCadenceConsistencyRatio: 1.0, // every tested cadence must agree in direction — no single-cadence artifacts
-    minFeeAdjustedValueRatio: 1.0, // fills net-positive of the tiered per-fill cost model
+    minFeeAdjustedValueRatio: 1.0, // ≡ oosReturn ≥ 0 net of fees — an absolute return floor (see threshold doc)
   },
 };
 
@@ -381,7 +384,11 @@ export interface AccumulationBacktestGateMetrics {
    * when every cadence agrees.
    */
   cadenceVariantsConsistent: number;
-  /** Value/invested ratio net of the tiered per-fill cost model (>1 ⇒ fills net-positive of fees). */
+  /**
+   * Value/invested ratio net of the tiered per-fill cost model. Equals
+   * `1 + oosReturn` by construction (`finalValue / invested`), so a floor on it
+   * is an absolute net-of-fees return floor — it does not isolate fee drag.
+   */
   feeAdjustedValueRatio: number;
 }
 
@@ -686,7 +693,8 @@ export function evaluateAccumulationBacktestGate(
 
   if (!(metrics.feeAdjustedValueRatio >= t.minFeeAdjustedValueRatio))
     failed.push(
-      `fee-adjusted value ratio ${fmt(metrics.feeAdjustedValueRatio)} < ${fmt(t.minFeeAdjustedValueRatio)} — per-fill costs eat the accumulation`,
+      `fee-adjusted value ratio ${fmt(metrics.feeAdjustedValueRatio)} < ${fmt(t.minFeeAdjustedValueRatio)} — net-of-fees final value below the floor `
+        + `(ratio ≡ 1 + OOS return, so this is an absolute return floor, not a fee-drag test)`,
     );
 
   return { state: failed.length === 0 ? 'pass' : 'fail', failedChecks: failed };

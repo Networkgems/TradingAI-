@@ -702,10 +702,10 @@ describe('evaluateAccumulationBacktestGate — accumulation robustness, not timi
     expect(r.failedChecks.join(' ')).toMatch(/cadence consistency/);
   });
 
-  it('fails when per-fill costs eat the accumulation', () => {
+  it('fails when net-of-fees value is below invested (absolute return floor, mislabeled as a fee test until TRA-1631)', () => {
     const r = evaluateAccumulationBacktestGate({ ...PASSING_ACCUM_BT, feeAdjustedValueRatio: 0.98 });
     expect(r.state).toBe('fail');
-    expect(r.failedChecks.join(' ')).toMatch(/per-fill costs eat/);
+    expect(r.failedChecks.join(' ')).toMatch(/absolute return floor, not a fee-drag test/);
   });
 
   it('default accumulation-backtest thresholds are the TRA-1465 v1 proposal', () => {
