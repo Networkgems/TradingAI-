@@ -41,6 +41,8 @@ $ErrorActionPreference = 'Stop'
 $InstallDir    = Join-Path $env:USERPROFILE '.paperclip\autostart'
 $InstalledPs1  = Join-Path $InstallDir 'paperclip-autostart.ps1'
 $SourcePs1     = Join-Path $PSScriptRoot 'paperclip-autostart.ps1'
+$SourceProbe   = Join-Path $PSScriptRoot 'paperclip-tick-probe.cjs'
+$InstalledProbe = Join-Path $InstallDir 'paperclip-tick-probe.cjs'
 
 function Fail { param([string]$m) Write-Output "FAIL: $m"; exit 1 }
 function Ok   { param([string]$m) Write-Output "ok   : $m" }
@@ -63,8 +65,13 @@ if ($Verify) {
   Ok "ExecutionTimeLimit=PT0S (unlimited)"
 
   $mip = $xml.Task.Settings.MultipleInstancesPolicy
-  if ($mip -ne 'IgnoreNew') { Fail "MultipleInstancesPolicy=$mip -- must be IgnoreNew to stop the repetition spawning duplicate servers" }
-  Ok "MultipleInstancesPolicy=IgnoreNew"
+  # TRA-5156: IgnoreNew is now a FAIL. A long-lived launcher instance reads Running, so
+  # every PT5M repetition is skipped (693 Id-322 events 2026-10-03..10-05) and the port
+  # guard never re-runs. Duplicate-server safety lives in the launcher's start mutex.
+  if ($mip -ne 'Parallel') { Fail "MultipleInstancesPolicy=$mip -- must be Parallel (IgnoreNew masks the PT5M guard behind the running launcher; TRA-5156)" }
+  Ok "MultipleInstancesPolicy=Parallel"
+  if (-not (Test-Path $InstalledProbe)) { Fail "tick probe missing at $InstalledProbe" }
+  Ok "tick probe present at $InstalledProbe"
 
   if ($xml.Task.Settings.StartWhenAvailable -ne 'true') { Fail "StartWhenAvailable must be true so a missed trigger still runs" }
   Ok "StartWhenAvailable=true"
@@ -103,6 +110,8 @@ if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Force -Path $I
 # a live worktree could execute a half-written file mid-checkout.
 Copy-Item -Path $SourcePs1 -Destination $InstalledPs1 -Force
 Write-Output "installed launcher -> $InstalledPs1"
+Copy-Item -Path $SourceProbe -Destination $InstalledProbe -Force
+Write-Output "installed tick probe -> $InstalledProbe"
 
 $action = New-ScheduledTaskAction `
   -Execute 'powershell.exe' `
@@ -126,7 +135,7 @@ $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries `
   -DontStopIfGoingOnBatteries `
   -StartWhenAvailable `
-  -MultipleInstances IgnoreNew `
+  -MultipleInstances Parallel `
   -ExecutionTimeLimit ([TimeSpan]::Zero) `
   -RestartCount 3 `
   -RestartInterval (New-TimeSpan -Minutes 1)

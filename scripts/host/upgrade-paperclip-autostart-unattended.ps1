@@ -134,7 +134,7 @@ if ($bootCount -ge 1) {
   Write-Output 'note : BootTrigger NOT installed (refused without elevation). Post-boot recovery still bounded at ~5 min by the repeating TimeTrigger -- the same trigger that generated 70 Id-332 refusals on 2026-10-04 proves it fires unattended. Re-run elevated to add the BootTrigger.'
 }
 
-# Re-assert the TRA-5054 invariants (no EndBoundary, PT0S, IgnoreNew, ...)
+# Re-assert the TRA-5054 invariants (no EndBoundary, PT0S, Parallel [TRA-5156], ...)
 & (Join-Path $PSScriptRoot 'install-paperclip-autostart.ps1') -TaskName $TaskName -Verify
 if ($LASTEXITCODE -ne 0) { Fail 'TRA-5054 definition invariants regressed -- see above' }
 
@@ -146,7 +146,7 @@ if (-not $SkipSmokeTest) {
   $hex  = '0x{0:X8}' -f $info.LastTaskResult
   switch ($info.LastTaskResult) {
     0          { Ok 'smoke run: LastTaskResult 0' }
-    2147946720 { Ok "smoke run: $hex -- IgnoreNew refused the start because an instance is already live (designed shape, not a fault)" }
+    2147946720 { Ok "smoke run: $hex -- legacy IgnoreNew-era result; task now runs Parallel (TRA-5156), inspect the Operational log" }
     2147943785 { Fail "$hex -- the account lacks the 'Log on as a batch job' right, so the Password principal cannot launch. An administrator must grant it: secpol.msc > Local Policies > User Rights Assignment > Log on as a batch job" }
     2147943726 { Fail "$hex -- stored credential rejected (wrong or stale password). Re-run this script" }
     default    { Write-Output "warn : smoke run LastTaskResult $hex -- inspect Microsoft-Windows-TaskScheduler/Operational" }

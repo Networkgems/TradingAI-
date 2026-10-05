@@ -109,14 +109,27 @@ if ($DryRun) {
   exit 0
 }
 
+# TRA-5156: the task now runs MultipleInstances=Parallel (IgnoreNew let the long-lived
+# launcher instance mask every PT5M repetition -- 693 Id-322 skips, guard dead since
+# 2026-10-03). Parallel means this guard+start window can overlap with the logon
+# trigger's instance, so serialize it. Held only until the server is UP (or the guard
+# no-ops); the long WaitForExit below runs OUTSIDE the mutex.
+$startMutex = New-Object System.Threading.Mutex($false, 'GlobalPaperclip-Autostart-Start')
+$haveMutex = $false
+try { $haveMutex = $startMutex.WaitOne([TimeSpan]::FromMinutes(6)) } catch [System.Threading.AbandonedMutexException] { $haveMutex = $true }
+if (-not $haveMutex) { Write-Log 'NOOP' 'could not take the start mutex in 6 minutes; another instance is mid-start'; exit 0 }
+function Release-StartMutex { if ($script:haveMutex) { try { $script:startMutex.ReleaseMutex() } catch { } ; $script:haveMutex = $false } }
+
 $existing = Get-ServerPid -P $Port
 if ($existing -gt 0) {
+  Release-StartMutex
   Write-Log 'NOOP' "server already listening on 127.0.0.1:$Port (pid=$existing); nothing to do"
   exit 0
 }
 
 $onboardPid = Get-OnboardPid
 if ($onboardPid -gt 0) {
+  Release-StartMutex
   Write-Log 'NOOP' "no listener on 127.0.0.1:$Port but a paperclipai onboard process is alive (pid=$onboardPid); it is still booting or has port-shifted -- refusing to stack a second server"
   exit 0
 }
@@ -129,6 +142,16 @@ Write-Log 'START' "no listener on 127.0.0.1:$Port; starting: $resolved"
 # invisible on the already-running path (the guard no-ops before reaching here), so it
 # would have shipped a task that reads Ready and never starts a server.
 $argLine = ($CmdArgs | ForEach-Object { '"' + $_ + '"' }) -join ' '
+
+# TRA-5156: observe-only scheduler tick probe, preloaded into the server (and stripped
+# from NODE_OPTIONS by the probe itself so agent children do not inherit it).
+$Probe = Join-Path $Root 'paperclip-tick-probe.cjs'
+if (Test-Path $Probe) {
+  $env:NODE_OPTIONS = (($env:NODE_OPTIONS + ' --require "' + $Probe + '"')).Trim()
+  Write-Log 'INFO' "tick probe preloaded: $Probe"
+} else {
+  Write-Log 'WARN' "tick probe NOT found at $Probe -- starting without it (watchdog will read tick_probe_absent)"
+}
 
 $proc = Start-Process -FilePath $NodeExe -ArgumentList $argLine `
           -NoNewWindow -PassThru `
@@ -161,9 +184,12 @@ if ($serverPid -gt 0) {
   Write-Log 'ERROR' "no listener on 127.0.0.1:$Port within 5 minutes; see $ErrFile"
 }
 
+Release-StartMutex
+
 # Hold the task open for the lifetime of the server. Combined with the task's
-# MultipleInstancesPolicy=IgnoreNew this is what makes the repetition interval a
-# supervisor rather than a source of duplicate servers.
+# MultipleInstancesPolicy=Parallel the repetition keeps launching fresh guard
+# instances (each a logged no-op while a server is up) -- that is what makes the interval
+# a supervisor. The start mutex above, not IgnoreNew, is what prevents duplicate servers.
 $proc.WaitForExit()
 Write-Log 'EXIT' "server process pid=$($proc.Id) exited with code=$($proc.ExitCode)"
 exit $proc.ExitCode
