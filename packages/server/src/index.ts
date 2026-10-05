@@ -489,8 +489,10 @@ import {
 // never corrects one.
 import {
   auditLiveCellSource,
+  auditStampFromStoredBlock,
   decideLiveCellSourceDisposition,
-  isUnreconciled,
+  notGradedAuditStamp,
+  resolveBrokerDayEvidence,
 } from './reports/live-cell-broker-source.js';
 import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, consumeLegacyResetToken, recordResetFailure, hashSecretValue, initResetTokenStore, revokeResetTokensFor, MIN_PASSWORD_LENGTH } from './auth.js';
 import {
@@ -2455,9 +2457,10 @@ async function generateAndSaveReport(
         realizedPnl: finalReport.realizedPnl,
         optionsPnl: finalReport.optionsPnl,
         markdown: finalReport.markdown,
-        broker: totals.ok
-          ? { known: true, realizedUsd: totals.totals[finalReport.date] ?? 0 }
-          : { known: false, reason: totals.reason },
+        // TRA-5118 — never `totals[date] ?? 0`: a date the windowed sidecar
+        // does not cover is not evidence the broker was quiet. The resolver
+        // falls back to the row's own TRA-4201 FIFO block and labels the basis.
+        broker: resolveBrokerDayEvidence(totals, finalReport.date, finalReport.brokerRealized),
       });
       // Log the verdict on EVERY pass, not just the bad ones — a line that only
       // appears when something is wrong cannot be used to prove the detector ran.
@@ -2469,31 +2472,44 @@ async function generateAndSaveReport(
         renderedPnl: Number(verdict.renderedPnl.toFixed(2)),
         engineOptionsPnl: Number(verdict.engineOptionsPnl.toFixed(2)),
         brokerPnl: verdict.brokerPnl,
+        brokerEvidenceSource: verdict.brokerEvidenceSource,
       });
-      if (isUnreconciled(verdict)) {
-        const disposition = decideLiveCellSourceDisposition(verdict, new Date().toISOString());
-        if (disposition.pnlUnreconciled) {
-          log.warn('TRA-3102 live calendar cell is NOT broker-confirmed', {
-            username: ctx.username,
-            date: finalReport.date,
-            reason: disposition.pnlUnreconciled.reason,
-            detail: disposition.pnlUnreconciled.detail,
-          });
-          finalReport = {
-            ...finalReport,
-            pnlUnreconciled: disposition.pnlUnreconciled,
-            markdown: `${disposition.header}\n\n${finalReport.markdown}`,
-          };
-        }
+      const disposition = decideLiveCellSourceDisposition(verdict, new Date().toISOString());
+      // TRA-5118 — the verdict is stamped on EVERY graded row, `ok` included,
+      // so "ties to the broker" and "the broker was never consulted" stop
+      // sharing a wire representation (absence).
+      finalReport = { ...finalReport, brokerSourceAudit: disposition.audit };
+      if (disposition.pnlUnreconciled) {
+        log.warn('TRA-3102 live calendar cell is NOT broker-confirmed', {
+          username: ctx.username,
+          date: finalReport.date,
+          reason: disposition.pnlUnreconciled.reason,
+          detail: disposition.pnlUnreconciled.detail,
+        });
+        finalReport = {
+          ...finalReport,
+          pnlUnreconciled: disposition.pnlUnreconciled,
+          markdown: `${disposition.header}\n\n${finalReport.markdown}`,
+        };
       }
     } catch (err) {
       // Never block the report write on the audit — but never let the failure be
-      // indistinguishable from a clean pass either.
+      // indistinguishable from a clean pass either. The `not_graded` stamp is
+      // what keeps an errored audit distinguishable from a pass ON THE ROW, not
+      // only in a log line that scrolls away (TRA-5118).
       log.warn('TRA-3102 broker-source audit failed — cell written unaudited', {
         username: ctx.username,
         date: finalReport.date,
         reason: err instanceof Error ? err.message : String(err),
       });
+      finalReport = {
+        ...finalReport,
+        brokerSourceAudit: notGradedAuditStamp(
+          'audit_error',
+          `The write-time broker-source audit threw (${err instanceof Error ? err.message : String(err)}); this cell was written unaudited.`,
+          new Date().toISOString(),
+        ),
+      };
     }
   }
 
@@ -3504,10 +3520,29 @@ async function stampBrokerSourceAudit(
 ): Promise<EodReport> {
   // A demo book HAS no broker, so engine closes are the only source there is and
   // "unreconciled" would be true of every cell — a flag that is always on is not
-  // an instrument. This defect is about real money.
+  // an instrument. This defect is about real money. Demo rows carry no stamp at
+  // all; the TRA-5118 denominator is a claim about live cells only.
   if (mode === 'demo') return report;
-  if (report.pnlUnreconciled) return report;   // write-time verdict wins
-  if (report.pnlUnknown) return report;        // TRA-3101 already says more
+  // A row that already carries a write-time audit stamp is served as-is — the
+  // write path saw the live evidence (TRA-5118).
+  if (report.brokerSourceAudit) return report;
+  if (report.pnlUnreconciled) {
+    // Write-time verdict wins — but it predates the TRA-5118 stamp, so derive
+    // the stamp from the stored block rather than serving an absence.
+    return { ...report, brokerSourceAudit: auditStampFromStoredBlock(report.pnlUnreconciled) };
+  }
+  if (report.pnlUnknown) {
+    // TRA-3101 already says something strictly stronger; the skip itself is
+    // serialized so a sweep can count this arm instead of inferring it (TRA-5118).
+    return {
+      ...report,
+      brokerSourceAudit: notGradedAuditStamp(
+        'pnl_unknown_precedence',
+        `${report.date} is marked pnlUnknown (TRA-3101) — the day was never measured, which is strictly stronger than unreconciled; the broker-source audit does not run on it.`,
+        new Date().toISOString(),
+      ),
+    };
+  }
   const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
   try {
     const totals = await readTradierDailyTotalsForEvidence(ctx, env);
@@ -3522,13 +3557,22 @@ async function stampBrokerSourceAudit(
       // `readTradierDailyTotalsForEvidence`. A missing file is `ok` with no rows
       // (a new account genuinely has none); a FAILED read is `known: false` and
       // the audit fails closed on it.
-      broker: totals.ok
-        ? { known: true, realizedUsd: totals.totals[report.date] ?? 0 }
-        : { known: false, reason: totals.reason },
+      //
+      // ⛔ And a date ABSENT from the windowed sidecar must not read as quiet
+      // either (TRA-5118): the June 2026 cells TRA-3100 enumerated rolled out of
+      // the reconcile window long ago, and `totals[date] ?? 0` manufactured a
+      // quiet broker on exactly the rows the fourth quadrant exists to catch.
+      // The resolver falls back to the row's own TRA-4201 FIFO reconstruction
+      // and labels which basis carried the comparison.
+      broker: resolveBrokerDayEvidence(totals, report.date, report.brokerRealized),
     });
-    if (!isUnreconciled(verdict)) return report;
     const disposition = decideLiveCellSourceDisposition(verdict, new Date().toISOString());
-    if (!disposition.pnlUnreconciled) return report;
+    if (!disposition.pnlUnreconciled) {
+      // TRA-5118 — an `ok` (or blind-pass-through) verdict is still serialized:
+      // "ties to the broker" and "the broker was never consulted" must not share
+      // a representation on the wire.
+      return { ...report, brokerSourceAudit: disposition.audit };
+    }
     log.warn('TRA-3102 served a live calendar cell as NOT broker-confirmed', {
       username: ctx.username,
       env,
@@ -3538,18 +3582,27 @@ async function stampBrokerSourceAudit(
       renderedPnl: disposition.pnlUnreconciled.renderedPnl,
       brokerPnl: disposition.pnlUnreconciled.brokerPnl,
       engineOptionsPnl: disposition.pnlUnreconciled.engineOptionsPnl,
+      brokerEvidenceSource: verdict.brokerEvidenceSource,
     });
-    return { ...report, pnlUnreconciled: disposition.pnlUnreconciled };
+    return { ...report, pnlUnreconciled: disposition.pnlUnreconciled, brokerSourceAudit: disposition.audit };
   } catch (err) {
     // A failed audit must not blank the calendar, and must not be silent — or
     // "the detector found nothing" and "the detector never ran" become the same
-    // observation, which is the defect this cluster keeps producing.
+    // observation, which is the defect this cluster keeps producing. The
+    // `not_graded` stamp keeps that distinction ON THE ROW (TRA-5118).
     log.warn('TRA-3102 broker-source audit failed — cell served unaudited', {
       username: ctx.username,
       date: report.date,
       reason: err instanceof Error ? err.message : String(err),
     });
-    return report;
+    return {
+      ...report,
+      brokerSourceAudit: notGradedAuditStamp(
+        'audit_error',
+        `The read-time broker-source audit threw (${err instanceof Error ? err.message : String(err)}); this cell is served unaudited.`,
+        new Date().toISOString(),
+      ),
+    };
   }
 }
 

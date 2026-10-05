@@ -21,10 +21,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   auditLiveCellSource,
+  auditStampFromStoredBlock,
   brokerFigureFromHeader,
   classifyCellPnlSource,
   decideLiveCellSourceDisposition,
   isUnreconciled,
+  notGradedAuditStamp,
+  resolveBrokerDayEvidence,
   type BrokerDayEvidence,
   type LiveCellSourceInput,
 } from './live-cell-broker-source.js';
@@ -69,12 +72,18 @@ function cell(over: Partial<LiveCellSourceInput> = {}): LiveCellSourceInput {
 // ── the reach gate ───────────────────────────────────────────────────────────
 
 describe('classifyCellPnlSource — THE REACH GATE', () => {
-  it('classifies an UNLABELLED row as engine-sourced', () => {
+  it('classifies an UNLABELLED row as its own class, never a guessed source (TRA-5118)', () => {
     // ⛔ 46 of 69 live rows are this shape. The whole audit hangs off this line.
-    expect(classifyCellPnlSource(undefined)).toBe('engine');
+    // TRA-5095 ruled that absence maps to an explicit `unlabelled` state — the
+    // client already complies, and the old `'engine'` fall-through here routed
+    // these real-money rows into the branch that early-returned `ok`.
+    expect(classifyCellPnlSource(undefined)).toBe('unlabelled');
+    expect(classifyCellPnlSource('')).toBe('unlabelled');
   });
 
   it('classifies an unrecognised label as engine-sourced rather than trusting it', () => {
+    // A FUTURE label is a recorded provenance we do not recognise — not absence.
+    // It stays on the engine rule because "not broker evidence" is the allow-list.
     expect(classifyCellPnlSource('some-future-source')).toBe('engine');
   });
 
@@ -99,9 +108,16 @@ describe('classifyCellPnlSource — THE REACH GATE', () => {
       'live-intraday',
     ];
     const denylistWouldReach = live.filter(s => s === 'engine').length;
-    const allowlistReaches = live.filter(s => classifyCellPnlSource(s) === 'engine').length;
+    // TRA-5118 — the 46 unlabelled rows are still REACHED (graded on the same
+    // options-leg comparison), but as the `unlabelled` class, never as a guess.
+    const graded = live.filter(s => {
+      const c = classifyCellPnlSource(s);
+      return c === 'engine' || c === 'unlabelled';
+    }).length;
+    const guessedEngine = live.filter(s => classifyCellPnlSource(s) === 'engine').length;
     expect(denylistWouldReach).toBe(0);
-    expect(allowlistReaches).toBe(46);
+    expect(graded).toBe(46);
+    expect(guessedEngine).toBe(0);
   });
 });
 
@@ -275,10 +291,14 @@ describe('healthy real rows are NOT flagged', () => {
     expect(v.status).toBe('ok');
   });
 
-  it('an engine row that booked NO options P&L has nothing sourced from the engine book', () => {
-    // 2026-07-14: rendered 0.00, optionsPnl 0.00, unlabelled. Correct as-is.
+  it('a row quiet on BOTH books is ok — the broker leg was read, not skipped (TRA-5118)', () => {
+    // 2026-07-14: rendered 0.00, optionsPnl 0.00, unlabelled, broker realized 0.
+    // Pre-TRA-5118 this arm returned `ok` WITHOUT reading the broker leg; now it
+    // is the (0, 0) quadrant of the matrix, reached only after the broker spoke.
     const v = auditLiveCellSource(cell({ reportDate: '2026-07-14', combinedPnl: 0, optionsPnl: 0 }));
     expect(v.status).toBe('ok');
+    expect(v.sourceClass).toBe('unlabelled');
+    expect(v.detail).toContain('quiet on both books');
   });
 
   it('an engine options figure that ties to the broker is confirmed', () => {
@@ -308,7 +328,9 @@ describe('engine-sourced P&L on a live account', () => {
         cell({ reportDate: row.date, combinedPnl: row.pnl, optionsPnl: row.pnl, broker: { known: true, realizedUsd: 0 } }),
       );
       expect(v.status).toBe('engine_close_without_broker_fill');
-      expect(v.sourceClass).toBe('engine');
+      // These fixtures carry no `pnlSource` — TRA-5118 publishes that as
+      // `unlabelled` rather than guessing `engine`. The verdict is unchanged.
+      expect(v.sourceClass).toBe('unlabelled');
       expect(v.engineOptionsPnl).toBe(row.pnl);
       expect(v.detail).toContain('not money that moved');
     });
@@ -338,11 +360,17 @@ describe('engine-sourced P&L on a live account', () => {
     expect(v.detail).toContain('sidecar unparseable');
   });
 
-  it('an unreadable tape on a ZERO-options row stays ok — nothing to reconcile', () => {
+  it('an unreadable tape on a ZERO-options row now fails CLOSED too (TRA-5118)', () => {
+    // ⛔ Behaviour flip, deliberate. The old `ok` here was mechanism 1 of
+    // TRA-5118: "nothing to reconcile" is a statement about the ENGINE leg,
+    // while the question is about the BROKER — which may have booked realized
+    // closes the cell never recorded, and which cannot be read. Blind ≠ agreed.
     const v = auditLiveCellSource(
       cell({ combinedPnl: 0, optionsPnl: 0, broker: { known: false, reason: 'sidecar unparseable' } }),
     );
-    expect(v.status).toBe('ok');
+    expect(v.status).toBe('broker_evidence_unreadable');
+    expect(v.brokerPnl).toBeNull();
+    expect(v.detail).toContain('sidecar unparseable');
   });
 
   it('grades the OPTIONS leg and does not claim to have graded equity realized', () => {
@@ -420,5 +448,190 @@ describe('decideLiveCellSourceDisposition', () => {
     );
     expect(d.pnlUnreconciled!.renderedPnl).toBe(739);
     expect(d.pnlUnreconciled!.engineOptionsPnl).toBe(739);
+  });
+});
+
+// ── TRA-5118 — the fourth quadrant ───────────────────────────────────────────
+//
+// The audit said `ok` to 8 of TRA-3100's 9 permanently-uncorrectable cells, and
+// the one it flagged had the SMALLEST gap of the nine ($25.27, vs a $322.99 gap
+// waved through on 06-25). The engine branch early-returned `ok` on
+// `optionsPnl == 0` before the broker leg was read — three quadrants of a
+// four-quadrant matrix. These fixtures are the issue's acceptance table: the
+// rendered figures are the stored rows, the broker figures are the TRA-4201
+// FIFO reconstructions stamped beside them.
+
+describe('TRA-5118 — broker realized P&L on a date the cell booked none', () => {
+  const FOURTH_QUADRANT = [
+    { date: '2026-06-11', rendered: 23.81, broker: -80.72 },
+    { date: '2026-06-12', rendered: 0, broker: -141.72 },     // pre-fix: rescued only by TRA-3101
+    { date: '2026-06-15', rendered: 104.84, broker: 125.75 },
+    { date: '2026-06-16', rendered: -122.77, broker: -162.35 },
+    { date: '2026-06-25', rendered: -86.6, broker: -409.59 }, // the headline: a $322.99 gap read `ok`
+    { date: '2026-08-03', rendered: 0, broker: 74.65 },
+  ] as const;
+
+  for (const row of FOURTH_QUADRANT) {
+    it(`flags ${row.date} — renders ${row.rendered} with no options leg while the broker realized ${row.broker}`, () => {
+      const v = auditLiveCellSource(
+        cell({
+          reportDate: row.date,
+          combinedPnl: row.rendered,
+          optionsPnl: 0,
+          broker: { known: true, realizedUsd: row.broker, source: 'fifo_row' },
+        }),
+      );
+      expect(v.status).toBe('broker_realized_without_cell_pnl');
+      expect(v.sourceClass).toBe('unlabelled');
+      expect(v.brokerPnl).toBe(row.broker);
+      expect(v.brokerEvidenceSource).toBe('fifo_row');
+      expect(v.detail).toContain('not broker-confirmed');
+      expect(isUnreconciled(v)).toBe(true);
+    });
+  }
+
+  it('flags the quadrant on an explicitly engine-labelled row too', () => {
+    const v = auditLiveCellSource(
+      cell({ pnlSource: 'engine', combinedPnl: 12, optionsPnl: 0, broker: { known: true, realizedUsd: -50 } }),
+    );
+    expect(v.status).toBe('broker_realized_without_cell_pnl');
+    expect(v.sourceClass).toBe('engine');
+  });
+
+  it('does NOT flag a zero-options cell whose RENDERED figure ties the broker to the cent', () => {
+    // A balance-delta row that correctly recorded the broker's realized options
+    // close has an empty options leg and a right answer. The number is
+    // broker-confirmed even though the leg is empty.
+    const v = auditLiveCellSource(
+      cell({ combinedPnl: -80.72, optionsPnl: 0, broker: { known: true, realizedUsd: -80.72 } }),
+    );
+    expect(v.status).toBe('ok');
+    expect(v.detail).toContain('ties the broker');
+  });
+
+  it('keeps the 07-31 divergence verdict — both legs non-zero is the OLD quadrant', () => {
+    const v = auditLiveCellSource(
+      cell({ reportDate: '2026-07-31', combinedPnl: 739, optionsPnl: 739, broker: { known: true, realizedUsd: 713.73 } }),
+    );
+    expect(v.status).toBe('engine_options_diverges_from_broker');
+    expect(v.sourceClass).toBe('unlabelled');
+  });
+
+  it('does not flag the 07-01 / 07-08 shape — a broker-labelled balance delta vs realized closes is a measure difference', () => {
+    // These two are in TRA-3100's nine, but their rendered figures ARE broker
+    // balance deltas confirmed by their own headers. Balance delta includes
+    // open-position MTM; realized closes do not. On a day with open positions
+    // they SHOULD differ, and flagging them would fire on every such day.
+    const v = auditLiveCellSource(
+      cell({
+        reportDate: '2026-07-01',
+        pnlSource: 'tradier-balance',
+        combinedPnl: -42.18,
+        optionsPnl: 0,
+        markdown: tra359Header('2026-07-01', '1,000.00', '2026-06-30', '1,042.18', '-42.18'),
+        broker: { known: true, realizedUsd: -116.48 },
+      }),
+    );
+    expect(v.status).toBe('ok');
+    expect(v.sourceClass).toBe('broker');
+  });
+});
+
+// ── TRA-5118 — the broker leg must not be manufactured by `?? 0` ─────────────
+
+describe('resolveBrokerDayEvidence', () => {
+  const SIDECAR_OK = { ok: true as const, totals: { '2026-07-31': 713.73, '2026-08-03': 74.65 } };
+  const SIDECAR_BAD = { ok: false as const, reason: 'tradier-options-pnl.production.json unreadable: bad JSON' };
+
+  it('prefers a sidecar ENTRY for the date', () => {
+    expect(resolveBrokerDayEvidence(SIDECAR_OK, '2026-07-31', { optionsPnl: -409.59 })).toEqual({
+      known: true,
+      realizedUsd: 713.73,
+      source: 'sidecar',
+    });
+  });
+
+  it('falls back to the row\'s own TRA-4201 FIFO block when the date rolled out of the sidecar', () => {
+    // The June cells have long since rolled out of the reconcile window. The old
+    // call sites read `totals[date] ?? 0` — a quiet day manufactured out of a
+    // windowed file, on exactly the rows the fourth quadrant exists to catch.
+    expect(resolveBrokerDayEvidence(SIDECAR_OK, '2026-06-25', { optionsPnl: -409.59 })).toEqual({
+      known: true,
+      realizedUsd: -409.59,
+      source: 'fifo_row',
+    });
+  });
+
+  it('uses the FIFO block even when the sidecar is unreadable', () => {
+    expect(resolveBrokerDayEvidence(SIDECAR_BAD, '2026-06-25', { optionsPnl: -409.59 })).toEqual({
+      known: true,
+      realizedUsd: -409.59,
+      source: 'fifo_row',
+    });
+  });
+
+  it('carries a readable-but-silent sidecar as the WEAKER `sidecar_quiet` basis, countable by a sweep', () => {
+    expect(resolveBrokerDayEvidence(SIDECAR_OK, '2026-09-01', undefined)).toEqual({
+      known: true,
+      realizedUsd: 0,
+      source: 'sidecar_quiet',
+    });
+  });
+
+  it('fails CLOSED when the sidecar is unreadable and the row has no FIFO block', () => {
+    const e = resolveBrokerDayEvidence(SIDECAR_BAD, '2026-09-01', undefined);
+    expect(e.known).toBe(false);
+    if (!e.known) expect(e.reason).toContain('unreadable');
+  });
+});
+
+// ── TRA-5118 — `ok` must serialize as SOMETHING ──────────────────────────────
+
+describe('TRA-5118 — the verdict is stamped on every graded row, ok included', () => {
+  it('an ok verdict carries a full audit stamp beside the null disposition', () => {
+    const d = decideLiveCellSourceDisposition(
+      auditLiveCellSource(cell({ combinedPnl: 75.3, optionsPnl: 75.3, broker: { known: true, realizedUsd: 75.3, source: 'sidecar' } })),
+      '2026-10-05T06:00:00.000Z',
+    );
+    expect(d.pnlUnreconciled).toBeNull();
+    expect(d.header).toBe('');
+    expect(d.audit.status).toBe('ok');
+    expect(d.audit.sourceClass).toBe('unlabelled');
+    expect(d.audit.brokerPnl).toBe(75.3);
+    expect(d.audit.brokerEvidenceSource).toBe('sidecar');
+    expect(d.audit.detail).not.toBe('');
+    expect(d.audit.at).toBe('2026-10-05T06:00:00.000Z');
+  });
+
+  it('a failing verdict carries the SAME stamp, so pass and fail share a wire shape', () => {
+    const d = decideLiveCellSourceDisposition(
+      auditLiveCellSource(
+        cell({ reportDate: '2026-06-25', combinedPnl: -86.6, optionsPnl: 0, broker: { known: true, realizedUsd: -409.59, source: 'fifo_row' } }),
+      ),
+      '2026-10-05T06:00:00.000Z',
+    );
+    expect(d.pnlUnreconciled!.reason).toBe('broker_realized_without_cell_pnl');
+    expect(d.audit.status).toBe('broker_realized_without_cell_pnl');
+    expect(d.audit.brokerEvidenceSource).toBe('fifo_row');
+    expect(d.header).toContain('NOT broker-confirmed');
+  });
+
+  it('a deliberately-skipped row stamps `not_graded` with its reason — absence is never the representation', () => {
+    const s = notGradedAuditStamp('pnl_unknown_precedence', 'TRA-3101 already says more.', '2026-10-05T06:00:00.000Z');
+    expect(s.status).toBe('not_graded');
+    expect(s.notGradedReason).toBe('pnl_unknown_precedence');
+  });
+
+  it('a stored write-time pnlUnreconciled block round-trips into an audit stamp', () => {
+    const s = auditStampFromStoredBlock({
+      reason: 'engine_close_without_broker_fill',
+      renderedPnl: 739,
+      brokerPnl: 0,
+      engineOptionsPnl: 739,
+      detail: 'x',
+      at: '2026-08-06T15:00:00.000Z',
+    });
+    expect(s.status).toBe('engine_close_without_broker_fill');
+    expect(s.at).toBe('2026-08-06T15:00:00.000Z');
   });
 });

@@ -18,9 +18,9 @@
  *     same trap TRA-3101 hit: a gate keyed on a field added later cannot reach
  *     the rows that predate it, and those are the broken ones. So the class is
  *     decided by ALLOW-LIST — only `tradier-balance` / `realized-backfill` are
- *     broker-derived; everything else, INCLUDING an absent label, is
- *     engine-sourced until proven otherwise. Not knowing the measure is a reason
- *     to audit, never a reason to skip.
+ *     broker-derived. An absent label is its own class (`unlabelled`, TRA-5118;
+ *     it used to be silently folded into `engine`) and is graded, never skipped:
+ *     not knowing the measure is a reason to audit, never a reason to skip.
  *
  *   • **3 of 14 `tradier-balance` rows render a figure their own header
  *     contradicts.** 2026-07-15 states "= +0.00" in prose and carries
@@ -43,6 +43,24 @@
  * (TRA-2864), and the broker figure a clobbered row states in prose is itself
  * only as good as the cash-flow span behind it (07-17's "+300.00" is one of the
  * ACH deposits TRA-2875 enumerated).
+ *
+ * TRA-5118 — three defects in THIS instrument, found by grading it against
+ * TRA-3100's nine permanently-uncorrectable cells (it said `ok` to 8 of the 9,
+ * and the one it flagged had the smallest gap):
+ *
+ *   1. The engine branch early-returned `ok` on `optionsPnl == 0` BEFORE the
+ *      broker leg was read — a 2-term detector graded as "it fires" instead of
+ *      as a 4-quadrant matrix. The missing quadrant (engine leg zero, broker leg
+ *      NOT zero) is where 5 of the 9 lived; it now has its own status,
+ *      `broker_realized_without_cell_pnl`.
+ *   2. `classifyCellPnlSource(undefined)` guessed `'engine'` — the exact
+ *      absence-to-guessed-source mapping TRA-5095 ruled out for the client — and
+ *      the guess was load-bearing: it routed unlabelled real-money rows into the
+ *      branch that early-returned `ok`. Absence is now its own class.
+ *   3. `ok` serialized as NOTHING, so "ties to the broker", "the broker was
+ *      never consulted" and "I guessed the source" were byte-identical on the
+ *      wire. The verdict is now stamped on every graded row
+ *      (`BrokerSourceAuditStamp`), `ok` included.
  */
 
 /** The `pnlSource` labels a stored calendar row can carry. */
@@ -51,13 +69,26 @@ export type StoredPnlSource = 'engine' | 'tradier-balance' | 'realized-backfill'
 /**
  * How the row's calendar figure was SOURCED, as opposed to what it is labelled.
  *
- *  - `broker`   — derived from broker data (a balance delta, or FIFO-matched fills).
- *  - `engine`   — derived from the engine's own book. Needs reconciling on a live
- *                 account. **An unlabelled row lands here.**
- *  - `intraday` — today's unsettled running figure; labelled as such and not yet
- *                 a claim about a closed day.
+ *  - `broker`     — derived from broker data (a balance delta, or FIFO-matched fills).
+ *  - `engine`     — derived from the engine's own book. Needs reconciling on a
+ *                   live account.
+ *  - `intraday`   — today's unsettled running figure; labelled as such and not
+ *                   yet a claim about a closed day.
+ *  - `unlabelled` — the row carries NO `pnlSource` at all (TRA-5118). TRA-5095
+ *                   ruled that the correct per-cell label for a no-`pnlSource`
+ *                   row is an explicit `unlabelled` state, never an inferred
+ *                   source; the client (`pnl-day.tsx`, `UNLABELLED_MEASURE`)
+ *                   already complies, and until TRA-5118 this module contradicted
+ *                   it by guessing `engine`. The grading rule for the class is
+ *                   decided explicitly, not inherited by fall-through: an
+ *                   unlabelled row is graded on the same options-leg-vs-broker
+ *                   4-quadrant comparison as an engine row — whatever the
+ *                   rendered figure measures, `optionsPnl` comes off the engine's
+ *                   own book, so that leg is comparable — but the class is
+ *                   PUBLISHED as `unlabelled` and no detail string claims the
+ *                   row is engine-sourced.
  */
-export type CellSourceClass = 'broker' | 'engine' | 'intraday';
+export type CellSourceClass = 'broker' | 'engine' | 'intraday' | 'unlabelled';
 
 /**
  * ⛔ THE REACH GATE. Allow-list, deliberately.
@@ -66,10 +97,16 @@ export type CellSourceClass = 'broker' | 'engine' | 'intraday';
  * An unknown or absent label means the row's provenance was never recorded, and
  * "not recorded" is not evidence of broker truth — it is exactly the population
  * that predates broker sourcing.
+ *
+ * TRA-5118 — an ABSENT label is `unlabelled`, its own class, graded by the same
+ * broker comparison as `engine` but never published as a guessed source. An
+ * unrecognised FUTURE label stays `engine`: a label we do not recognise is not
+ * broker evidence, and "engine until proven otherwise" is the allow-list.
  */
 export function classifyCellPnlSource(pnlSource: string | undefined): CellSourceClass {
   if (pnlSource === 'tradier-balance' || pnlSource === 'realized-backfill') return 'broker';
   if (pnlSource === 'live-intraday') return 'intraday';
+  if (pnlSource === undefined || pnlSource === '') return 'unlabelled';
   return 'engine';
 }
 
@@ -103,6 +140,9 @@ export function brokerFigureFromHeader(markdown: string | undefined): number | n
   return Number.isFinite(value) ? value : null;
 }
 
+/** Which evidence carried the broker leg of the comparison (TRA-5118). */
+export type BrokerEvidenceSource = 'sidecar' | 'fifo_row' | 'sidecar_quiet';
+
 /**
  * What we could establish about broker activity on the report date.
  *
@@ -113,13 +153,48 @@ export function brokerFigureFromHeader(markdown: string | undefined): number | n
  *
  * ⚠️ SCOPE, stated because a partial comparison that does not say so reads as a
  * full one: `realizedUsd` is the broker's realized **options** P&L for the date
- * (the `tradier-options-pnl.<env>.json` sidecar). The audit therefore grades the
- * OPTIONS leg — which is the leg sourced from `closedOptions` and the whole
- * mechanism of this ticket — and never claims to have graded equity realized.
+ * (the `tradier-options-pnl.<env>.json` sidecar, or the row's own TRA-4201 FIFO
+ * reconstruction — `source` says which). The audit therefore grades the OPTIONS
+ * leg — which is the leg sourced from `closedOptions` and the whole mechanism of
+ * this ticket — and never claims to have graded equity realized.
  */
 export type BrokerDayEvidence =
-  | { known: true; realizedUsd: number }
+  | { known: true; realizedUsd: number; source?: BrokerEvidenceSource }
   | { known: false; reason: string };
+
+/**
+ * TRA-5118 — assemble the broker leg for one date WITHOUT letting `?? 0`
+ * manufacture "the broker was quiet" out of a windowed sidecar.
+ *
+ * The `tradier-options-pnl.<env>.json` sidecar only covers the reconcile
+ * window; the June 2026 cells TRA-3100 enumerated have long since rolled out of
+ * it, so `totals[date] ?? 0` reads as a quiet day on exactly the rows the
+ * fourth-quadrant check exists to catch — the fix would be structurally unable
+ * to reach the wrong cells (TRA-2864's trap, one layer down). Precedence:
+ *
+ *   1. a sidecar ENTRY for the date — the live reconcile wins when it speaks;
+ *   2. the row's own TRA-4201 `brokerRealized` block — FIFO-matched per date
+ *      from the broker's trade history and stored beside the figure. Its
+ *      `optionsPnl` leg is the one used, matching this audit's stated scope;
+ *   3. a READABLE sidecar with no entry and no FIFO block — quiet as far as
+ *      anything here can see, carried as `sidecar_quiet` so a sweep can count
+ *      the weaker basis separately;
+ *   4. an unreadable sidecar and no FIFO block — `known: false`. Fails closed.
+ */
+export function resolveBrokerDayEvidence(
+  totals: { ok: true; totals: Record<string, number> } | { ok: false; reason: string },
+  date: string,
+  brokerRealized: { optionsPnl: number } | undefined,
+): BrokerDayEvidence {
+  if (totals.ok && totals.totals[date] !== undefined) {
+    return { known: true, realizedUsd: totals.totals[date], source: 'sidecar' };
+  }
+  if (brokerRealized && Number.isFinite(brokerRealized.optionsPnl)) {
+    return { known: true, realizedUsd: brokerRealized.optionsPnl, source: 'fifo_row' };
+  }
+  if (totals.ok) return { known: true, realizedUsd: 0, source: 'sidecar_quiet' };
+  return { known: false, reason: totals.reason };
+}
 
 export type LiveCellSourceStatus =
   | 'ok'
@@ -131,7 +206,14 @@ export type LiveCellSourceStatus =
   | 'engine_close_without_broker_fill'
   /** Engine-sourced options P&L that disagrees with the broker's figure for the date. */
   | 'engine_options_diverges_from_broker'
-  /** Engine-sourced options P&L and the broker tape could not be read. BLIND. */
+  /**
+   * TRA-5118 — the FOURTH quadrant: the broker booked realized options P&L on a
+   * date the cell booked none, and the rendered figure does not tie to it. The
+   * mirror of `engine_close_without_broker_fill`, and the quadrant where 5 of
+   * TRA-3100's 9 uncorrectable cells lived while the audit said `ok`.
+   */
+  | 'broker_realized_without_cell_pnl'
+  /** The broker tape could not be read, so the comparison could not run. BLIND. */
   | 'broker_evidence_unreadable';
 
 export interface LiveCellSourceVerdict {
@@ -143,6 +225,8 @@ export interface LiveCellSourceVerdict {
   engineOptionsPnl: number;
   /** Broker figure for the comparison, or `null` when unknown/blind. */
   brokerPnl: number | null;
+  /** TRA-5118 — which evidence carried the broker leg; `null` when blind/unused. */
+  brokerEvidenceSource: BrokerEvidenceSource | null;
   /** Operator-facing sentence. Never a number the caller should trade on. */
   detail: string;
 }
@@ -170,6 +254,10 @@ function signed(n: number): string {
   return (n >= 0 ? '+' : '-') + usd(n).slice(1);
 }
 
+function brokerEvidenceSourceOf(input: LiveCellSourceInput): BrokerEvidenceSource | null {
+  return input.broker.known ? input.broker.source ?? null : null;
+}
+
 function ok(input: LiveCellSourceInput, sourceClass: CellSourceClass, detail: string): LiveCellSourceVerdict {
   return {
     status: 'ok',
@@ -177,6 +265,7 @@ function ok(input: LiveCellSourceInput, sourceClass: CellSourceClass, detail: st
     renderedPnl: input.combinedPnl,
     engineOptionsPnl: input.optionsPnl,
     brokerPnl: input.broker.known ? input.broker.realizedUsd : null,
+    brokerEvidenceSource: brokerEvidenceSourceOf(input),
     detail,
   };
 }
@@ -219,6 +308,7 @@ export function auditLiveCellSource(input: LiveCellSourceInput): LiveCellSourceV
         renderedPnl: input.combinedPnl,
         engineOptionsPnl: input.optionsPnl,
         brokerPnl: null,
+        brokerEvidenceSource: null,
         detail:
           `${input.reportDate} is labelled a broker balance-delta cell but carries no readable broker `
           + `computation, so the rendered ${signed(input.combinedPnl)} cannot be tied back to the broker. `
@@ -233,6 +323,7 @@ export function auditLiveCellSource(input: LiveCellSourceInput): LiveCellSourceV
         renderedPnl: input.combinedPnl,
         engineOptionsPnl: input.optionsPnl,
         brokerPnl: stated,
+        brokerEvidenceSource: null,
         detail:
           `${input.reportDate} states a broker-truth P&L of ${signed(stated)} in its own header but `
           + `renders ${signed(input.combinedPnl)}. `
@@ -246,40 +337,96 @@ export function auditLiveCellSource(input: LiveCellSourceInput): LiveCellSourceV
     return ok(input, sourceClass, `Broker balance delta, confirmed against the row's own header (${signed(stated)}).`);
   }
 
-  // ── engine-sourced ────────────────────────────────────────────────────────
+  // ── engine-sourced or unlabelled ──────────────────────────────────────────
   //
   // The graded quantity is the OPTIONS leg: `optionsPnl` is what comes off
-  // `closedOptions`, and it is what a phantom engine close inflates.
-  if (Math.abs(input.optionsPnl) <= TOLERANCE_USD) {
-    return ok(input, sourceClass, 'No engine options P&L booked on this day — nothing sourced from the engine book.');
-  }
+  // `closedOptions`, and it is what a phantom engine close inflates. That leg is
+  // engine-book-derived whatever the row is labelled, so the `unlabelled` class
+  // is graded on the same comparison — but its prose never claims the row IS
+  // engine-sourced, and its class is published as `unlabelled` (TRA-5118).
+  //
+  // ⛔ TRA-5118 — this is a 4-QUADRANT matrix on (engine leg zero?, broker leg
+  // zero?), and the broker leg is read FIRST. The pre-fix code early-returned
+  // `ok` on a zero engine leg before ever reading the broker, which made the
+  // quadrant (engine == 0, broker != 0) — where 5 of TRA-3100's 9 uncorrectable
+  // cells live — grade as confirmed.
+  const provenanceNote = sourceClass === 'unlabelled'
+    ? ' This row carries no `pnlSource` (provenance never recorded — TRA-5095), so nothing is assumed about what the rendered figure measures.'
+    : '';
+  const engineZero = Math.abs(input.optionsPnl) <= TOLERANCE_USD;
   if (!input.broker.known) {
-    // ⛔ FAILS CLOSED. An unreadable broker tape must never resolve to "agrees".
+    // ⛔ FAILS CLOSED — on BOTH engine quadrants. An unreadable broker tape must
+    // never resolve to "agrees"; and with the fourth quadrant closed, the broker
+    // leg is load-bearing even when the cell booked nothing, because the broker
+    // may have booked closes the cell never recorded. Pre-TRA-5118 this arm
+    // returned `ok` when `optionsPnl == 0`.
     return {
       status: 'broker_evidence_unreadable',
       sourceClass,
       renderedPnl: input.combinedPnl,
       engineOptionsPnl: input.optionsPnl,
       brokerPnl: null,
-      detail:
-        `${input.reportDate} books ${signed(input.optionsPnl)} of options P&L from the engine's own closed-options `
-        + `book, and the broker tape could not be read (${input.broker.reason}), so it could not be `
-        + `reconciled. Unconfirmed, not agreed.`,
+      brokerEvidenceSource: null,
+      detail: engineZero
+        ? `${input.reportDate} books no engine options P&L, and the broker tape could not be read `
+          + `(${input.broker.reason}), so whether the broker booked realized closes this day cannot be `
+          + `established. Unconfirmed, not agreed.${provenanceNote}`
+        : `${input.reportDate} books ${signed(input.optionsPnl)} of options P&L from the engine's own closed-options `
+          + `book, and the broker tape could not be read (${input.broker.reason}), so it could not be `
+          + `reconciled. Unconfirmed, not agreed.${provenanceNote}`,
     };
   }
   const brokerUsd = input.broker.realizedUsd;
-  if (Math.abs(brokerUsd) <= TOLERANCE_USD) {
+  const brokerZero = Math.abs(brokerUsd) <= TOLERANCE_USD;
+  if (engineZero) {
+    if (brokerZero) {
+      return ok(
+        input,
+        sourceClass,
+        `No engine options P&L booked and the broker shows no realized options P&L for ${input.reportDate} — `
+        + `quiet on both books.${provenanceNote}`,
+      );
+    }
+    // The broker moved real money and the cell booked none of it. If the
+    // rendered figure happens to tie the broker's realized figure to the cent,
+    // the NUMBER is broker-confirmed even though the options leg is empty;
+    // anything else is the fourth quadrant.
+    if (Math.abs(input.combinedPnl - brokerUsd) <= TOLERANCE_USD) {
+      return ok(
+        input,
+        sourceClass,
+        `The rendered ${signed(input.combinedPnl)} ties the broker's realized options P&L for `
+        + `${input.reportDate} (${signed(brokerUsd)}) to the cent, although the cell's own options leg is `
+        + `empty.${provenanceNote}`,
+      );
+    }
+    return {
+      status: 'broker_realized_without_cell_pnl',
+      sourceClass,
+      renderedPnl: input.combinedPnl,
+      engineOptionsPnl: input.optionsPnl,
+      brokerPnl: brokerUsd,
+      brokerEvidenceSource: brokerEvidenceSourceOf(input),
+      detail:
+        `${input.reportDate} renders ${signed(input.combinedPnl)} with no options P&L booked on the cell, `
+        + `while the broker's realized options P&L for the date is ${signed(brokerUsd)} — a gap of `
+        + `${signed(input.combinedPnl - brokerUsd)}. The broker moved money this cell never recorded, so the `
+        + `rendered figure is not broker-confirmed.${provenanceNote}`,
+    };
+  }
+  if (brokerZero) {
     return {
       status: 'engine_close_without_broker_fill',
       sourceClass,
       renderedPnl: input.combinedPnl,
       engineOptionsPnl: input.optionsPnl,
       brokerPnl: brokerUsd,
+      brokerEvidenceSource: brokerEvidenceSourceOf(input),
       detail:
         `${input.reportDate} books ${signed(input.optionsPnl)} of options P&L from the engine's own `
         + `closed-options book while the broker shows NO realized options P&L for that date. An engine `
         + `close with no broker fill is not a P&L event on a live account — this figure is not money `
-        + `that moved.`,
+        + `that moved.${provenanceNote}`,
     };
   }
   if (Math.abs(brokerUsd - input.optionsPnl) > TOLERANCE_USD) {
@@ -289,14 +436,19 @@ export function auditLiveCellSource(input: LiveCellSourceInput): LiveCellSourceV
       renderedPnl: input.combinedPnl,
       engineOptionsPnl: input.optionsPnl,
       brokerPnl: brokerUsd,
+      brokerEvidenceSource: brokerEvidenceSourceOf(input),
       detail:
         `${input.reportDate} books ${signed(input.optionsPnl)} of options P&L from the engine's own `
         + `closed-options book; the broker's realized options P&L for that date is ${signed(brokerUsd)}, a `
         + `difference of ${signed(input.optionsPnl - brokerUsd)}. Broker truth wins — the rendered figure is `
-        + `the engine's.`,
+        + `the engine's.${provenanceNote}`,
     };
   }
-  return ok(input, sourceClass, `Engine options figure ties to the broker's realized options P&L (${signed(brokerUsd)}).`);
+  return ok(
+    input,
+    sourceClass,
+    `Engine options figure ties to the broker's realized options P&L (${signed(brokerUsd)}).${provenanceNote}`,
+  );
 }
 
 /** True when the verdict means the rendered figure is not broker-confirmed. */
@@ -314,11 +466,69 @@ export interface PnlUnreconciledBlock {
   at: string;
 }
 
+/**
+ * TRA-5118 — the verdict as it is SERIALIZED, on every graded row, `ok`
+ * included. Mirrors `EodReport['brokerSourceAudit']`.
+ *
+ * Before this existed, an `ok` verdict wrote nothing, so three different states
+ * shared one wire representation (absence): a real pass, a cell the broker was
+ * never consulted about, and a guessed source routed into the pass branch. A
+ * sweep over served rows can now read the DENOMINATOR — how many rows reached
+ * each status, including the not-graded arms — instead of counting flags raised.
+ */
+export interface BrokerSourceAuditStamp {
+  /** The verdict, or `not_graded` with the reason beside it. */
+  status: LiveCellSourceStatus | 'not_graded';
+  /**
+   * Present exactly when `status === 'not_graded'`.
+   *  - `pnl_unknown_precedence` — TRA-3101 already says something strictly
+   *    stronger about this row ("the day was never measured"); the broker-source
+   *    audit does not run on it.
+   *  - `audit_error` — the audit itself threw. The row is served/written
+   *    unaudited, and this stamp is what keeps that distinguishable from a pass.
+   */
+  notGradedReason?: 'pnl_unknown_precedence' | 'audit_error';
+  sourceClass?: CellSourceClass;
+  renderedPnl?: number;
+  engineOptionsPnl?: number;
+  brokerPnl?: number | null;
+  brokerEvidenceSource?: BrokerEvidenceSource | null;
+  detail: string;
+  at: string;
+}
+
+/** TRA-5118 — the stamp for a row the audit deliberately or accidentally skipped. */
+export function notGradedAuditStamp(
+  reason: 'pnl_unknown_precedence' | 'audit_error',
+  detail: string,
+  at: string,
+): BrokerSourceAuditStamp {
+  return { status: 'not_graded', notGradedReason: reason, detail, at };
+}
+
+/**
+ * TRA-5118 — derive the stamp from a stored write-time `pnlUnreconciled` block,
+ * so a row whose write-time verdict stands still serializes a verdict instead of
+ * relying on the block's presence alone.
+ */
+export function auditStampFromStoredBlock(block: PnlUnreconciledBlock): BrokerSourceAuditStamp {
+  return {
+    status: block.reason,
+    renderedPnl: block.renderedPnl,
+    engineOptionsPnl: block.engineOptionsPnl,
+    brokerPnl: block.brokerPnl,
+    detail: block.detail,
+    at: block.at,
+  };
+}
+
 export interface LiveCellSourceDisposition {
   /** Non-null exactly when the rendered figure is not broker-confirmed. */
   pnlUnreconciled: PnlUnreconciledBlock | null;
   /** The markdown header the row carries. Empty string when there is nothing to say. */
   header: string;
+  /** TRA-5118 — stamped on EVERY graded row, `ok` included. */
+  audit: BrokerSourceAuditStamp;
 }
 
 /**
@@ -336,7 +546,17 @@ export function decideLiveCellSourceDisposition(
   verdict: LiveCellSourceVerdict,
   at: string,
 ): LiveCellSourceDisposition {
-  if (!isUnreconciled(verdict)) return { pnlUnreconciled: null, header: '' };
+  const audit: BrokerSourceAuditStamp = {
+    status: verdict.status,
+    sourceClass: verdict.sourceClass,
+    renderedPnl: Number(verdict.renderedPnl.toFixed(2)),
+    engineOptionsPnl: Number(verdict.engineOptionsPnl.toFixed(2)),
+    brokerPnl: verdict.brokerPnl === null ? null : Number(verdict.brokerPnl.toFixed(2)),
+    brokerEvidenceSource: verdict.brokerEvidenceSource,
+    detail: verdict.detail,
+    at,
+  };
+  if (!isUnreconciled(verdict)) return { pnlUnreconciled: null, header: '', audit };
   const reason = verdict.status as Exclude<LiveCellSourceStatus, 'ok'>;
   return {
     pnlUnreconciled: {
@@ -351,5 +571,6 @@ export function decideLiveCellSourceDisposition(
       `> **⚠ The P&L shown for this day is NOT broker-confirmed (TRA-3102).** ${verdict.detail} `
       + `The figure is left exactly as it was recorded — this row is flagged, not corrected — and it is `
       + `EXCLUDED from the monthly totals. \`reason: ${reason}\`.`,
+    audit,
   };
 }

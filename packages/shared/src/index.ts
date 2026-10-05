@@ -6667,6 +6667,10 @@ export interface EodReport {
      *   the broker shows no realized options P&L for. Not money that moved.
      * - `engine_options_diverges_from_broker` — both non-zero and they disagree;
      *   broker truth wins and the rendered figure is the engine's.
+     * - `broker_realized_without_cell_pnl` — TRA-5118, the fourth quadrant: the
+     *   broker realized options P&L on a date the cell booked none, and the
+     *   rendered figure does not tie to it. The broker moved money this cell
+     *   never recorded.
      * - `broker_figure_overwritten` — a broker-tagged row whose stored figure
      *   contradicts the broker figure stated in its own header.
      * - `broker_evidence_unreadable` / `broker_provenance_unreadable` — the
@@ -6675,6 +6679,7 @@ export interface EodReport {
     reason:
       | 'engine_close_without_broker_fill'
       | 'engine_options_diverges_from_broker'
+      | 'broker_realized_without_cell_pnl'
       | 'broker_figure_overwritten'
       | 'broker_evidence_unreadable'
       | 'broker_provenance_unreadable';
@@ -6687,6 +6692,54 @@ export interface EodReport {
     /** Operator-facing explanation of what is unconfirmed and why. */
     detail: string;
     /** ISO timestamp the verdict was stamped. */
+    at: string;
+  };
+
+  /**
+   * TRA-5118 — the broker-source audit verdict, stamped on EVERY graded live
+   * cell, `ok` included.
+   *
+   * Before this field, an `ok` verdict serialized as NOTHING, so three states
+   * were byte-identical on the wire: "the figure ties to the broker" (a real
+   * pass), "the broker was never consulted" (not graded), and "the source was
+   * guessed" (the pre-TRA-5118 `engine` fall-through). A sweep over served rows
+   * could count flags raised but never read the DENOMINATOR. This block makes
+   * the pass, the fail, and the deliberate skip three different readings.
+   *
+   *  - `status` — the verdict (`ok` / the `pnlUnreconciled` reasons), or
+   *    `not_graded` with `notGradedReason` beside it (`pnl_unknown_precedence`:
+   *    TRA-3101 already says something strictly stronger; `audit_error`: the
+   *    audit itself threw and the row is served unaudited — distinguishable
+   *    from a pass precisely because this stamp says so).
+   *  - `sourceClass` — `broker` / `engine` / `intraday` / `unlabelled`. An
+   *    absent `pnlSource` is published as `unlabelled` (TRA-5095's ruling),
+   *    never inferred to a source.
+   *  - `brokerEvidenceSource` — which evidence carried the broker leg:
+   *    `sidecar` (the live reconcile file has the date), `fifo_row` (the row's
+   *    own TRA-4201 reconstruction; the sidecar's window has rolled past the
+   *    date), or `sidecar_quiet` (a readable sidecar with no entry and no FIFO
+   *    block — the weakest basis, counted separately so it cannot hide).
+   *
+   * Served on the read path and stamped by the write path; absent only on rows
+   * served by a pre-TRA-5118 build (and on demo cells, which have no broker).
+   */
+  brokerSourceAudit?: {
+    status:
+      | 'ok'
+      | 'engine_close_without_broker_fill'
+      | 'engine_options_diverges_from_broker'
+      | 'broker_realized_without_cell_pnl'
+      | 'broker_figure_overwritten'
+      | 'broker_evidence_unreadable'
+      | 'broker_provenance_unreadable'
+      | 'not_graded';
+    notGradedReason?: 'pnl_unknown_precedence' | 'audit_error';
+    sourceClass?: 'broker' | 'engine' | 'intraday' | 'unlabelled';
+    renderedPnl?: number;
+    engineOptionsPnl?: number;
+    brokerPnl?: number | null;
+    brokerEvidenceSource?: 'sidecar' | 'fifo_row' | 'sidecar_quiet' | null;
+    detail: string;
     at: string;
   };
 
