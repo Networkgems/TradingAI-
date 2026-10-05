@@ -1150,6 +1150,7 @@ import {
   PROMOTION_DIVERGENCE_RECOMPUTE_MS,
 } from './promotion-divergence-monitor.js';
 import { resolveDataDir } from './data-dir.js';
+import { mergeExitSpreadShadow } from './option-exit-spread-shadow.js';
 // TRA-3595 — the host execution path for the TRA-2906 v1→v2 cash-flow rebuild.
 // Inert unless `TRA2906_CASH_FLOW_REBUILD` is set; see that module's header for
 // why an env-armed boot one-shot is not the standing automated write TRA-3595
@@ -13572,6 +13573,9 @@ app.get('/api/health/options-live', async (_req, res) => {
       // rising while `escalatedTotal` stays flat is this bug, still open.
       //
       // Resets on restart by design, same as `abandonedStagedExits`.
+      // TRA-4944 — observe-only exit-quote spread census; read `evaluated` WITH
+      // each cell's `noQuote` (an unmeasured exit is never a tight one).
+      exitSpreadShadow: mergeExitSpreadShadow(getAllUserContexts().map((c) => c.engine.getExitSpreadShadow())),
       expiredExits: getAllUserContexts().reduce(
         (acc, c) => {
           const s = c.engine.getExpiredExitStats();

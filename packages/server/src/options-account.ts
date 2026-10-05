@@ -270,6 +270,7 @@ import { computeOptionStopBasisR } from './option-stop-basis-r.js';
 // TRA-4997 — the exit-side quote stamp + its measured cross. Pure; imports
 // nothing back from here.
 import { resolveExitQuote, exitQuoteCrossUsd } from './option-exit-quote.js';
+import { ExitSpreadShadow, type ExitSpreadShadowSnapshot } from './option-exit-spread-shadow.js';
 // TRA-3946 — the observe-only average-down shadow (phase 1, zero capital).
 import {
   resolveAverageDownConfig,
@@ -6798,6 +6799,8 @@ export class PaperOptionsAccount {
    * "never reached" if you only publish one of the two numbers.
    */
   private escalatedExits = 0;
+  /** TRA-4944 — observe-only exit-quote spread census (no threshold, refuses nothing). */
+  private readonly exitSpreadShadow = new ExitSpreadShadow();
   /**
    * TRA-3217 — how many chandelier fires this process VETOED because the
    * breach was carried out of a suppressed window (PDT/swing hold or the live
@@ -13234,6 +13237,15 @@ export class PaperOptionsAccount {
         // header on `stampExitMarkProvenance` for why this is one call site and
         // not the three the ticket enumerated.
         stampExitMarkProvenance(opt, markProvenance);
+        // TRA-4944 — SHADOW ONLY (ruled 2026-10-04): count the exit quote's
+        // relative spread at the seam; no level is named and nothing is refused.
+        this.exitSpreadShadow.observe({
+          sleeve: opt.engineOriginSleeve ?? opt.signalType ?? 'unknown',
+          mode: opt.mode ?? 'demo',
+          reason: exitJournalReason ?? exitKind,
+          quote: markProvenance.quoteAtFire,
+          markSource: markProvenance.markSource,
+        });
         if (waitAndHold) {
           // TRA-354 — stage the full exit at the trigger (SL or trailing)
           // price; engine submits a Tradier limit sell_to_close. The paper
@@ -14481,6 +14493,11 @@ export class PaperOptionsAccount {
    * on a live row until the daily-close window (one per row per ET day).
    * Since-boot; the live read is `liveStopActionability.byReason.daily_close_hold`.
    */
+  /** TRA-4944 — since-boot exit-spread shadow census (counts only, no OCC symbols; TRA-2163). */
+  getExitSpreadShadow(): ExitSpreadShadowSnapshot {
+    return this.exitSpreadShadow.snapshot();
+  }
+
   getSlDailyCloseHolds(): number {
     return this.slDailyCloseHolds;
   }

@@ -49,7 +49,7 @@ export interface CrossedPricingRow {
   /** TRA-1656 scanner snapshot — the pre-stamp fallback. */
   entryBid?: number;
   entryAsk?: number;
-  markProvenance?: { quoteAtFire: { bid: number; ask: number } | null; at?: number } | null;
+  markProvenance?: { quoteAtFire: { bid: number; ask: number } | null; markSource?: string | null; at?: number } | null;
   /**
    * TRA-4997 — the exit-side quote stamped at the CLOSE SEAM, which every close
    * path reaches (the cascade fire, the halt flatten, the manual close, the
@@ -281,6 +281,14 @@ export interface CrossedFoldCells {
   unpriced: number;
   /** Census of WHY, by {@link CrossedUnpricedReason}. Sums to `unpriced`. */
   unpricedReasons: Partial<Record<CrossedUnpricedReason, number>>;
+  /**
+   * TRA-4944 (q2a, ruled 2026-10-04) — of `unpriced`, rows whose exit was priced
+   * off a `delta_backstop` model mark. TRA-384 working as designed, so this is a
+   * REPORTING cell, not a refusal: these exits are UNMEASURED, not cheap, and
+   * they are absent from every crossed/cost fold. Subset of `unpriced`; counted
+   * regardless of which {@link CrossedUnpricedReason} won.
+   */
+  unmeasuredDeltaBackstop: number;
   /** Σ crossed P&L over the priced rows; null (never 0) when priced === 0. */
   crossedPnlUsd: number | null;
   /** Σ `realizedPnlUsd` over the SAME priced rows — the matched booked column. */
@@ -307,6 +315,7 @@ export function foldCrossedCells(closedRows: CrossedPricingRow[]): CrossedFoldCe
   let loss = 0;
   let flat = 0;
   let pricedByFireTickQuote = 0;
+  let unmeasuredDeltaBackstop = 0;
   const lastKnownAges: number[] = [];
   const crossedRs: number[] = [];
   for (const row of closedRows) {
@@ -314,6 +323,7 @@ export function foldCrossedCells(closedRows: CrossedPricingRow[]): CrossedFoldCe
     if (p.crossedPnlUsd === null) {
       const reason = p.crossedUnpriced ?? 'exit_quote_missing';
       reasons[reason] = (reasons[reason] ?? 0) + 1;
+      if (row.markProvenance?.markSource === 'delta_backstop') unmeasuredDeltaBackstop += 1;
       continue;
     }
     priced += 1;
@@ -345,6 +355,7 @@ export function foldCrossedCells(closedRows: CrossedPricingRow[]): CrossedFoldCe
         : null,
     unpriced: closedRows.length - priced,
     unpricedReasons: reasons,
+    unmeasuredDeltaBackstop,
     crossedPnlUsd,
     bookedPnlUsdPriced,
     spreadDragUsd:

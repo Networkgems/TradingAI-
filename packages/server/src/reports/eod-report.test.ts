@@ -751,6 +751,7 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
     lastKnownQuoteMeanAgeMs: null,
     unpriced: 1,
     unpricedReasons: { structure_not_crossable: 1 as number },
+    unmeasuredDeltaBackstop: 0,
     crossedPnlUsd: null,
     bookedPnlUsdPriced: null,
     spreadDragUsd: null,

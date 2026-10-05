@@ -809,6 +809,7 @@ import { emitAlert } from './notifications/index.js';
 import { dispatchAlert } from './observability/alerts.js';
 // TRA-3962 (Q2, board ruling 2026-10-04) — the over-cap page classifier.
 import { classifyOverCapPage } from './tra3962-over-cap-page.js';
+import { mergeExitSpreadShadow, type ExitSpreadShadowSnapshot } from './option-exit-spread-shadow.js';
 
 const balanceLog = logger.child({ module: 'signal-engine' });
 const log = logger.child({ module: 'signal-engine' });
@@ -11856,6 +11857,12 @@ export class SignalEngine {
    *
    * Counts and timestamps only — no OCC symbols (TRA-2163).
    */
+  getExitSpreadShadow(): ExitSpreadShadowSnapshot {
+    return mergeExitSpreadShadow(
+      (['sandbox', 'production'] as const).map((env) => this.optionsAccounts[env].getExitSpreadShadow()),
+    );
+  }
+
   getExpiredExitStats(): {
     expiredTotal: number;
     expiredLiveTotal: number;
