@@ -127,6 +127,8 @@ import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
 // the chain-archive seedable-depth census behind the TRA-5170 seed decision.
 import { readIvStoreProvenanceSync } from '../iv-rank-store.js';
 import { readArchiveSeedCensusSync, summarizeSeedableUniverse } from '../iv-seed-census.js';
+// TRA-5176 — the durable, dated per-session candidate-arrival series.
+import { readShortPremiumArrivalHistorySync } from '../short-premium-arrival-ledger.js';
 import { buildWheelPromotionGateSummary } from '../wheel-promotion-gate-store.js'; // TRA-2028
 import {
   summarizeConvictionDca,
@@ -5769,6 +5771,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       ivStoreProvenance: readIvStoreProvenanceSync(),
       archiveSeedCensus: readArchiveSeedCensusSync(Date.now()),
       seedableUniverse: summarizeSeedableUniverse(summary.scans.map((s) => s.symbol)),
+      // TRA-5176 — the durable, dated per-session arrival ledger (newest
+      // first). `candidateCount` above is a live snapshot one sweep wide; THIS
+      // is the series TRA-5173 item 2 grades: distinct (symbol, expiration,
+      // structure) per ET session, restart-durable, with absent-vs-zero
+      // preserved. Observe-only like everything else on this route.
+      arrivalHistory: readShortPremiumArrivalHistorySync(),
     });
   });
 

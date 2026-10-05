@@ -212,6 +212,8 @@ import {
   type AdvisoryShortlist,
 } from './agents-advisory-bound.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan, type ShortPremiumScanResult } from './short-premium-scanner.js';
+// TRA-5176 — one completed whole-universe sweep = one arrival-ledger "cycle".
+import { noteShortPremiumCycleComplete } from './short-premium-arrival-ledger.js';
 // TRA-4570/4626 — observe-only swing scanners + fusion ranking; TRA-4706 — one
 // injected pass (daily series, recent earnings, per-cause summary).
 import type { SwingSignalCandidate, SwingScanSummary } from '@trading-app/shared';
@@ -18629,6 +18631,11 @@ export class SignalEngine {
     // TRA-2262 — once per COMPLETED sweep, not once per budgeted slice, so the
     // wheel keeps exactly its pre-bound cadence and sees a whole-universe map.
     if (pass.complete) {
+      // TRA-5176 — count the completed sweep into the durable arrival ledger
+      // (sweep units, not budgeted slices, so `cycleCount` matches TRA-2262's
+      // cadence) and let it persist the session row. Synchronous enqueue; the
+      // ledger serialises its own I/O and can never break the scan pass.
+      noteShortPremiumCycleComplete(Date.now());
       if (routeWheel) {
         try {
           this.runWheelCycle(wheelScans, Date.now());

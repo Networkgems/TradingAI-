@@ -679,6 +679,8 @@ import {
   atmIvFromRows,
   seedFromArchive,
 } from './iv-rank-store.js';
+// TRA-5176 — the durable per-session short-premium candidate-arrival ledger.
+import { initShortPremiumArrivalLedger } from './short-premium-arrival-ledger.js';
 // TRA-4644 — availability accounting for the `ivPercentile` sibling field on
 // the OTM/RV nomination read surface (published on the decomposition probe).
 import { ivPercentileCoverageHealth } from './iv-percentile-coverage.js';
@@ -1532,6 +1534,11 @@ void runMacroRefresh();
 // synchronous `ivRankSync` read used by the AI Options Ideas fusion has data
 // available right after boot. The store is appended to as chains are pulled.
 await initIvRankStore();
+
+// TRA-5176 — warm (and ARM disk persistence for) the short-premium arrival
+// ledger so the dated per-session series survives bqb1's several-a-day
+// restarts and is readable on /api/health/short-premium right after boot.
+await initShortPremiumArrivalLedger();
 
 // TRA-5171 — kick the chain-archive seedable-depth census (a cached disk walk)
 // in the background. Deliberately NOT awaited: a large archive must never delay
