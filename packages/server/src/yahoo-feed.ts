@@ -2665,10 +2665,25 @@ export const __recordChartSplitsForTests = recordChartSplits;
  * TRA-386 — fetch the last N *daily* candles for a symbol via Yahoo's chart
  * endpoint. Used by the automated market-review generator to read index-level
  * series (`^GSPC`, `^VIX`, `^TNX`) that the intraday minute-bar path does not
- * cover. Yahoo is the only provider queried here — Tradier's timesales feed is
- * intraday-only and these index symbols are not in the Twelve Data budget set.
+ * cover.
  *
- * Returns an empty array on any failure; callers must tolerate a cold feed.
+ * TRA-5092 — Yahoo is no longer the only provider: when the Yahoo leg yields
+ * ZERO bars (breaker open, error, or an empty answer) the call falls through to
+ * {@link fetchTradierDailyCandles}, which carries its own breaker + the
+ * TRA-4987 symbol-admission gate (so index symbols like `^GSPC` are refused
+ * there without spending a request, exactly as before). One provider's
+ * rate-limiter was a single point of failure for every daily-bar consumer that
+ * had not wired its own fallback — measured 2026-10-02 (TRA-5089): breaker open
+ * all session, `candidates: 0` across 778/1,557 funnel passes.
+ *
+ * `fallback: 'none'` is the opt-out for call sites that own their OWN Tradier
+ * leg with per-leg attribution or budgeting (the TRA-5065 sma200 budgeted pull,
+ * the TRA-4424 otm-daily-series batch, the TRA-1230 iv-rv backfill, the TRA-586
+ * market-review provenance cascade). Those sites must see the Yahoo leg's true
+ * answer, or their `servedPrimary` / `provider` bookkeeping silently relabels
+ * Tradier serves as Yahoo ones and their fallback budgets stop binding.
+ *
+ * Returns an empty array when every leg fails; callers must tolerate a cold feed.
  *
  * TRA-4805 — `lane` is an OPT-IN, and the default keeps every existing caller
  * exactly where it was (`crumb`).
@@ -2694,6 +2709,7 @@ export async function fetchDailyCandles(
   symbol: string,
   count = 30,
   lane: YahooBreakerLane = 'crumb',
+  fallback: 'tradier' | 'none' = 'tradier',
 ): Promise<Candle[]> {
   const now = new Date();
   // Pull a generous calendar window so weekends/holidays still leave `count`
@@ -2707,9 +2723,8 @@ export async function fetchDailyCandles(
     YF_RETRIES,
     lane,
   )).value;
-  if (!result) return [];
-  recordChartSplits(symbol, result);
-  const candles: Candle[] = (result.quotes ?? [])
+  if (result) recordChartSplits(symbol, result);
+  const candles: Candle[] = (result?.quotes ?? [])
     .filter(q => q.open != null && q.high != null && q.low != null && q.close != null)
     .map(q => ({
       symbol,
@@ -2721,7 +2736,11 @@ export async function fetchDailyCandles(
       volume: q.volume ?? 0,
     }))
     .sort((a, b) => a.timestamp - b.timestamp);
-  return candles.slice(-count);
+  if (candles.length > 0 || fallback === 'none') return candles.slice(-count);
+  // TRA-5092 — zero bars from Yahoo. The Tradier leg gates itself (client
+  // presence, breaker, symbol admission) and answers `[]` when it too is dark,
+  // so BOTH-legs-dead still yields an empty array, never a throw.
+  return fetchTradierDailyCandles(symbol, count);
 }
 
 /**

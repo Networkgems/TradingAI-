@@ -1035,7 +1035,7 @@ import { isTestAccount as isTestAccountName } from './test-accounts.js';
 import type { TradierEnv } from '@trading-app/shared';
 // TRA-3068 — the split calendar, read at the EOD report's generation path.
 import type { CorporateAction } from '@trading-app/shared';
-import { fetchQuotes, fetchDailyCandles, fetchTradierDailyCandles, fetchShortInterestFundamentals, fetchRecentSplits } from './yahoo-feed.js';
+import { fetchQuotes, fetchDailyCandles, fetchShortInterestFundamentals, fetchRecentSplits } from './yahoo-feed.js';
 import {
   runFirstBootMigration,
   runTra237OptionsReset,
@@ -1399,10 +1399,8 @@ log.info('rv-scanner initialized', {
 // (Yahoo primary, Tradier fallback when Yahoo's breaker is open).
 const shortSqueezeScannerService = new ShortSqueezeScannerService({
   fetchFundamentals: (symbol) => fetchShortInterestFundamentals(symbol),
-  fetchDailyBars: async (symbol, count) => {
-    const bars = await fetchDailyCandles(symbol, count);
-    return bars.length > 0 ? bars : fetchTradierDailyCandles(symbol, count);
-  },
+  // TRA-5092 — the Yahoo → Tradier cascade is inside `fetchDailyCandles` now.
+  fetchDailyBars: async (symbol, count) => fetchDailyCandles(symbol, count),
 });
 
 // TRA-563 (TRA-410 A1) — install the notification dispatcher. Preferences are

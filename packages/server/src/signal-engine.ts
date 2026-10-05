@@ -8893,7 +8893,10 @@ export class SignalEngine {
             // TRA-5065 — …and the Tradier leg behind it, so the sweep is not
             // pinned to a provider that 429s ~permanently on this host.
             const pulled = await fetchSma200CandlesShared(
-              sym, SMA200_DAILY_BARS, (s, n) => fetchDailyCandles(s, n),
+              // TRA-5092 — `'none'`: this pull owns its own budgeted fallback
+              // leg below; the in-feed Tradier leg would bypass the budget and
+              // count Tradier serves as `servedPrimary`.
+              sym, SMA200_DAILY_BARS, (s, n) => fetchDailyCandles(s, n, 'crumb', 'none'),
               {
                 breakerOpen: () => isYahooBreakerOpen(),
                 fallback: {
@@ -17410,7 +17413,9 @@ export class SignalEngine {
       // through `withRetry`, which returns `[]` while Yahoo is rate-limited, so an
       // un-asked breaker would launder an outage into `fetchEmpty`.
       run: (batch) => runOtmDailySeriesBatch(batch, {
-        fetch: (sym) => fetchDailyCandles(sym, OTM_DAILY_SERIES_BARS),
+        // TRA-5092 — `'none'`: the batch module attributes primary vs fallback
+        // behaviourally; the in-feed Tradier leg would relabel fallback serves.
+        fetch: (sym) => fetchDailyCandles(sym, OTM_DAILY_SERIES_BARS, 'crumb', 'none'),
         breakerOpen: () => isYahooBreakerOpen(),
         // TRA-4424 (09-18) — Yahoo 429s ~permanently on Render (TRA-1230): measured
         // live, a Yahoo-only refresh left 142 of 145 seam reads `absent`. Tradier
@@ -18476,10 +18481,10 @@ export class SignalEngine {
         // the backfill is session- and Yahoo-breaker-independent.
         let dailyCloses = getSharedDailyCloses(sym) ?? [];
         if (dailyCloses.length === 0) {
-          let bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
-          if (bars.length === 0) {
-            bars = await fetchTradierDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
-          }
+          // TRA-5092 — the Yahoo → Tradier cascade this comment describes now
+          // lives inside `fetchDailyCandles` itself; the explicit second leg
+          // was folded in rather than left to double-spend a history request.
+          const bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
           if (bars.length > 0) {
             dailyCloses = bars.map((b) => b.close);
             setSharedDailyCloses(sym, dailyCloses);
@@ -18573,10 +18578,10 @@ export class SignalEngine {
         // prime the cache so the next pass is warm.
         let dailyCloses = getSharedDailyCloses(sym) ?? [];
         if (dailyCloses.length === 0) {
-          let bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
-          if (bars.length === 0) {
-            bars = await fetchTradierDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
-          }
+          // TRA-5092 — the Yahoo → Tradier cascade this comment describes now
+          // lives inside `fetchDailyCandles` itself; the explicit second leg
+          // was folded in rather than left to double-spend a history request.
+          const bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
           if (bars.length > 0) {
             dailyCloses = bars.map((b) => b.close);
             setSharedDailyCloses(sym, dailyCloses);
