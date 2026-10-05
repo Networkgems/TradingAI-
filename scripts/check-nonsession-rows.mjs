@@ -50,10 +50,24 @@
 //   2 usage
 //   3 BLIND   a control failed — publish nothing
 //
+// ── `--movement-only` — the ROUTINE grading mode (board ruling, TRA-3849 Q2,
+// 2026-10-04, recorded under the TRA-5122 delegation) ────────────────────────
+// "A detector whose RED is its expected steady state is not a detector — it is
+// a light that is always on." Under this flag the steady state (population
+// present AND matching the manifest row-for-row) exits 0 STEADY instead of
+// 1 RED, so a scheduled run pages on MOVEMENT and on BLIND, never on the
+// documented standing 83. Everything else is UNCHANGED — the census still
+// runs in full, the standing count is still PRINTED as a number (the ruling's
+// condition (a): published, not assumed), and MOVED/BLIND exit exactly as
+// above. The flag cannot swallow an alert: it is consulted only on the branch
+// that already proved zero movement against the named manifest, and the
+// selftest runs a paired arm proving a NEW row still exits 5 under it.
+//
 // Usage:
-//   node scripts/check-nonsession-rows.mjs                # live bqb1
+//   node scripts/check-nonsession-rows.mjs                  # live bqb1, RED=1
+//   node scripts/check-nonsession-rows.mjs --movement-only   # routine mode, steady=0
 //   node scripts/check-nonsession-rows.mjs --fixture=f.json
-//   node scripts/check-nonsession-rows.mjs --selftest     # paired arms + controls
+//   node scripts/check-nonsession-rows.mjs --selftest       # paired arms + controls
 
 import { readFileSync } from 'node:fs';
 
@@ -88,21 +102,29 @@ async function loadCalendar() {
     const set = new Set(readFileSync(path, 'utf-8').match(/'2\d{3}-\d{2}-\d{2}'/g) ?? []);
     return [...set].sort().join(',');
   };
+  // TRA-4478 moved the holiday table out of `scheduler.ts` into the generated
+  // bundle `data/nyse-calendar.generated.ts` (scheduler re-exports the
+  // interface). The drift compare follows the DATA, not the module that
+  // delegates to it — scheduler.ts now contains zero date literals, which this
+  // control correctly refused until it was re-pointed here.
   let hSrc, hDist;
   try {
-    hSrc = holidaysOf('packages/server/src/scheduler.ts');
-    hDist = holidaysOf('packages/server/dist/scheduler.js');
+    hSrc = holidaysOf('packages/server/src/data/nyse-calendar.generated.ts');
+    hDist = holidaysOf('packages/server/dist/data/nyse-calendar.generated.js');
   } catch (e) {
-    blind(`cannot read the scheduler calendar (${e.message}) — run \`pnpm build\` first`);
+    blind(`cannot read the exchange calendar bundle (${e.message}) — run \`pnpm build\` first`);
   }
   if (hSrc !== hDist || hSrc.length === 0) {
-    blind(`scheduler calendar drift src(${hSrc.split(',').length}) vs dist(${hDist.split(',').length}) — rebuild before grading`);
+    blind(`exchange calendar drift src(${hSrc.split(',').length}) vs dist(${hDist.split(',').length}) — rebuild before grading`);
   }
   const { isMarketDayIso } = await import('../packages/server/dist/scheduler.js');
   // Sat/Fri self-test AND a known holiday, because the weekday rule alone would
   // pass a calendar with an empty holiday table.
   if (isMarketDayIso('2026-08-15') !== false || isMarketDayIso('2026-08-14') !== true) {
     blind('isMarketDayIso failed its Sat/Fri self-test');
+  }
+  if (isMarketDayIso('2026-01-01') !== false) {
+    blind('isMarketDayIso failed its known-holiday self-test (2026-01-01 graded a session)');
   }
   console.log(`CONTROL 0  calendar src==dist (${hSrc.split(',').length} holiday literals), Sat/Fri self-test OK`);
   return isMarketDayIso;
@@ -278,6 +300,31 @@ async function selftest() {
   check('  disagreeing server axis → BLIND (3), never a published number', child.status, EXIT.BLIND);
   check('  …and it says WHY', /calendars disagree/.test(child.stderr ?? ''), true);
 
+  console.log('\nMOVEMENT-ONLY ARMS — the flag downgrades ONLY the steady state, never an alert');
+  // Run in children against a manifest that names exactly the fixture's two
+  // phantoms, so the steady/moved branches are exercised end-to-end through
+  // the real exit paths rather than through the diff helper alone.
+  const scratch = process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? '.';
+  const fixManifest = `${scratch}/tra3849-mo-manifest.json`;
+  const fixSteady = `${scratch}/tra3849-mo-steady.json`;
+  const fixGrown = `${scratch}/tra3849-mo-grown.json`;
+  writeFileSync(fixManifest, JSON.stringify({
+    capturedAtIso: '2026-10-04T00:00:00Z', liveBuild: 'selftest', rowCount: 2, denominatorRows: 5,
+    rows: [
+      { username: 'admin', mode: 'live', date: '2026-08-09' },
+      { username: 'v0nni', mode: 'sandbox', date: '2026-08-09' },
+    ],
+  }));
+  writeFileSync(fixSteady, JSON.stringify(payload));
+  writeFileSync(fixGrown, JSON.stringify({ engines: [...payload.engines, { username: 'nu', mode: 'demo', days: [{ date: '2026-08-16', eodCombined: 0, stockDaily: 0, optionsDaily: 0 }] }] }));
+  const run = (...extra) => spawnSync(process.execPath,
+    ['scripts/check-nonsession-rows.mjs', `--manifest=${fixManifest}`, ...extra], { encoding: 'utf-8' });
+  const steadyMo = run(`--fixture=${fixSteady}`, '--movement-only');
+  check('  steady state + --movement-only → 0 STEADY, not paged', steadyMo.status, EXIT.CLEAN);
+  check('  …and the standing count is still PUBLISHED as a number', /STEADY — 2 non-session rows \/ 5/.test(steadyMo.stdout ?? ''), true);
+  check('  same steady state WITHOUT the flag → 1 RED (flag moves only this exit)', run(`--fixture=${fixSteady}`).status, EXIT.RED);
+  check('  a NEW phantom + --movement-only → 5 MOVED (the flag cannot swallow an alert)', run(`--fixture=${fixGrown}`, '--movement-only').status, EXIT.MOVED);
+
   console.log(`\n${failed === 0 ? 'CONTROLS PASS' : `** ${failed} CONTROL(S) FAILED **`}`);
   process.exit(failed === 0 ? EXIT.CLEAN : EXIT.BLIND);
 }
@@ -349,10 +396,14 @@ async function main() {
     console.log('\nCLEAN — no non-session rows in the durable series.');
     process.exit(EXIT.CLEAN);
   }
-  console.log(`\nRED — ${g.rows.length} non-session rows / ${g.denominatorRows}, matching the manifest exactly.`);
+  console.log(`\n${has('movement-only') ? 'STEADY' : 'RED'} — ${g.rows.length} non-session rows / ${g.denominatorRows}, matching the manifest exactly.`);
   console.log('This is the EXPECTED STEADY STATE: the population is named, stable, and left in place');
-  console.log('pending a board ruling on retraction (TRA-3849 leg 3). Do not clear it by deleting rows.');
+  console.log('pending the TRA-3849 impact analysis. Do not clear it by deleting rows.');
   if (crossed === 'absent') console.log('NOTE: graded client-side only — the server axis is not on the live build yet.');
+  if (has('movement-only')) {
+    console.log('movement-only: standing population is documented, not paged (board ruling 2026-10-04). Exit 0.');
+    process.exit(EXIT.CLEAN);
+  }
   process.exit(EXIT.RED);
 }
 
