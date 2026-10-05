@@ -86,6 +86,8 @@ import {
 } from './option-exec-flag.js';
 import { isOptionMakerTelemetryEnabled } from './option-maker-fill-ledger.js';
 import { isExplorationAllowanceFlagOn } from './directional-exploration-allowance.js';
+import { isWheelIvEntryFilterEnabled } from './option-exec-flag.js';
+import { resolveExpectancyGateConfig } from '@trading-app/agents';
 
 export interface EnvLeverIntent {
   /** The env key the intent is about. */
@@ -233,6 +235,42 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
     resolve: (env) => (isExplorationAllowanceFlagOn(env) ? 'on' : 'off'),
     // The overlay IS this lever's home — see `overlayBacked` on EnvLeverIntent.
     // Without it this row would publish `off` on a box where the flag is armed.
+    overlayBacked: true,
+  },
+  {
+    // TRA-5172 — the IVR>=50 floor is a HARD FAIL ON UNKNOWN in this consumer
+    // (`options-ideas-expectancy-gate.ts`: `ivRank == null || ivRank < minIvRank`
+    // ⇒ drop, checks 4-6 never run), unlike the scanner where it is fail-open
+    // (TRA-2045). Registering the precondition here makes it machine-readable on
+    // the no-auth /api/health/durability surface instead of living in a comment
+    // — the TRA-2206 warning was prose, and prose did not stop it.
+    key: 'ENABLE_OPTIONS_IDEA_EXPECTANCY_GATE',
+    intended: 'off',
+    provenance:
+      'code default, off. TRA-5170 (QuantTrader ruling, 2026-10-05): MUST NOT be armed while ' +
+      '/api/health/short-premium reports ivRankMeasured: 0. The IVR>=50 floor is a hard fail on ' +
+      'unknown in this consumer, so arming it on the current store (depth 2 of 20 on 82/82 scans) ' +
+      'suppresses 100% of credit structures and attributes it to a missing data field — a drop ' +
+      'rate that reads exactly like "the gate is working" while measuring nothing. Precondition: ' +
+      'ivRankMeasured >= 0.80 * scanCount sustained across a deploy (TRA-5173).',
+    resolve: (env) => (resolveExpectancyGateConfig(env) != null ? 'on' : 'off'),
+  },
+  {
+    // TRA-5172 — same ruling, second fail-closed consumer: `wheel-router.ts`
+    // `passesRoutingGate` never routes a null/sub-floor rank. Overlay-backed:
+    // this flag's home is the demo-flags.json allowlist (a daemon-free board
+    // arm), not the service env list — see `overlayBacked` on EnvLeverIntent.
+    key: 'ENABLE_WHEEL_IV_ENTRY_FILTER',
+    intended: 'off',
+    provenance:
+      'code default, off (observe-only ledger accrues either way, TRA-2028). TRA-5170 ' +
+      '(QuantTrader ruling, 2026-10-05): MUST NOT be armed while /api/health/short-premium ' +
+      'reports ivRankMeasured: 0 — wheel-router passesRoutingGate is a hard fail on an unknown ' +
+      'ivRank, so arming the filter on the current store (depth 2 of 20 on 82/82 scans) stands ' +
+      'down 100% of wheel routing while /api/health/wheel-promotion-gate keeps reading like a ' +
+      'working gate (ivEntries.total: 0). Precondition: ivRankMeasured >= 0.80 * scanCount ' +
+      'sustained across a deploy (TRA-5173).',
+    resolve: (env) => (isWheelIvEntryFilterEnabled(env) ? 'on' : 'off'),
     overlayBacked: true,
   },
   {
