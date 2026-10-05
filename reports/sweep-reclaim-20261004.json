@@ -1,0 +1,203 @@
+{
+  "ranAt": "2026-10-05T00:29:20.406Z",
+  "prereg": {
+    "minTrades": 100,
+    "ciAlpha": 0.025,
+    "placeboPercentile": 0.95
+  },
+  "bracket": {
+    "maxHoldBars": 20,
+    "costBpsPerSide": 5
+  },
+  "reports": [
+    {
+      "name": "V1_no_trend_filter",
+      "options": {
+        "trendFilter": "none"
+      },
+      "signals": 293,
+      "bySide": {
+        "long": {
+          "n": 127,
+          "meanR": -0.09860140074935121,
+          "medianR": -1.0245508128664929,
+          "sdR": 1.9664920265866168,
+          "winRate": 0.33070866141732286,
+          "profitFactor": 0.8684060433947481,
+          "totalR": -12.522377895167605
+        },
+        "short": {
+          "n": 100,
+          "meanR": -0.34372987275319716,
+          "medianR": -1.0331325039066643,
+          "sdR": 1.9214027510364535,
+          "winRate": 0.32,
+          "profitFactor": 0.6200007699487203,
+          "totalR": -34.372987275319716
+        }
+      },
+      "all": {
+        "n": 227,
+        "meanR": -0.20658751176426127,
+        "medianR": -1.0290534027205214,
+        "sdR": 1.9462947172850906,
+        "winRate": 0.32599118942731276,
+        "profitFactor": 0.7473509219648024,
+        "totalR": -46.89536517048731
+      },
+      "grossMeanR": -0.10977194331462191,
+      "ci": {
+        "lower": -0.48113174386666124,
+        "upper": 0.09669846720403356,
+        "clusters": 164
+      },
+      "halves": {
+        "first": {
+          "n": 113,
+          "meanR": -0.10914482213716177,
+          "medianR": -1.0293600839341572,
+          "sdR": 1.8733598773007578,
+          "winRate": 0.336283185840708,
+          "profitFactor": 0.860425688835588,
+          "totalR": -12.33336490149928
+        },
+        "second": {
+          "n": 114,
+          "meanR": -0.3031754409560355,
+          "medianR": -1.0267333820553393,
+          "sdR": 2.0196037924390207,
+          "winRate": 0.3157894736842105,
+          "profitFactor": 0.6446084478178413,
+          "totalR": -34.562000268988044
+        },
+        "splitTs": 1765929600000
+      },
+      "placebo": {
+        "draws": 500,
+        "mean": -0.09271659296508829,
+        "p95": 0.17867311222878904,
+        "percentileOfReal": 0.21
+      },
+      "forward5": {
+        "n": 210,
+        "meanBp": -12.748563675410107,
+        "t": -0.29714041752930154
+      },
+      "skips": {
+        "position_open": 57,
+        "gap_through_stop": 4,
+        "gap_through_target": 4,
+        "no_next_bar": 1
+      },
+      "exitReasons": {
+        "time": 8,
+        "stop": 116,
+        "target": 51,
+        "stop_gap": 34,
+        "target_gap": 14,
+        "end_of_data": 4
+      },
+      "verdict": "FAIL",
+      "failedCriteria": [
+        "CI lower -0.481 <= 0",
+        "placebo percentile 0.210 < 0.95",
+        "not positive in both halves"
+      ]
+    },
+    {
+      "name": "V2_sma200_trend_filter",
+      "options": {
+        "trendFilter": "sma200"
+      },
+      "signals": 87,
+      "bySide": {
+        "long": {
+          "n": 48,
+          "meanR": -0.037962744267999726,
+          "medianR": -1.0273011259747267,
+          "sdR": 2.580314070470672,
+          "winRate": 0.2916666666666667,
+          "profitFactor": 0.9522991043771954,
+          "totalR": -1.8222117248639869
+        },
+        "short": {
+          "n": 21,
+          "meanR": -0.6753823261991642,
+          "medianR": -1.0260509580156285,
+          "sdR": 1.7361806096935866,
+          "winRate": 0.2857142857142857,
+          "profitFactor": 0.3807071282074199,
+          "totalR": -14.183028850182447
+        }
+      },
+      "all": {
+        "n": 69,
+        "meanR": -0.2319600083340062,
+        "medianR": -1.0260509580156285,
+        "sdR": 2.3612963869391344,
+        "winRate": 0.2898550724637681,
+        "profitFactor": 0.7380602670301091,
+        "totalR": -16.00524057504643
+      },
+      "grossMeanR": -0.16976395737315256,
+      "ci": {
+        "lower": -0.7863132545020063,
+        "upper": 0.45368864210521065,
+        "clusters": 52
+      },
+      "halves": {
+        "first": {
+          "n": 33,
+          "meanR": -0.40564729952315864,
+          "medianR": -1.029950123566557,
+          "sdR": 2.0126110450991668,
+          "winRate": 0.24242424242424243,
+          "profitFactor": 0.5774621156942014,
+          "totalR": -13.386360884264235
+        },
+        "second": {
+          "n": 36,
+          "meanR": -0.07274665807728344,
+          "medianR": -1.0253515431992624,
+          "sdR": 2.659869059501875,
+          "winRate": 0.3333333333333333,
+          "profitFactor": 0.910988782196245,
+          "totalR": -2.6188796907822036
+        },
+        "splitTs": 1773014400000
+      },
+      "placebo": {
+        "draws": 500,
+        "mean": -0.06881109221747365,
+        "p95": 0.3063883767668606,
+        "percentileOfReal": 0.222
+      },
+      "forward5": {
+        "n": 66,
+        "meanBp": 0.16195837339132577,
+        "t": 0.0024898357986680346
+      },
+      "skips": {
+        "position_open": 15,
+        "gap_through_stop": 2,
+        "gap_through_target": 1,
+        "no_next_bar": 0
+      },
+      "exitReasons": {
+        "stop": 35,
+        "stop_gap": 13,
+        "target": 14,
+        "target_gap": 4,
+        "time": 2,
+        "end_of_data": 1
+      },
+      "verdict": "UNDERPOWERED",
+      "failedCriteria": [
+        "n 69 < 100",
+        "CI lower -0.786 <= 0",
+        "placebo percentile 0.222 < 0.95",
+        "not positive in both halves"
+      ]
+    }
+  ]
+}

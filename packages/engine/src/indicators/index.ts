@@ -38,6 +38,8 @@ export type { SupertrendBar, SupertrendDirection, SupertrendOptions } from './su
 export { donchian } from './donchian.js';
 export type { DonchianChannel } from './donchian.js';
 export { findSwings, supportResistance, reversalChecklist } from './support-resistance.js';
+export { detectSweepReclaim, detectSweepReclaimSeries, SWEEP_RECLAIM_DEFAULTS } from './sweep-reclaim.js';
+export type { SweepReclaimOptions, SweepReclaimSignal, SweepZone } from './sweep-reclaim.js';
 export type {
   SwingPoint,
   SrZone,

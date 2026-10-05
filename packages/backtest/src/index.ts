@@ -332,3 +332,24 @@ export {
   WHEEL_FULL_UNIVERSE,
   WHEEL_QUALITY_UNIVERSE,
 } from './wheel-recovery.js';
+// Sweep-and-reclaim swing study (docs/sweep-reclaim-study.md).
+export {
+  simulateBracket,
+  simulateIntents,
+  intentFromSignal,
+  rStats,
+  clusteredBootstrapMeanCI,
+  placeboMeanRs,
+  forwardReturnT,
+  runVariant,
+  BRACKET_DEFAULTS,
+} from './sweep-reclaim-backtest.js';
+export type {
+  BracketConfig,
+  BracketIntent,
+  Trade,
+  SkipCounts,
+  RStats,
+  VariantReport,
+  PreRegistration,
+} from './sweep-reclaim-backtest.js';

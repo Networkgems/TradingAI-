@@ -253,6 +253,8 @@ export type { MacdResult, BollingerState, VwapState, AnchoredVwapState, AvwapRec
 // TRA-920 — swing-based S/R zones + reversal-confluence checklist (TRA-921 wires
 // these into the OBSERVE-ONLY reversal shadow ledger).
 export { findSwings, supportResistance, reversalChecklist } from './indicators/index.js';
+export { detectSweepReclaim, detectSweepReclaimSeries, SWEEP_RECLAIM_DEFAULTS } from './indicators/index.js';
+export type { SweepReclaimOptions, SweepReclaimSignal, SweepZone } from './indicators/index.js';
 // NOTE: SwingOptions / ReversalOptions are already exported above from the
 // archived strategies, so they are intentionally NOT re-exported here.
 export type { SwingPoint, SrZone, SrLevels, ReversalChecklist } from './indicators/index.js';
