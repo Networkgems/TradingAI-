@@ -345,7 +345,7 @@ describe('TRA-4906 — slot-budget drops are DURABLE and per-slot (AC1/AC2)', ()
   });
 
   it('a v2 budgetdrop row is NOT retconned into a thinned one on hydrate', () => {
-    // The whole v2 corpus (2026-09-19..10-02) carries neither field. Reading the
+    // The whole v2 corpus (2026-09-19..2026-10-01) carries neither field. Reading the
     // absence as "banked: unknown" and guessing would make those days look like
     // they thinned — they did not, and that difference is the TRA-4954 finding.
     const v2 = {
