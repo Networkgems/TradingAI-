@@ -1784,3 +1784,266 @@ export function summarizeRealFillShadow(
     },
   };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-5186 — taker-cross basis-error canary (demo shadow, CTO sign-off on
+// TRA-5184). Observe-only; no order-routing change, no flag arms, $0 notional.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Question: per OTM candidate reaching the decision point, how large is the
+// ENTRY-basis error — the booked pre-trade NBBO mid versus the price an
+// IMMEDIATE taker cross would have paid — in dollars per contract?
+//
+// The cross is a pure quote-stamp computation: a buy crosses at the decision
+// ask, a sell at the decision bid, so the error against the booked mid is the
+// HALF-SPREAD at the decision instant, both sides. Per CTO amendment 1 it is
+// MEASURED off each row's own quote stamp, never assumed equal to the gate's
+// modeled `makerAdjustedSpreadCrossR` — and measured-vs-modeled ships beside
+// the dollars so that assumption is graded rather than trusted.
+//
+// ⚠️ WHY THIS FOLD MAY POOL `admitted` AND `refused` when every other fold in
+// this module is forbidden to (TRA-4897): the pooling prohibition protects a
+// REALISED number from being blended with a COUNTERFACTUAL one. The taker-cross
+// basis error involves no fill model, no outcome, and no P&L — it is decision-
+// time quote GEOMETRY, identical in kind on both partitions, and CTO amendment
+// 2 on TRA-5186 explicitly defines the population as the union (every candidate
+// reaching the decision point, admit or reject), because OTM has 0 admits and a
+// carve-out-only read could end with `row_cap`. The per-partition counts still
+// ship on every structure row so the mix is readable.
+
+export const TAKER_CROSS_BASIS_SCHEMA = 'taker_cross_basis_v1' as const;
+
+/**
+ * The pre-registered read (TRA-5186 amendment 4), shipped on the payload so a
+ * consumer cannot turn this canary into a viability/promotion gate by accident.
+ */
+export const TAKER_CROSS_PREREGISTERED_READ =
+  'PRE-REGISTERED READ (TRA-5186): report the $/contract number and n. Do NOT state a pass/fail '
+  + 'on profitability — this is an instrumentation canary, not a viability or promotion gate. '
+  + 'Expected base case ~ $7.70/contract; a result far outside 0.5x-2x of that is a finding about '
+  + 'the MODEL, not a failure. Directional is out of scope until a measured breakeven replaces '
+  + 'the carried prior 0.308. Standing caveat: routing is second-order; the selector is the '
+  + 'binding constraint.';
+
+/**
+ * Per-row immediate-taker-cross basis error, in DOLLARS PER CONTRACT (×100
+ * shares), off the row's own decision-time quote stamp.
+ *
+ * `null` = the stamp cannot price a cross (no two-sided spread recorded) — the
+ * row is EXCLUDED and must be COUNTED by the caller, never imputed.
+ *
+ * Side-independent on purpose: a buy crosses at `mid + spread/2`, a sell at
+ * `mid − spread/2`, and the signed cost against the booked mid is `spread/2`
+ * both ways — the same normalisation `basisDeltaUsd` already uses.
+ */
+export function takerCrossBasisErrorUsdPerContract(row: RealFillShadowRow): number | null {
+  const spread = row.taxonomy?.spreadUsd;
+  if (typeof spread !== 'number' || !Number.isFinite(spread) || spread < 0) return null;
+  if (!Number.isFinite(row.midBasisUsd) || !(row.midBasisUsd > 0)) return null;
+  return (spread / 2) * 100;
+}
+
+/**
+ * Nearest-rank percentile over a NON-EMPTY ascending-sorted array: the smallest
+ * element with at least `q` of the mass at or below it. No interpolation — the
+ * published number is a value that actually occurred, so it is reproducible
+ * from the ledger by hand.
+ */
+function nearestRank(sortedAsc: readonly number[], q: number): number {
+  const rank = Math.max(1, Math.ceil(q * sortedAsc.length));
+  return sortedAsc[Math.min(rank, sortedAsc.length) - 1];
+}
+
+export interface TakerCrossStructureStats {
+  structure: string;
+  /** Decision rows with a usable quote stamp. Every stat below is over THIS. */
+  n: number;
+  /** Partition mix of `n` — published so the union fold stays readable. */
+  nAdmitted: number;
+  nRefused: number;
+  /** $-per-contract immediate-cross basis error (half-spread × 100). */
+  meanBasisErrorUsdPerContract: number | null;
+  medianBasisErrorUsdPerContract: number | null;
+  p90BasisErrorUsdPerContract: number | null;
+  /**
+   * Ledger decision rows here whose stamp could not price a cross — EXCLUDED
+   * from `n`, counted, never imputed. ⚠️ A LOWER BOUND on the decision-point
+   * unusable share: a candidate whose quote was one-sided/crossed at the
+   * decision instant never entered the ledger at all (`beginRestingOrder`
+   * returns `null`). The true decision-point counter is
+   * `decisionPointUnusableSinceBoot`, which the engine stamps at the drop site.
+   */
+  rowsUnusableQuote: number;
+  /** `rowsUnusableQuote / (n + rowsUnusableQuote)`, or `null` at zero denominator. */
+  shareUnusableQuote: number | null;
+  /**
+   * Measured-vs-modeled (TRA-5186 amendment 1), in the cost gate's own stop-R
+   * unit (R = 0.25·mid ⇒ entry half-spread in R = 2·spreadPct).
+   *
+   * `measuredMeanEntryCrossR` is the mean MEASURED one-way cross; the modeled
+   * twin is HALF the gate's round-trip `makerAdjustedSpreadCrossR` input. The
+   * ratio grades the 0.235R assumption against this population's own stamps.
+   */
+  measuredMeanEntryCrossR: number | null;
+  modeledEntryCrossR: number;
+  measuredOverModeledRatio: number | null;
+}
+
+export interface TakerCrossUnusableSinceBoot {
+  structure: string;
+  admitted: number;
+  refused: number;
+  total: number;
+}
+
+export interface TakerCrossBasisSummary {
+  schema: typeof TAKER_CROSS_BASIS_SCHEMA;
+  generatedAt: number;
+  preRegisteredRead: typeof TAKER_CROSS_PREREGISTERED_READ;
+  /** Decision-point (entry-side) ledger rows considered, across all structures. */
+  entryRows: number;
+  /** Close-side rows excluded: an exit is not an entry decision and its quote stamp is the EXIT book. */
+  closeRowsExcluded: number;
+  /** The gate's modeled ROUND-TRIP cross input this summary was graded against. */
+  modeledRoundTripCrossR: number;
+  byStructure: TakerCrossStructureStats[];
+  /**
+   * Candidates whose decision quote was unusable AT THE DECISION POINT and so
+   * never produced a ledger row. ⚠️ SINCE BOOT, beside a DURABLE ledger — the
+   * same window caveat as `byAdmission.*.sampling`; do not divide across.
+   */
+  decisionPointUnusableSinceBoot: {
+    samplingWindow: 'since_boot';
+    bootedAt: number;
+    byStructure: TakerCrossUnusableSinceBoot[];
+  };
+}
+
+export const TAKER_CROSS_COUNTER_BOOTED_AT = Date.now();
+
+const takerCrossUnusable = new Map<string, Record<RealFillAdmission, number>>();
+
+/**
+ * Count one decision-point candidate whose quote stamp could not price a cross
+ * (missing / one-sided / crossed book). Called by the engine at the exact drop
+ * sites where such a candidate leaves the denominator, so "excluded" is always
+ * also "counted" (TRA-5186 acceptance). Never imputes anything.
+ */
+export function recordTakerCrossUnusableQuote(
+  structure: string,
+  admission: RealFillAdmission,
+): void {
+  const cur = takerCrossUnusable.get(structure) ?? { admitted: 0, refused: 0 };
+  cur[admission] += 1;
+  takerCrossUnusable.set(structure, cur);
+}
+
+/** Test seam — reset the since-boot unusable-quote counters. */
+export function resetTakerCrossUnusableForTests(): void {
+  takerCrossUnusable.clear();
+}
+
+function takerCrossUnusableRows(): TakerCrossUnusableSinceBoot[] {
+  return [...takerCrossUnusable.entries()]
+    .map(([structure, c]) => ({
+      structure,
+      admitted: c.admitted,
+      refused: c.refused,
+      total: c.admitted + c.refused,
+    }))
+    .sort((a, b) => a.structure.localeCompare(b.structure));
+}
+
+/**
+ * Fold the ledger into the TRA-5186 taker-cross basis-error canary.
+ *
+ * Population: DECISION rows only — a row with no `exitType` stamped (open-side
+ * admitted rows and refused candidates alike; close rows carry a non-null
+ * `exitType` and are excluded AND counted). Per CTO amendment 2 this is every
+ * OTM candidate that reached the decision point, not carve-out admits.
+ */
+export function summarizeTakerCrossBasis(
+  rows: readonly RealFillShadowRow[],
+  opts: { modeledRoundTripCrossR?: number; generatedAt?: number } = {},
+): TakerCrossBasisSummary {
+  const modeledRoundTrip = opts.modeledRoundTripCrossR ?? 0.235;
+  const modeledEntryCrossR = modeledRoundTrip / 2;
+
+  const entryRows: RealFillShadowRow[] = [];
+  let closeRowsExcluded = 0;
+  for (const r of rows) {
+    // `exitType` is `null` on open-side rows and on refused candidates, and a
+    // pre-TRA-4893 row (no provenance) is open-side by construction.
+    if (r.taxonomy?.exitType == null) entryRows.push(r);
+    else closeRowsExcluded += 1;
+  }
+
+  const byStructure = new Map<string, RealFillShadowRow[]>();
+  for (const r of entryRows) {
+    const list = byStructure.get(r.structure);
+    if (list) list.push(r);
+    else byStructure.set(r.structure, [r]);
+  }
+
+  const stats: TakerCrossStructureStats[] = [...byStructure.entries()]
+    .map(([structure, list]) => {
+      const errors: number[] = [];
+      let nAdmitted = 0;
+      let nRefused = 0;
+      let unusable = 0;
+      const crossRs: number[] = [];
+      for (const r of list) {
+        const err = takerCrossBasisErrorUsdPerContract(r);
+        if (err === null) {
+          unusable += 1; // excluded, counted, never imputed
+          continue;
+        }
+        errors.push(err);
+        if (admissionOf(r) === 'refused') nRefused += 1;
+        else nAdmitted += 1;
+        // Entry one-way cross in stop-R units: (spread/2) / (0.25·mid) = 2·spreadPct.
+        const spreadPct = r.taxonomy.spreadPct;
+        if (typeof spreadPct === 'number' && Number.isFinite(spreadPct) && spreadPct >= 0) {
+          crossRs.push(2 * spreadPct);
+        }
+      }
+      errors.sort((a, b) => a - b);
+      const n = errors.length;
+      const mean = n === 0 ? null : errors.reduce((a, b) => a + b, 0) / n;
+      const measuredMeanEntryCrossR =
+        crossRs.length === 0 ? null : crossRs.reduce((a, b) => a + b, 0) / crossRs.length;
+      return {
+        structure,
+        n,
+        nAdmitted,
+        nRefused,
+        meanBasisErrorUsdPerContract: mean,
+        medianBasisErrorUsdPerContract: n === 0 ? null : nearestRank(errors, 0.5),
+        p90BasisErrorUsdPerContract: n === 0 ? null : nearestRank(errors, 0.9),
+        rowsUnusableQuote: unusable,
+        shareUnusableQuote: n + unusable === 0 ? null : unusable / (n + unusable),
+        measuredMeanEntryCrossR,
+        modeledEntryCrossR,
+        measuredOverModeledRatio:
+          measuredMeanEntryCrossR === null || !(modeledEntryCrossR > 0)
+            ? null
+            : measuredMeanEntryCrossR / modeledEntryCrossR,
+      };
+    })
+    .sort((a, b) => a.structure.localeCompare(b.structure));
+
+  return {
+    schema: TAKER_CROSS_BASIS_SCHEMA,
+    generatedAt: opts.generatedAt ?? Date.now(),
+    preRegisteredRead: TAKER_CROSS_PREREGISTERED_READ,
+    entryRows: entryRows.length,
+    closeRowsExcluded,
+    modeledRoundTripCrossR: modeledRoundTrip,
+    byStructure: stats,
+    decisionPointUnusableSinceBoot: {
+      samplingWindow: 'since_boot',
+      bootedAt: TAKER_CROSS_COUNTER_BOOTED_AT,
+      byStructure: takerCrossUnusableRows(),
+    },
+  };
+}

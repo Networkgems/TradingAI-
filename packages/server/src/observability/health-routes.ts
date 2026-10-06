@@ -437,6 +437,7 @@ import {
 import {
   listRealFillShadowRows,
   summarizeRealFillShadow,
+  summarizeTakerCrossBasis,
   isOptionRealFillShadowEnabled,
   OPTION_REAL_FILL_SHADOW_FLAG,
 } from '../option-real-fill-shadow.js';
@@ -10146,8 +10147,24 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         + '`totalBasisDeltaUsd` on that partition is dollars-per-one-contract; read the size-free '
         + '`meanBasisDeltaPctOfMid` instead. '
         + '⛔ Refused rows are INADMISSIBLE to the TRA-4887 / TRA-4894 promotion gate: no exit and no P&L '
-        + 'means no realised-R numerator can exist. That gate must reject them and count the rejections.',
+        + 'means no realised-R numerator can exist. That gate must reject them and count the rejections. '
+        + 'TRA-5186 — `takerCrossBasis` is the taker-cross basis-error canary: per DECISION row (admit or '
+        + 'reject; close rows excluded), the $-per-contract error between the booked pre-trade NBBO mid and '
+        + 'an IMMEDIATE taker cross off the row\'s own quote stamp (= half-spread × 100). It is the ONE fold '
+        + 'allowed to pool the two admission partitions, because it is decision-time quote geometry with no '
+        + 'fill model and no P&L on either side — the partition mix still ships per structure. '
+        + '`measuredMeanEntryCrossR` vs `modeledEntryCrossR` grades the gate\'s `makerAdjustedSpreadCrossR` '
+        + 'input against measured stamps rather than assuming it. READ `preRegisteredRead` BEFORE QUOTING: '
+        + 'no pass/fail on profitability may be stated off this surface.',
       summary,
+      // TRA-5186 — graded against the SAME env-resolved cost-gate config the
+      // live admission bar uses (bqb1 overrides via env), not the shipped
+      // default, so measured-vs-modeled grades the number actually governing.
+      takerCrossBasis: summarizeTakerCrossBasis(rows, {
+        modeledRoundTripCrossR:
+          resolveCostGateConfig(process.env).optionsCost.makerAdjustedSpreadCrossR,
+        generatedAt: now(),
+      }),
     });
   });
 

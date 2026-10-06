@@ -634,6 +634,7 @@ import {
   isOptionRealFillShadowEnabled,
   DEFAULT_REAL_FILL_CONFIG,
   realFillSampler,
+  recordTakerCrossUnusableQuote,
   type RestingOrderState,
   type EntryType as RealFillEntryType,
   type RealFillTaxonomy,
@@ -10617,7 +10618,14 @@ export class SignalEngine {
       const { symbol, expiration, bid, ask } = quote;
       const { optionSymbol, contracts } = opened;
       if (!symbol || !expiration || !optionSymbol) return;
-      if (typeof bid !== 'number' || typeof ask !== 'number') return;
+      // TRA-5186 — an unusable decision quote is EXCLUDED and COUNTED, never
+      // silent: these drops are exactly the "share of rows with an unusable
+      // quote" the taker-cross canary must publish, and the ledger cannot see
+      // them (no row is ever written).
+      if (typeof bid !== 'number' || typeof ask !== 'number') {
+        recordTakerCrossUnusableQuote(structure, 'admitted');
+        return;
+      }
       if (typeof contracts !== 'number' || !(contracts > 0)) return;
 
       const state = beginRestingOrder(
@@ -10626,8 +10634,12 @@ export class SignalEngine {
         DEFAULT_REAL_FILL_CONFIG,
       );
       // `null` = one-sided / crossed book. Such opens DROP OUT of the
-      // denominator rather than being booked at a flattering zero cost.
-      if (!state) return;
+      // denominator rather than being booked at a flattering zero cost — and
+      // are counted at the drop site (TRA-5186).
+      if (!state) {
+        recordTakerCrossUnusableQuote(structure, 'admitted');
+        return;
+      }
       // TRA-4897 — the admitted partition has its OWN reserved slots and is
       // never dropped for a refused candidate's sake. It grows at ≤2/day; a
       // shared 200-slot buffer against 3,039 refusals/day would starve it.
@@ -10748,7 +10760,12 @@ export class SignalEngine {
       const { symbol, expiration } = signal;
       const { optionSymbol, bid, ask } = candidate;
       if (!symbol || !expiration || !optionSymbol) return;
-      if (typeof bid !== 'number' || typeof ask !== 'number') return;
+      // TRA-5186 — counted at the drop site, same as the admitted side: the
+      // unusable-quote share must have a denominator the ledger cannot carry.
+      if (typeof bid !== 'number' || typeof ask !== 'number') {
+        recordTakerCrossUnusableQuote(structure, 'refused');
+        return;
+      }
 
       // ⛔ Read BEFORE any further work: it is a one-slot channel cleared on
       // every `costAwareGateReject` entry, and this call site is the next
@@ -10761,8 +10778,12 @@ export class SignalEngine {
         DEFAULT_REAL_FILL_CONFIG,
       );
       // One-sided / crossed book — same drop-out as the open side. A basis
-      // comparison against a mid that does not exist is meaningless.
-      if (!state) return;
+      // comparison against a mid that does not exist is meaningless. Counted
+      // at the drop site (TRA-5186).
+      if (!state) {
+        recordTakerCrossUnusableQuote(structure, 'refused');
+        return;
+      }
 
       // ⛔ The sampler, NOT a length check. See `RefusedCandidateSampler`: at
       // ~3,039 refusals/day an arrival-order buffer would silently make this
