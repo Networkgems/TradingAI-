@@ -527,10 +527,21 @@ export interface LiveHealthDeps {
    * consults, or the check would report an operator's daemon-free flag flip as
    * drift. Resolved per-call so a file flip is picked up on the next probe.
    * Optional: falls back to raw `process.env`, which is correct off Render where
-   * no overlay is in play. Values are read for comparison ONLY and never
-   * emitted — see the route's redaction note.
+   * no overlay is in play. Value emission follows the TRA-5222 AC4 rules — see
+   * the route's redaction note.
    */
   effectiveEnv?: () => NodeJS.ProcessEnv;
+  /**
+   * TRA-5222 AC1 — the raw allowlisted contents of `<DATA_DIR>/demo-flags.json`
+   * (`loadDemoFlagFile`), i.e. the OVERLAY LAYER itself, distinct from the
+   * already-merged `effectiveEnv` view above. env-drift needs both: the merged
+   * view says what the engine resolves, the overlay map says WHICH layer said
+   * so — without it an operator's documented daemon-free flip and an
+   * unauthorized store flip are indistinguishable, which is the wolf-crier
+   * failure TRA-5222 closes. Resolved per-call so a file flip is picked up on
+   * the next probe. Optional: absent ⇒ no overlay layer is modeled.
+   */
+  demoFlagOverlay?: () => Readonly<Record<string, string>>;
   /**
    * TRA-901 — the shared secret that grants the unattended TRA-898 daily-watch
    * routine access to the auth-gated `/api/health/demo-book` surface without a
@@ -10979,10 +10990,13 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   //
   // No-auth by design and by necessity: bqb1's admin auth is dead (401), so a
   // gated drift check would be exactly as unreachable as the wipe it is meant to
-  // catch. Safe to expose because the payload is KEY NAMES AND STATE LABELS ONLY
-  // — `EnvDriftEntry` has no field that can carry a value, so no amount of drift
-  // can leak one (these keys share a store with TRADIER_API_TOKEN / AUTH_SECRET;
-  // TRA-2163).
+  // catch. Safe to expose because values are emitted ONLY for keys render.yaml
+  // declares as a LITERAL `value:` — already public in the committed blueprint —
+  // while dashboard-managed/Render-managed keys (where every secret lives;
+  // TRADIER_API_TOKEN / AUTH_SECRET; TRA-2163) are never compared and never
+  // reach a bucket, plus a name-pattern redaction backstop (TRA-5222 AC4,
+  // revising the original no-values-ever rule because `set` vs `set` hid a 10x
+  // budget divergence).
   //
   // `ok:false` covers BOTH a real divergence AND a broken parse; read `parserOk`
   // to tell them apart. `declaredKeysParsed`/`declaredValuesParsed` are INPUT-side
@@ -10995,6 +11009,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // overlay on top, so an operator's daemon-free flip reads as the running
       // state rather than as phantom drift. Falls back to raw process.env.
       runningEnv: deps.effectiveEnv?.() ?? process.env,
+      // TRA-5222 AC1 — the overlay layer itself, so an operator's documented
+      // demo-flags.json flip reads as `overlayManaged[]` rather than burning
+      // `driftCount` on an authorized, dated runbook action.
+      overlay: deps.demoFlagOverlay?.() ?? {},
       seededKeys: getSeededEnvKeys(),
       now,
     });

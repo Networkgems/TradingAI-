@@ -150,8 +150,28 @@ be non-zero:
 | `parserOk` | `false` ⇒ the check is broken and the drift lists mean nothing. |
 | `declaredKeysParsed` | Every `- key:` found. `0` ⇒ blueprint not found/parsed. |
 | `declaredValuesParsed` | Keys with a literal `value:`. **`0` ⇒ the CRLF-class bug.** |
-| `driftCount` | `declaredOnButOff` + `declaredOffButOn` + `valueMismatch`. |
+| `driftCount` | `declaredOnButOff` + `declaredOffButOn` + `valueMismatch` + `selfHealedMismatchCount`. **Unexplained divergence only** (TRA-5222). |
+| `overlayManaged` | **Not drift** — the `demo-flags.json` overlay supplies these (see below). |
 | `selfHealed` | **Not drift** — a code fallback supplies these (see below). |
+
+Every divergence entry carries `source` (TRA-5222 AC1): which layer the running
+value resolves from — `overlay` (`<DATA_DIR>/demo-flags.json`), `boot_seed`
+(the self-heal maps), `render_store` (present in the process env), or
+`blueprint` (absent from every runtime layer; the declaration is the key's only
+voice).
+
+`overlayManaged` (TRA-5222) lists compared keys the **demo-flags.json overlay**
+currently governs. The overlay is a legitimate, documented, runtime-writable
+layer (TRA-1008/TRA-1481 — the daemon-free operator flip; the TRA-5207 pre-bell
+runbook depends on it), so a divergence it explains is a **dated operator
+action, not an unauthorized flip**, and does not count into `driftCount`. Before
+TRA-5222 those divergences burned the alarm: the route rested at `ok: false`
+with 5 benign drifts, so the next *unauthorized* live-flag flip would have
+arrived as `driftCount: 6` on a surface everyone had learned to ignore. A
+running value that contradicts **both** the blueprint **and** the overlay still
+lands in the drift buckets. `agreesWithDeclared: false` on an entry means the
+overlay is overriding the declared steady state — expected while a dated
+runbook action is in force, worth a look if it persists.
 
 `sync: false` keys are skipped (dashboard-managed, legitimately absent from the
 blueprint), as are `generateValue`/`fromService` keys.
@@ -172,10 +192,16 @@ looking healthy. `declared: false` on such an entry means the flag is armed on
 every Render boot with **no render.yaml record backing it**, which violates the
 maps' own stated admission criterion; treat it as a finding.
 
-**No values, ever.** The payload is key names and state labels
-(`on`/`off`/`set`/`absent`) only. These keys share a store with
-`TRADIER_API_TOKEN` / `AUTH_SECRET` and the route is unauthenticated, so
-`EnvDriftEntry` has no field capable of carrying a value (TRA-2163).
+**Values: compared literals only** (TRA-5222 AC4, revising the original
+no-values-ever rule). `declared: "set", running: "set"` was unactionable by
+construction — it hid a 10x divergence on `OPTIONS_IDEAS_MONTHLY_USD_CAP`
+behind two identical labels. `valueMismatch` and `overlayManaged` entries now
+emit `declaredValue`/`runningValue`, but **only** for keys render.yaml declares
+as a literal `value:` — values already public in the committed blueprint.
+Dashboard-managed (`sync: false`) and Render-managed keys — where every secret
+lives (`TRADIER_API_TOKEN` / `AUTH_SECRET`; TRA-2163) — are never compared and
+structurally never reach a bucket, and a literal whose *name* matches the
+secret pattern reports `valuesRedacted: true` with no values.
 
 ## Live-equity acceptance probe (TRA-580)
 

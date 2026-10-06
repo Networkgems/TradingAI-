@@ -99,16 +99,26 @@ describe('TRA-2209 render.yaml parser — CRLF', () => {
     expect(report.declaredRenderManaged).toBe(1); // AUTH_SECRET
     expect(report.parserOk).toBe(true);
 
-    // ...then the divergences themselves.
+    // ...then the divergences themselves. `source` is the TRA-5222 AC1 layer
+    // attribution: an absent key's only voice is the blueprint; a present one
+    // resolves from the store.
     expect(report.declaredOnButOff).toEqual([
-      { key: 'EXIT_RISK_RULES_ENABLED', declared: 'on', running: 'absent' },
-      { key: 'ENABLE_REVERSAL_SHADOW', declared: 'on', running: 'off' },
+      { key: 'EXIT_RISK_RULES_ENABLED', declared: 'on', running: 'absent', source: 'blueprint' },
+      { key: 'ENABLE_REVERSAL_SHADOW', declared: 'on', running: 'off', source: 'render_store' },
     ]);
     expect(report.declaredOffButOn).toEqual([
-      { key: 'ENABLE_SOMETHING_RISKY', declared: 'off', running: 'on' },
+      { key: 'ENABLE_SOMETHING_RISKY', declared: 'off', running: 'on', source: 'render_store' },
     ]);
     expect(report.valueMismatch).toEqual([
-      { key: 'NODE_VERSION', declared: 'set', running: 'set' },
+      {
+        key: 'NODE_VERSION',
+        declared: 'set',
+        running: 'set',
+        source: 'render_store',
+        // TRA-5222 AC4 — `set` vs `set` was unactionable; both values emit.
+        declaredValue: '20.19.0',
+        runningValue: '18.0.0',
+      },
     ]);
     expect(report.driftCount).toBe(4);
     expect(report.ok).toBe(false);
@@ -247,22 +257,201 @@ describe('TRA-2209 comparison semantics', () => {
       key: 'NODE_VERSION',
       declared: 'set',
       running: 'absent',
+      source: 'blueprint',
+      declaredValue: '20.19.0',
     });
   });
 });
 
-describe('TRA-2209 the surface never leaks a value', () => {
-  it('serializes without any declared or running env value', () => {
+describe('TRA-5222 AC4 — value emission rules (revising TRA-2163 no-values-ever)', () => {
+  it('emits values ONLY on divergence entries, never for agreeing keys', () => {
     const serialized = JSON.stringify(evaluate(crlf(FIXTURE_LINES)));
-    // Every distinctive value present on either side of the comparison. These
-    // keys share a store with TRADIER_API_TOKEN / AUTH_SECRET (TRA-2163), and the
-    // route is NO-AUTH, so not one of them may appear in the payload.
-    for (const value of ['production', '/data', '20.19.0', '18.0.0']) {
+    // Agreeing keys still emit no values — nothing to act on, nothing to show.
+    for (const value of ['production', '/data']) {
       expect(serialized).not.toContain(value);
     }
-    // ...while the KEY names, which are what an operator needs, are all present.
+    // A valueMismatch now carries BOTH sides (TRA-5222 AC4): `set` vs `set`
+    // hid a 10x budget divergence (OPTIONS_IDEAS_MONTHLY_USD_CAP 5 vs 50).
+    expect(serialized).toContain('20.19.0');
+    expect(serialized).toContain('18.0.0');
     expect(serialized).toContain('EXIT_RISK_RULES_ENABLED');
     expect(serialized).toContain('NODE_VERSION');
+  });
+
+  it('never emits a dashboard-managed or render-managed value — they are never compared', () => {
+    // The secrets live in these kinds (sync:false / generateValue). Structural:
+    // only literal-declared keys reach any bucket, so no bucket can carry them.
+    const report = evaluate(crlf(FIXTURE_LINES));
+    const allKeys = [
+      ...report.declaredOnButOff,
+      ...report.declaredOffButOn,
+      ...report.valueMismatch,
+      ...report.overlayManaged,
+    ].map((e) => e.key);
+    expect(allKeys).not.toContain('TRADIER_API_TOKEN');
+    expect(allKeys).not.toContain('AUTH_SECRET');
+  });
+
+  it('redacts values for a literal whose NAME matches the secret pattern', () => {
+    // A credential declared as a blueprint literal is a mistake, but the
+    // surface must not amplify it: the entry reports the divergence with
+    // `valuesRedacted: true` and carries neither value.
+    const report = evaluateEnvDrift({
+      blueprint: crlf([
+        'services:',
+        '  - type: web',
+        '    envVars:',
+        '      - key: SOME_WEBHOOK_TOKEN',
+        '        value: declared-hook-value',
+        '',
+      ]),
+      runningEnv: { SOME_WEBHOOK_TOKEN: 'running-hook-value' },
+      seededKeys: {},
+      now: () => 1_784_000_000_000,
+    });
+    expect(report.valueMismatch).toEqual([
+      {
+        key: 'SOME_WEBHOOK_TOKEN',
+        declared: 'set',
+        running: 'set',
+        source: 'render_store',
+        valuesRedacted: true,
+      },
+    ]);
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain('declared-hook-value');
+    expect(serialized).not.toContain('running-hook-value');
+  });
+});
+
+describe('TRA-5222 AC1 — the demo-flags.json overlay is a layer, not drift', () => {
+  // The measured 2026-10-06 shape: render.yaml declares the steady state ON,
+  // the TRA-5207 pre-bell runbook wrote "0" into demo-flags.json, the engine's
+  // effective env resolves the overlay value. Before this ticket that read as
+  // declaredOnButOff and burned the alarm; an UNAUTHORIZED flip then arrives
+  // indistinguishable (`ok:false` either way — the wolf-crier).
+  const OVERLAY_LINES = [
+    'services:',
+    '  - type: web',
+    '    envVars:',
+    '      - key: OTM_DELTA_FLOOR_ENABLED',
+    '        value: "1"',
+    '      - key: ENABLE_OPTION_COST_AWARE_GATE',
+    '        value: "1"',
+    '      - key: ENABLE_SMA200_DEMO_FORWARD_TEST',
+    '        value: "1"',
+    '',
+  ];
+  const base = {
+    blueprint: crlf(OVERLAY_LINES),
+    seededKeys: {},
+    now: () => 1_784_000_000_000,
+  };
+
+  it('reports an overlay-authorized divergence as overlayManaged, driftCount 0, ok true', () => {
+    const report = evaluateEnvDrift({
+      ...base,
+      // Effective env: overlay "0" wins over the store "1" for the floor key;
+      // the cost-aware key is absent from the store entirely (boot seed skipped
+      // because the file holds it), so the overlay is its only voice.
+      runningEnv: {
+        RENDER: 'true',
+        OTM_DELTA_FLOOR_ENABLED: '0',
+        ENABLE_OPTION_COST_AWARE_GATE: '0',
+        ENABLE_SMA200_DEMO_FORWARD_TEST: '1',
+      },
+      overlay: { OTM_DELTA_FLOOR_ENABLED: '0', ENABLE_OPTION_COST_AWARE_GATE: '0' },
+    });
+    expect(report.declaredOnButOff).toEqual([]);
+    expect(report.overlayManaged).toEqual([
+      {
+        key: 'ENABLE_OPTION_COST_AWARE_GATE',
+        declared: 'on',
+        running: 'off',
+        source: 'overlay',
+        agreesWithDeclared: false,
+        declaredValue: '1',
+        runningValue: '0',
+      },
+      {
+        key: 'OTM_DELTA_FLOOR_ENABLED',
+        declared: 'on',
+        running: 'off',
+        source: 'overlay',
+        agreesWithDeclared: false,
+        declaredValue: '1',
+        runningValue: '0',
+      },
+    ]);
+    // The whole point: an authorized, dated runbook action does not burn the alarm.
+    expect(report.driftCount).toBe(0);
+    expect(report.ok).toBe(true);
+  });
+
+  it('still counts a running value that contradicts BOTH the blueprint AND the overlay', () => {
+    // The overlay authorizes EXACTLY its recorded value — it is not a blanket
+    // exemption for the key (that would re-open TRA-2224's hole one layer up).
+    const report = evaluateEnvDrift({
+      ...base,
+      runningEnv: {
+        RENDER: 'true',
+        OTM_DELTA_FLOOR_ENABLED: '1', // matches blueprint — fine
+        ENABLE_OPTION_COST_AWARE_GATE: '0', // matches overlay — fine
+        ENABLE_SMA200_DEMO_FORWARD_TEST: '0', // contradicts blueprint "1", overlay says "1" too
+      },
+      overlay: {
+        OTM_DELTA_FLOOR_ENABLED: '0', // stale overlay; running follows blueprint — overlayManaged, not drift
+        ENABLE_OPTION_COST_AWARE_GATE: '0',
+        ENABLE_SMA200_DEMO_FORWARD_TEST: '1', // running "0" contradicts this AND the blueprint
+      },
+    });
+    expect(report.declaredOnButOff).toEqual([
+      {
+        key: 'ENABLE_SMA200_DEMO_FORWARD_TEST',
+        declared: 'on',
+        running: 'off',
+        source: 'overlay',
+      },
+    ]);
+    expect(report.driftCount).toBe(1);
+    expect(report.ok).toBe(false);
+    expect(report.overlayManaged.map((e) => e.key)).toEqual([
+      'ENABLE_OPTION_COST_AWARE_GATE',
+      'OTM_DELTA_FLOOR_ENABLED',
+    ]);
+  });
+
+  it('AC5 negative-control shape: one unauthorized flip moves driftCount 0 → 1 → 0', () => {
+    // A green route that has never been shown to go red is not an alarm. This
+    // is the pure-function half of the AC5 control; the live half runs the same
+    // three reads against bqb1 (flip a non-money demo key in the store, pinned
+    // redeploy, read, restore, read).
+    const clean = {
+      RENDER: 'true',
+      OTM_DELTA_FLOOR_ENABLED: '0',
+      ENABLE_OPTION_COST_AWARE_GATE: '0',
+      ENABLE_SMA200_DEMO_FORWARD_TEST: '1',
+    };
+    const overlay = { OTM_DELTA_FLOOR_ENABLED: '0', ENABLE_OPTION_COST_AWARE_GATE: '0' };
+
+    const before = evaluateEnvDrift({ ...base, runningEnv: clean, overlay });
+    expect(before.driftCount).toBe(0);
+    expect(before.ok).toBe(true);
+
+    const flipped = evaluateEnvDrift({
+      ...base,
+      runningEnv: { ...clean, ENABLE_SMA200_DEMO_FORWARD_TEST: '0' },
+      overlay,
+    });
+    expect(flipped.driftCount).toBe(1);
+    expect(flipped.ok).toBe(false);
+    expect(flipped.declaredOnButOff.map((e) => e.key)).toEqual([
+      'ENABLE_SMA200_DEMO_FORWARD_TEST',
+    ]);
+
+    const restored = evaluateEnvDrift({ ...base, runningEnv: clean, overlay });
+    expect(restored.driftCount).toBe(0);
+    expect(restored.ok).toBe(true);
   });
 });
 

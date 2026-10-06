@@ -8,8 +8,8 @@
 // them risk controls — while `/api/health/*` stayed green across the board.
 //
 // This module is the missing comparison. It is deliberately a PURE function over
-// (render.yaml text, running env, seeded-key record) so the whole thing is
-// unit-testable without booting a server or touching Render.
+// (render.yaml text, running env, seeded-key record, demo-flags overlay) so the
+// whole thing is unit-testable without booting a server or touching Render.
 //
 // ── THE FAILURE THIS FILE MUST NOT REPRODUCE ────────────────────────────────
 // The first hand-rolled cut of this check SILENTLY REPORTED ZERO DRIFT.
@@ -42,12 +42,21 @@
 // via `selfHealedMismatchCount`. Both paths share ONE comparator
 // (`compareDeclaredToRunning`) so they cannot answer the same question two ways.
 //
-// ── NO VALUES, EVER ─────────────────────────────────────────────────────────
-// These keys live in the same store as TRADIER_API_TOKEN / AUTH_SECRET. This
-// surface is NO-AUTH. It therefore emits KEY NAMES AND STATE LABELS ONLY —
-// never a declared value, never a running value, not even for keys that look
-// boring. The `EnvDriftEntry` type has no field capable of carrying one.
-// (TRA-2163 redaction lesson, applied to the whole surface.)
+// ── VALUES: COMPARED LITERALS ONLY (TRA-5222 AC4 revised TRA-2163's blanket) ─
+// The original rule here was NO VALUES, EVER. TRA-5222 measured its cost: a
+// `valueMismatch` of `declared: "set", running: "set"` is unactionable by
+// construction (OPTIONS_IDEAS_MONTHLY_USD_CAP store=50 vs blueprint "5" hid a
+// 10x budget divergence behind two identical labels). The revised rule:
+//   - Values are emitted ONLY for keys the blueprint declares as a LITERAL
+//     `value:` — i.e. keys whose declared value is ALREADY public in the
+//     committed render.yaml of a public repo. Dashboard-managed (`sync: false`)
+//     and Render-managed keys — where every secret lives (TRADIER_API_TOKEN,
+//     AUTH_SECRET, ADMIN_PASSWORD...) — are never compared and structurally
+//     never reach a bucket, so no field exists that could carry their values.
+//   - Belt-and-braces: a literal key whose NAME matches the secret pattern
+//     (`VALUE_REDACT_RE`) gets `valuesRedacted: true` and no values, so a
+//     future operator who declares a credential as a blueprint literal (a
+//     mistake, but one this surface must not amplify) leaks nothing here.
 
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -86,14 +95,56 @@ export interface ParsedRenderEnv {
   renderManaged: number;
 }
 
-/** Declared/running state label. Carries no value — see NO VALUES, EVER above. */
+/** Declared/running state label. */
 export type EnvState = 'on' | 'off' | 'set' | 'absent';
 
-/** A single divergence. Key + state labels only; structurally cannot leak a value. */
+/**
+ * TRA-5222 AC1 — which layer supplies the key's RUNNING value, resolved in the
+ * same precedence order the engine itself resolves env:
+ *   - `overlay`      — `<DATA_DIR>/demo-flags.json` holds the key (file wins over
+ *                      env in `resolveDemoFlagEnv`, so it IS the running value).
+ *   - `boot_seed`    — the boot self-heal seeded it (`getSeededEnvKeys()`).
+ *   - `render_store` — present in the process env (on Render that env IS the
+ *                      dashboard/API env-var store; off Render, the operator env).
+ *   - `blueprint`    — absent from every runtime layer: the only voice the key
+ *                      has is its render.yaml declaration.
+ */
+export type EnvSource = 'blueprint' | 'render_store' | 'overlay' | 'boot_seed';
+
+/** A single divergence. Values appear only under the AC4 rules in the header. */
 export interface EnvDriftEntry {
   key: string;
   declared: EnvState;
   running: EnvState;
+  /** TRA-5222 AC1 — the layer the RUNNING side resolves from. */
+  source: EnvSource;
+  /** TRA-5222 AC4 — the blueprint literal, emitted on `valueMismatch` entries. */
+  declaredValue?: string;
+  /** TRA-5222 AC4 — the running value, emitted on `valueMismatch` entries. */
+  runningValue?: string;
+  /** Set when the key name matches the secret pattern; values then omitted. */
+  valuesRedacted?: true;
+}
+
+/**
+ * TRA-5222 AC1 — a compared key whose running value is supplied by the
+ * `demo-flags.json` overlay, a legitimate, documented, runtime-writable layer
+ * (TRA-1008/TRA-1481; the TRA-5207 pre-bell runbook depends on it). An
+ * overlay-sourced difference from the blueprint is NOT drift: the overlay is a
+ * dated operator action layered over a declaration that still states the
+ * intended steady state. It is surfaced here so the divergence stays VISIBLE
+ * without burning the alarm (the wolf-crier failure this ticket closes).
+ */
+export interface OverlayManagedEntry {
+  key: string;
+  declared: EnvState;
+  running: EnvState;
+  source: 'overlay';
+  /** False ⇒ the overlay currently overrides the declared steady state. */
+  agreesWithDeclared: boolean;
+  declaredValue?: string;
+  runningValue?: string;
+  valuesRedacted?: true;
 }
 
 /** A key present in the running env only because a code fallback re-seeded it. */
@@ -161,6 +212,14 @@ export interface EnvDriftReport {
   /** Non-boolean literal whose running value differs, or is absent. */
   valueMismatch: EnvDriftEntry[];
   /**
+   * TRA-5222 AC1 — compared keys the demo-flags.json overlay currently governs.
+   * NOT drift and NOT counted into `driftCount`: the overlay is a documented,
+   * runtime-writable layer, so a divergence it explains is a dated operator
+   * action, not an unauthorized flip. A running value that contradicts BOTH the
+   * blueprint AND the overlay still lands in the drift buckets above.
+   */
+  overlayManaged: OverlayManagedEntry[];
+  /**
    * NOT drift — a code fallback supplies these. Surfaced anyway because their
    * arm survives only via that fallback and NOT because the env holds it, which
    * is a standing fragility worth seeing (TRA-2198).
@@ -186,6 +245,14 @@ export interface EvaluateEnvDriftOptions {
    * every seeded key as healthy env. cf. `getSeededEnvKeys()` in demo-flags.ts.
    */
   seededKeys: Readonly<Record<string, string>>;
+  /**
+   * TRA-5222 AC1 — the allowlisted contents of `<DATA_DIR>/demo-flags.json`
+   * (`loadDemoFlagFile`), i.e. the overlay layer the engine resolves over env.
+   * Keys present here are graded against the overlay value FIRST: agreement
+   * with it (or with the blueprint) is overlay-managed, not drift. Defaults to
+   * no overlay, which is the honest state off Render-with-DATA_DIR hosts.
+   */
+  overlay?: Readonly<Record<string, string>>;
   now?: () => number;
 }
 
@@ -285,6 +352,29 @@ function compareDeclaredToRunning(declaredValue: string, rawRunning: string | un
 
   if (!runningPresent) return { agrees: false, runningState: 'absent' };
   return { agrees: unquote(rawRunning!) === declaredValue, runningState: 'set' };
+}
+
+/**
+ * TRA-5222 AC4 belt-and-braces — a compared literal whose NAME matches this gets
+ * `valuesRedacted: true` instead of values. Compared keys are blueprint literals
+ * (already public in the committed render.yaml), so this only matters if someone
+ * mistakenly declares a credential as a literal; the mistake must not leak here.
+ * Deliberately NOT matching bare `KEY`/`AUTH` — too broad for flag names.
+ */
+const VALUE_REDACT_RE = /(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|API_KEY|APIKEY)/i;
+
+/** AC4 value fields for one entry: both values, or `valuesRedacted` alone. */
+function valueFields(
+  key: string,
+  declaredValue: string,
+  rawRunning: string | undefined,
+): Pick<EnvDriftEntry, 'declaredValue' | 'runningValue' | 'valuesRedacted'> {
+  if (VALUE_REDACT_RE.test(key)) return { valuesRedacted: true };
+  const runningPresent = typeof rawRunning === 'string' && rawRunning.trim() !== '';
+  return {
+    declaredValue,
+    ...(runningPresent ? { runningValue: unquote(rawRunning!) } : {}),
+  };
 }
 
 const ENVVARS_RE = /^(\s*)envVars:\s*$/;
@@ -401,6 +491,7 @@ export function evaluateEnvDrift(opts: EvaluateEnvDriftOptions): EnvDriftReport 
       declaredOnButOff: [],
       declaredOffButOn: [],
       valueMismatch: [],
+      overlayManaged: [],
       selfHealed: [],
       blueprintFound: false,
       onRender,
@@ -413,7 +504,9 @@ export function evaluateEnvDrift(opts: EvaluateEnvDriftOptions): EnvDriftReport 
   const declaredOnButOff: EnvDriftEntry[] = [];
   const declaredOffButOn: EnvDriftEntry[] = [];
   const valueMismatch: EnvDriftEntry[] = [];
+  const overlayManaged: OverlayManagedEntry[] = [];
   const selfHealed: SelfHealedEntry[] = [];
+  const overlay = opts.overlay ?? {};
 
   const declaredKeys = new Set(parsed.declared.map((d) => d.key));
   // Literals only — a `sync: false` / Render-managed entry declares no value to
@@ -439,6 +532,12 @@ export function evaluateEnvDrift(opts: EvaluateEnvDriftOptions): EnvDriftReport 
   selfHealed.sort((a, b) => a.key.localeCompare(b.key));
   const selfHealedMismatchCount = selfHealed.filter((s) => s.matchesDeclared === false).length;
 
+  /** State label for a declared literal, mirroring the bucket naming. */
+  const declaredState = (value: string): EnvState => {
+    const b = classifyBool(value);
+    return b === true ? 'on' : b === false ? 'off' : 'set';
+  };
+
   let comparedKeys = 0;
   for (const entry of parsed.declared) {
     if (entry.kind !== 'literal' || entry.value === undefined) continue;
@@ -450,8 +549,38 @@ export function evaluateEnvDrift(opts: EvaluateEnvDriftOptions): EnvDriftReport 
 
     comparedKeys += 1;
 
-    const cmp = compareDeclaredToRunning(entry.value, opts.runningEnv[entry.key]);
+    const rawRunning = opts.runningEnv[entry.key];
+    const runningPresent = typeof rawRunning === 'string' && rawRunning.trim() !== '';
+    const cmp = compareDeclaredToRunning(entry.value, rawRunning);
+
+    // TRA-5222 AC1 — the overlay layer, graded FIRST. A key the demo-flags.json
+    // file holds is authorized at EXACTLY the overlay's recorded value: agreement
+    // with it (or with the blueprint itself) is overlay-managed, not drift. A
+    // running value that contradicts BOTH layers falls through to the drift
+    // buckets below — that is the unexplained divergence the alarm exists for,
+    // and it is what the AC5 negative control manufactures.
+    if (Object.prototype.hasOwnProperty.call(overlay, entry.key)) {
+      const overlayCmp = compareDeclaredToRunning(overlay[entry.key]!, rawRunning);
+      if (overlayCmp.agrees || cmp.agrees) {
+        overlayManaged.push({
+          key: entry.key,
+          declared: declaredState(entry.value),
+          running: cmp.runningState,
+          source: 'overlay',
+          agreesWithDeclared: cmp.agrees,
+          ...valueFields(entry.key, entry.value, rawRunning),
+        });
+        continue;
+      }
+    }
+
     if (cmp.agrees) continue;
+
+    const source: EnvSource = Object.prototype.hasOwnProperty.call(overlay, entry.key)
+      ? 'overlay'
+      : runningPresent
+        ? 'render_store'
+        : 'blueprint';
 
     // Boolean-shaped declarations sort into the on/off buckets (the TRA-2136 wipe
     // signature); everything else — versions, paths, numeric tunables — is a value
@@ -459,13 +588,22 @@ export function evaluateEnvDrift(opts: EvaluateEnvDriftOptions): EnvDriftReport 
     // different fixes.
     const declaredBool = classifyBool(entry.value);
     if (declaredBool === true) {
-      declaredOnButOff.push({ key: entry.key, declared: 'on', running: cmp.runningState });
+      declaredOnButOff.push({ key: entry.key, declared: 'on', running: cmp.runningState, source });
     } else if (declaredBool === false) {
-      declaredOffButOn.push({ key: entry.key, declared: 'off', running: 'on' });
+      declaredOffButOn.push({ key: entry.key, declared: 'off', running: 'on', source });
     } else {
-      valueMismatch.push({ key: entry.key, declared: 'set', running: cmp.runningState });
+      // TRA-5222 AC4 — `set` vs `set` was unactionable by construction; emit the
+      // two values (header rules) so the next reader can grade WHICH side is right.
+      valueMismatch.push({
+        key: entry.key,
+        declared: 'set',
+        running: cmp.runningState,
+        source,
+        ...valueFields(entry.key, entry.value, rawRunning),
+      });
     }
   }
+  overlayManaged.sort((a, b) => a.key.localeCompare(b.key));
 
   const driftCount =
     declaredOnButOff.length +
@@ -485,7 +623,10 @@ export function evaluateEnvDrift(opts: EvaluateEnvDriftOptions): EnvDriftReport 
         ? 'parser matched no env keys in render.yaml — driftCount:0 here means BROKEN, not clean'
         : `parser matched ${parsed.keysParsed} keys but 0 literal values — BROKEN parse (CRLF-class bug), driftCount:0 is meaningless`;
   } else if (driftCount > 0) {
-    reason = `${driftCount} declared env key(s) diverge from the running process`;
+    reason = `${driftCount} declared env key(s) diverge from the running process with no authorizing layer`;
+    if (overlayManaged.length > 0) {
+      reason += ` (${overlayManaged.length} further overlay-managed divergence(s) excluded — see overlayManaged[])`;
+    }
     if (selfHealedMismatchCount > 0) {
       // Name this separately: it is the one drift class NOT fixed by an env upsert.
       reason += ` (${selfHealedMismatchCount} of them self-healed to a value render.yaml does not declare — reconcile the code fallback map, not the store)`;
@@ -506,6 +647,7 @@ export function evaluateEnvDrift(opts: EvaluateEnvDriftOptions): EnvDriftReport 
     declaredOnButOff,
     declaredOffButOn,
     valueMismatch,
+    overlayManaged,
     selfHealed,
     blueprintFound: true,
     onRender,

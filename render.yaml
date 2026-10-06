@@ -789,23 +789,51 @@ services:
       - key: ENABLE_OPTION_LIVE_RV_LONG
         value: "0"
       # TRA-1490 (parent TRA-1479 "Demo to Live", family options-directional) —
-      # DARK live-capital gate on the deterministic DIRECTIONAL (near-ATM single-leg
-      # long call/put) options order path. Declared here EXPLICITLY OFF to document
-      # the shipped dark state and give a one-line arm point. Unlike the RV path, the
-      # directional pass (ENABLE_OPTION_DEMO_DIRECTIONAL above) has always been
-      # demo-only — this flag BUILDS the live path (Phase 1). With this OFF (default)
-      # the directional pass NEVER runs in live: no live-book open, no Tradier
-      # buy_to_open (zero real-capital risk). When armed ("1"), the live entry sizes
-      # off real Tradier equity and mirrors the paper open to a real buy_to_open via
-      # the SAME audited smart-open broker seam the RV long path uses. Read from
-      # process env ONLY — never the demo-flags.json override (this authorizes real
-      # orders; it is NOT on the demo-flag allowlist). DO NOT flip to "1" without a
-      # separate `request_board_approval` with a per-name cap (Phase 4 of TRA-1490) —
-      # arming is gated on the option-chain capture window (TRA-382) + sandbox fill
-      # validation (TRA-1436). NOTE: blueprint sync ≠ autoDeploy on bqb1 (TRA-1289) —
-      # a redeploy is needed to take effect. Accepts 1/true/yes/on.
+      # live-capital gate on the deterministic DIRECTIONAL (near-ATM single-leg
+      # long call/put) options order path. TRA-1490 authorized BUILDING the path,
+      # explicitly dark; arming was a separate gated approval — and that approval
+      # HAPPENED (TRA-5222 AC2 re-declaration, provenance below). Unlike the RV
+      # path, the directional pass (ENABLE_OPTION_DEMO_DIRECTIONAL above) has
+      # always been demo-only. When armed ("1"), the live entry sizes off real
+      # Tradier equity and mirrors the paper open to a real buy_to_open via the
+      # SAME audited smart-open broker seam the RV long path uses. Read from
+      # process env ONLY — never the demo-flags.json override (this authorizes
+      # real orders; it is NOT on the demo-flag allowlist).
+      #
+      # ARMED "1" — PROVENANCE (TRA-5222 AC2): board card `ca66df94` on TRA-5207
+      # (`ask_user_questions`, `effectiveResolverPolicy human_only`, resolved by
+      # `local-board`), answered 2026-10-05 23:03:52 ET (2026-10-06T03:03:52Z),
+      # option B — chosen by the board AGAINST QuantTrader's own recommendation
+      # of option A. Option B arms the LIVE directional learning budget at
+      # $800 total loss cap / $150 per-open at-risk / 40 opens, inside a
+      # 40-session auto-expiring box. Store writes + same-SHA env-apply
+      # `dep-db26gcui0phs73dg4hm0` executed 2026-10-06 (TRA-5213). The
+      # authorization is SCOPED TO THAT BUDGET, not open-ended: it stands only
+      # while ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET (declared below) is on and
+      # the budget has not self-disarmed — once it disarms, an `on` here is once
+      # again an unauthorized re-arm of the TRA-4750-stood-down sleeve: stand it
+      # down and return BOTH keys to "0" in the same change. Full machine-read
+      # manifest: env-intent.ts (served on /api/health/durability). Kill switch:
+      # ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET=0 + same-SHA redeploy.
       - key: ENABLE_OPTION_LIVE_DIRECTIONAL
-        value: "0"
+        value: "1"
+      # TRA-5222 AC2 — the kill-switch twin + the three board cap numbers of the
+      # ca66df94 arm above, declared so the blueprint carries the WHOLE approval
+      # (the two flag rows move together; the caps are the board's numbers, not
+      # tunables). Store values verified against the Render env-var store
+      # 2026-10-06 before declaring, so these rows mint no drift. A later
+      # kill-switch throw (budget flag =0 + redeploy) will read as
+      # declaredOnButOff drift on /api/health/env-drift until this declaration
+      # is updated in the same change — that alarm is DESIRED: it nags for the
+      # paired manifest edit the env-intent row demands.
+      - key: ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET
+        value: "1"
+      - key: LIVE_LEARNING_BUDGET_MAX_LOSS_USD
+        value: "800"
+      - key: LIVE_LEARNING_BUDGET_PER_OPEN_USD
+        value: "150"
+      - key: LIVE_LEARNING_BUDGET_MAX_OPENS
+        value: "40"
       # TRA-1317 (parent TRA-1316, board interaction `7042a614` answer = demo) —
       # arm DEMO PAPER routing of the regime-gated TSMOM scanner so the crypto
       # dashboard shows movement and we accrue forward round-trip evidence at ZERO

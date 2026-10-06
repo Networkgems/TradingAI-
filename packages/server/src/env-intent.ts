@@ -285,7 +285,8 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
     provenance:
       'TRA-1490 authorized BUILDING the live path, explicitly dark; arming was a separate gated ' +
       'approval — and board card ca66df94 on TRA-5207 (ask_user_questions, human_only, answered ' +
-      '2026-10-06T03:03:52Z) IS that approval: option B armed the LIVE directional learning budget ' +
+      '2026-10-05 23:03:52 ET / 2026-10-06T03:03:52Z) IS that approval: option B — chosen by the ' +
+      "board AGAINST QuantTrader's own recommendation of option A — armed the LIVE directional learning budget " +
       'at $800 loss cap / $150 per-open / 40 opens / 40-session box, executed 2026-10-06 by five ' +
       'single-key PUT /env-vars writes + the same-SHA env-apply dep-db26gcui0phs73dg4hm0 ' +
       '(TRA-5213). THE AUTHORISATION IS SCOPED TO THAT BUDGET, not open-ended: it stands only ' +

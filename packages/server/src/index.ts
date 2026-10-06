@@ -6462,6 +6462,10 @@ registerLiveHealthRoutes(app, {
   // what the process ACTUALLY resolves rather than against raw process.env (which
   // would report every daemon-free operator flip as phantom drift).
   effectiveEnv: () => demoFlagEnv(),
+  // TRA-5222 AC1 — the overlay LAYER itself (allowlisted demo-flags.json
+  // contents), so env-drift can attribute a divergence to the documented
+  // runtime-writable layer instead of counting it as unexplained drift.
+  demoFlagOverlay: () => loadDemoFlagFile(DATA_DIR),
   // TRA-3116 — grade every book's denominator-flip tape against the
   // pre-registered promotion bar. Enumerates the ACTIVE stocks bucket per book,
   // which is the same bucket `drainDenominatorFlipTapeFor` writes into, so the
