@@ -25,6 +25,13 @@ const RULED_PROD_ENV: NodeJS.ProcessEnv = {
   // applied by a same-SHA env-apply (TRA-5213). The two rows move together.
   ENABLE_OPTION_LIVE_DIRECTIONAL: '1',
   ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET: '1',
+  // TRA-5222 — the three ca66df94 board cap numbers, written by the same
+  // TRA-5213 five-PUT batch. MAX_LOSS and MAX_OPENS sit below their code
+  // ceilings (1000/60), so their rows exist precisely to catch a raise;
+  // PER_OPEN is AT its ceiling (150).
+  LIVE_LEARNING_BUDGET_MAX_LOSS_USD: '800',
+  LIVE_LEARNING_BUDGET_PER_OPEN_USD: '150',
+  LIVE_LEARNING_BUDGET_MAX_OPENS: '40',
   // ENABLE_ORDER_QUOTE_GUARD / ENABLE_OPTION_LIVE_RV_LONG absent: their intent
   // is `off` and their code default is off — absence MATCHES.
 };
@@ -66,6 +73,45 @@ describe('summarizeEnvIntent (TRA-4474)', () => {
     const lever = s.levers.find((l) => l.key === 'DURABILITY_POLICY');
     // The effective value the wiped box actually runs — beside the intended one.
     expect(lever).toMatchObject({ present: false, effective: 'observe', intended: 'refuse', matches: false });
+  });
+
+  // TRA-5222 (TRA-5188-watch finding) — the board cap NUMBERS are graded by
+  // value, post-clamp, the way resolveLiveLearningCaps resolves them. The two
+  // rows whose code ceiling sits ABOVE the board number must go red on a raise
+  // the consumer would honour; a raise past the ceiling clamps and still
+  // mismatches at the ceiling value; a wipe falls to the code default and
+  // mismatches there.
+  it('the ca66df94 cap numbers: a store raise the clamp honours is a named mismatch', () => {
+    const raised = graded({
+      ...RULED_PROD_ENV,
+      LIVE_LEARNING_BUDGET_MAX_LOSS_USD: '1000',
+      LIVE_LEARNING_BUDGET_MAX_OPENS: '60',
+    });
+    expect(raised.ok).toBe(false);
+    expect(raised.mismatches).toContain('LIVE_LEARNING_BUDGET_MAX_LOSS_USD');
+    expect(raised.mismatches).toContain('LIVE_LEARNING_BUDGET_MAX_OPENS');
+    expect(raised.levers.find((l) => l.key === 'LIVE_LEARNING_BUDGET_MAX_LOSS_USD')).toMatchObject({
+      effective: '1000',
+      intended: '800',
+      matches: false,
+    });
+    // Past the ceiling: the consumer clamps 5000 -> 1000; the row grades the
+    // clamped value real orders obey, not the stored string.
+    const clamped = graded({ ...RULED_PROD_ENV, LIVE_LEARNING_BUDGET_MAX_LOSS_USD: '5000' });
+    expect(clamped.levers.find((l) => l.key === 'LIVE_LEARNING_BUDGET_MAX_LOSS_USD')).toMatchObject({
+      effective: '1000',
+      matches: false,
+    });
+    // A wipe falls to the code default (300) — a silent TIGHTENING is still a
+    // posture the board did not rule; it must not grade clean.
+    const { LIVE_LEARNING_BUDGET_MAX_LOSS_USD: _gone, ...wipedEnv } = RULED_PROD_ENV;
+    const wiped = graded(wipedEnv);
+    expect(wiped.levers.find((l) => l.key === 'LIVE_LEARNING_BUDGET_MAX_LOSS_USD')).toMatchObject({
+      present: false,
+      effective: '300',
+      intended: '800',
+      matches: false,
+    });
   });
 
   it('a lever intended OFF found ON is a mismatch (the TRA-4442 direction)', () => {

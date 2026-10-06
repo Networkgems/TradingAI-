@@ -340,6 +340,81 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
         : 'off';
     },
   },
+  // TRA-5222 (TRA-5188-watch finding, 2026-10-06) — the three board cap NUMBERS
+  // of the ca66df94 arm, graded by value. The caps are tighten-only env clamps
+  // (live-learning-budget.ts `capFromEnv`: positive number clamped DOWN to a
+  // code ceiling, else default), and two of the three ceilings sit ABOVE the
+  // board's numbers: MAX_LOSS could drift 800→1000 and MAX_OPENS 40→60 by a
+  // single store write, with the consumer honouring the new value. render.yaml
+  // declares all three (414cbe47) so env-drift sees such a write post-deploy;
+  // these rows make the durability manifest see it too, and — unlike env-drift —
+  // they grade the RESOLVED cap (post-clamp), the number real orders obey.
+  // The numbers are the BOARD'S, not tunables: any edit here requires a new
+  // board card superseding ca66df94, and returns to the pre-arm posture
+  // ('off' twins above) must delete/zero these rows in the same change.
+  {
+    key: 'LIVE_LEARNING_BUDGET_MAX_LOSS_USD',
+    intended: '800',
+    provenance:
+      'Board card ca66df94 on TRA-5207 (option B, answered 2026-10-05 23:03:52 ET): $800 total ' +
+      'realized-loss cap on the live directional learning budget. Code ceiling is 1000 ' +
+      '(LIVE_LEARNING_CEILINGS.maxLossUsd), so a store write can legally raise the effective cap ' +
+      '25% past the board number with no consumer-side refusal — this row is the term that ' +
+      'disagrees. Resolved post-clamp, the way resolveLiveLearningCaps does.',
+    resolve: (env) => {
+      const n = Number(env['LIVE_LEARNING_BUDGET_MAX_LOSS_USD'] ?? '');
+      return String(
+        typeof env['LIVE_LEARNING_BUDGET_MAX_LOSS_USD'] === 'string' &&
+          env['LIVE_LEARNING_BUDGET_MAX_LOSS_USD'].trim() !== '' &&
+          Number.isFinite(n) &&
+          n > 0
+          ? Math.min(n, 1000)
+          : 300,
+      );
+    },
+  },
+  {
+    key: 'LIVE_LEARNING_BUDGET_PER_OPEN_USD',
+    intended: '150',
+    provenance:
+      'Board card ca66df94 on TRA-5207 (option B): $150 premium-at-risk per open. This board ' +
+      'number IS the code ceiling (LIVE_LEARNING_CEILINGS.perOpenAtRiskUsd = 150), so env drift ' +
+      'can only LOWER it — a mismatch here is a tightening or a wipe-to-default (100), never an ' +
+      'unauthorized raise; still escalate, the board number is the declared posture.',
+    resolve: (env) => {
+      const n = Number(env['LIVE_LEARNING_BUDGET_PER_OPEN_USD'] ?? '');
+      return String(
+        typeof env['LIVE_LEARNING_BUDGET_PER_OPEN_USD'] === 'string' &&
+          env['LIVE_LEARNING_BUDGET_PER_OPEN_USD'].trim() !== '' &&
+          Number.isFinite(n) &&
+          n > 0
+          ? Math.min(n, 150)
+          : 100,
+      );
+    },
+  },
+  {
+    key: 'LIVE_LEARNING_BUDGET_MAX_OPENS',
+    intended: '40',
+    provenance:
+      'Board card ca66df94 on TRA-5207 (option B): 40 opens total inside the 40-session box. ' +
+      'Code ceiling is 60 (LIVE_LEARNING_CEILINGS.maxOpens), so a store write can raise the ' +
+      'effective cap 50% past the board number — this row is the term that disagrees. Resolved ' +
+      'post-clamp + floor, the way resolveLiveLearningCaps does.',
+    resolve: (env) => {
+      const n = Number(env['LIVE_LEARNING_BUDGET_MAX_OPENS'] ?? '');
+      return String(
+        Math.floor(
+          typeof env['LIVE_LEARNING_BUDGET_MAX_OPENS'] === 'string' &&
+            env['LIVE_LEARNING_BUDGET_MAX_OPENS'].trim() !== '' &&
+            Number.isFinite(n) &&
+            n > 0
+            ? Math.min(n, 60)
+            : 40,
+        ),
+      );
+    },
+  },
   {
     key: 'TRADIER_ENV',
     intended: 'production',
