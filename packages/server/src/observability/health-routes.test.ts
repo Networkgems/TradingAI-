@@ -67,6 +67,14 @@ import {
 // TRA-5037 — the churn-brake flag, the surface the sibling-reads blank-case test
 // below grades after the 11 class-A conversions in health-routes.ts.
 import { CHURN_LOSS_BRAKE_FLAG } from '../churn-loss-brake-flag.js';
+// TRA-5208 — the wheel-routing arm legs + the IV-filter flag the gate route's
+// `enabled` actually mirrors, imported as SYMBOLS so the assertions cannot
+// drift against retyped literals.
+import {
+  OPTION_WHEEL_ROUTING_FLAG,
+  OPTION_SHORT_PREMIUM_SCANNER_FLAG,
+  WHEEL_IV_FILTER_FLAG,
+} from '../option-exec-flag.js';
 // TRA-3216 — the live OTM underlying allowlist + the enforcement-gate ledger it publishes through.
 import { OPTION_LIVE_OTM_UNIVERSE_VAR } from '../otm-live-universe-flag.js';
 import { clearLiveEnforceGateLedger, recordLiveEnforceDecision } from '../live-enforce-gate-ledger.js';
@@ -9063,5 +9071,144 @@ describe('TRA-5037 blank DATA_DIR on /api/health/churn-brake (the sibling reads)
     process.env.DATA_DIR = tmp!;
     expect(process.env[FLAG]).toBeUndefined();
     expect((await serve()).armed).toBe(true);
+  });
+});
+
+// TRA-5208 — the wheel-routing arm state is PUBLISHED, and the field an operator
+// mistook for it is labelled.
+//
+// Found arming TRA-5207 on bqb1: with the wheel correctly armed via demo-flags
+// (both ENABLE_OPTION_SHORT_PREMIUM_SCANNER and ENABLE_OPTION_WHEEL_ROUTING in
+// the overlay), `GET /api/health/wheel-promotion-gate` still read
+// `enabled: false`, because that field mirrors the IV ENTRY FILTER — and no
+// route anywhere published `isOptionWheelRoutingEnabled`. "Armed and quiet" and
+// "never armed" rendered identically, with the nearest-looking instrument
+// reading a confident false. These tests pin (1) the new `wheelRouting` block on
+// both routes, (2) the exact live confusion (armed wheel + `enabled:false`
+// coexisting, now with a label beside it), and (3) ask 3: /short-premium's own
+// `enabled` resolving through the overlay instead of bare process.env.
+describe('TRA-5208 wheel-routing arm state on /wheel-promotion-gate and /short-premium', () => {
+  let tmp: string | null = null;
+
+  const serve = async (path: string): Promise<Record<string, unknown>> => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    await routes.get(path)![0]!({ query: {} }, res);
+    return res.body as Record<string, unknown>;
+  };
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'tra5208-'));
+    delete process.env[OPTION_WHEEL_ROUTING_FLAG];
+    delete process.env[OPTION_SHORT_PREMIUM_SCANNER_FLAG];
+    delete process.env[WHEEL_IV_FILTER_FLAG];
+    delete process.env.DATA_DIR;
+  });
+
+  afterEach(() => {
+    delete process.env[OPTION_WHEEL_ROUTING_FLAG];
+    delete process.env[OPTION_SHORT_PREMIUM_SCANNER_FLAG];
+    delete process.env[WHEEL_IV_FILTER_FLAG];
+    delete process.env.DATA_DIR;
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    tmp = null;
+  });
+
+  it('the live confusion, pinned: wheel armed via the file ⇒ wheelRouting.armed true, attributed to the file, while `enabled` (the IV filter) stays false WITH a label beside it', async () => {
+    writeFileSync(
+      join(tmp!, 'demo-flags.json'),
+      JSON.stringify({
+        [OPTION_SHORT_PREMIUM_SCANNER_FLAG]: '1',
+        [OPTION_WHEEL_ROUTING_FLAG]: '1',
+      }),
+      'utf8',
+    );
+    process.env.DATA_DIR = tmp!;
+
+    // Control: neither key in process.env ⇒ `armed: true` can only have come
+    // off the file, which also proves the route opened the overlay.
+    expect(process.env[OPTION_WHEEL_ROUTING_FLAG]).toBeUndefined();
+    expect(process.env[OPTION_SHORT_PREMIUM_SCANNER_FLAG]).toBeUndefined();
+
+    const body = await serve('/api/health/wheel-promotion-gate');
+    expect(body.wheelRouting).toMatchObject({
+      flag: OPTION_WHEEL_ROUTING_FLAG,
+      armed: true,
+      flagValue: '1',
+      scannerFlag: OPTION_SHORT_PREMIUM_SCANNER_FLAG,
+      scannerEnabled: true,
+      enabledSource: 'demo_flags_file',
+      armableViaDemoFlagsFile: true,
+    });
+    // The exact TRA-5207 report: `enabled` reads false with the wheel armed —
+    // still true (it is the IV filter, untouched here), but no longer bare.
+    expect(body.enabled).toBe(false);
+    expect(String(body.enabledMeans)).toContain(WHEEL_IV_FILTER_FLAG);
+  });
+
+  it('half-armed is diagnosable from the payload: routing flag on, scanner off ⇒ armed:false names the missing leg', async () => {
+    writeFileSync(
+      join(tmp!, 'demo-flags.json'),
+      JSON.stringify({ [OPTION_WHEEL_ROUTING_FLAG]: '1' }),
+      'utf8',
+    );
+    process.env.DATA_DIR = tmp!;
+
+    const body = await serve('/api/health/wheel-promotion-gate');
+    expect(body.wheelRouting).toMatchObject({
+      armed: false,
+      flagValue: '1',
+      scannerEnabled: false,
+      enabledSource: 'off',
+    });
+  });
+
+  it('a process-env arm is attributed to process_env', async () => {
+    process.env[OPTION_SHORT_PREMIUM_SCANNER_FLAG] = '1';
+    process.env[OPTION_WHEEL_ROUTING_FLAG] = '1';
+
+    const body = await serve('/api/health/wheel-promotion-gate');
+    expect(body.wheelRouting).toMatchObject({ armed: true, enabledSource: 'process_env' });
+  });
+
+  it('ask 3: /short-premium `enabled` reads the overlay — a file-only arm reads true/demo_flags_file (bare process.env read false here), and the same wheelRouting block rides along', async () => {
+    writeFileSync(
+      join(tmp!, 'demo-flags.json'),
+      JSON.stringify({
+        [OPTION_SHORT_PREMIUM_SCANNER_FLAG]: '1',
+        [OPTION_WHEEL_ROUTING_FLAG]: '1',
+      }),
+      'utf8',
+    );
+    process.env.DATA_DIR = tmp!;
+    expect(process.env[OPTION_SHORT_PREMIUM_SCANNER_FLAG]).toBeUndefined();
+
+    const body = await serve('/api/health/short-premium');
+    expect(body.enabled).toBe(true);
+    expect(body.enabledSource).toBe('demo_flags_file');
+    expect(body.flag).toBe(OPTION_SHORT_PREMIUM_SCANNER_FLAG);
+    expect(body.armableViaDemoFlagsFile).toBe(true);
+    expect(body.wheelRouting).toMatchObject({ armed: true, enabledSource: 'demo_flags_file' });
+  });
+
+  it('ask 3, the disarm direction: a file `0` wins over a process-env arm (where the old bare read would publish a confident true)', async () => {
+    process.env[OPTION_SHORT_PREMIUM_SCANNER_FLAG] = '1';
+    writeFileSync(
+      join(tmp!, 'demo-flags.json'),
+      JSON.stringify({ [OPTION_SHORT_PREMIUM_SCANNER_FLAG]: '0' }),
+      'utf8',
+    );
+    process.env.DATA_DIR = tmp!;
+
+    const body = await serve('/api/health/short-premium');
+    expect(body.enabled).toBe(false);
+    expect(body.enabledSource).toBe('off');
+    expect(body.wheelRouting).toMatchObject({ armed: false, scannerEnabled: false });
   });
 });

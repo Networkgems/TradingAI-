@@ -61,7 +61,11 @@ import {
   isOptionIvRvRoutingEnabled, // TRA-2193
   isOptionIvRvScannerEnabled,
   isOptionShortPremiumScannerEnabled,
+  isOptionWheelRoutingEnabled, // TRA-5208
+  OPTION_WHEEL_ROUTING_FLAG, // TRA-5208
+  OPTION_SHORT_PREMIUM_SCANNER_FLAG, // TRA-5208
   isWheelIvEntryFilterEnabled,
+  WHEEL_IV_FILTER_FLAG, // TRA-5208
   isOptionLiveOtmEnabled,
   isOptionLiveRvLongEnabled,
   isOptionLiveTestWindowOpen,
@@ -5520,6 +5524,50 @@ export function rollUpExitCadence(engines: ExitCadenceHealth[]): ExitCadenceRoll
 // fired a false wiring accusation against a correctly wired gate.
 export const MIRROR_SEAM_GATES = ['canary_ceiling', 'sleeve_stand_down'] as const;
 
+/**
+ * TRA-5208 — the wheel-routing ARM state, published where an operator looks.
+ *
+ * `isOptionWheelRoutingEnabled` is a two-leg AND (the short-premium scanner
+ * flag AND the ENABLE_OPTION_WHEEL_ROUTING sub-flag) whose only non-test
+ * consumer is signal-engine's `routeWheel` read — until this block NOTHING
+ * published it, so "armed and quiet" and "never armed" rendered identically,
+ * and the nearest-looking instrument (`enabled` on /wheel-promotion-gate,
+ * which is the IV entry filter) read a confident `false` over a correctly
+ * armed wheel. `env` must be the demo-flags-overlay view
+ * (`resolveDemoFlagEnvFromEnv()`), the same env the engine resolves at the
+ * routing call site.
+ *
+ * `enabledSource` follows the /api/health/option-real-fill-shadow idiom: only
+ * the file is writable without a redeploy, so an operator who armed the file
+ * needs to see that it took. The per-leg reads make a half-armed state
+ * diagnosable from the payload alone: `armed:false` + `flagValue:'1'` +
+ * `scannerEnabled:false` names the missing leg without reading source.
+ */
+function buildWheelRoutingArmState(env: NodeJS.ProcessEnv): {
+  flag: string;
+  armed: boolean;
+  flagValue: string | null;
+  scannerFlag: string;
+  scannerEnabled: boolean;
+  enabledSource: 'process_env' | 'demo_flags_file' | 'off';
+  armableViaDemoFlagsFile: boolean;
+} {
+  const armed = isOptionWheelRoutingEnabled(env);
+  return {
+    flag: OPTION_WHEEL_ROUTING_FLAG,
+    armed,
+    flagValue: env[OPTION_WHEEL_ROUTING_FLAG] ?? null,
+    scannerFlag: OPTION_SHORT_PREMIUM_SCANNER_FLAG,
+    scannerEnabled: isOptionShortPremiumScannerEnabled(env),
+    enabledSource: armed
+      ? isOptionWheelRoutingEnabled(process.env)
+        ? 'process_env'
+        : 'demo_flags_file'
+      : 'off',
+    armableViaDemoFlagsFile: DEMO_FLAG_ALLOWLIST.includes(OPTION_WHEEL_ROUTING_FLAG),
+  };
+}
+
 export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): void {
   const now = deps.now ?? Date.now;
 
@@ -5823,18 +5871,38 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // (credit spreads / iron condors). Process-global, demo-only, OBSERVE-ONLY (no
   // balances/PII — just structure legs, credit/width/PoP, IV/RV, IV-rank, and
   // scores), so this is unauthenticated (parity with /iv-rv). `enabled` mirrors
-  // ENABLE_OPTION_SHORT_PREMIUM_SCANNER so the board can see at a glance whether
-  // the theta-positive scanner is armed; when off the store is empty so the
-  // surface is an honest zero rather than a 404. Always read-only: NO order is
-  // ever placed off these structures — demo routing / graduation is a separate
-  // board decision.
+  // the EFFECTIVE ENABLE_OPTION_SHORT_PREMIUM_SCANNER so the board can see at a
+  // glance whether the theta-positive scanner is armed; when off the store is
+  // empty so the surface is an honest zero rather than a 404. Always read-only:
+  // NO order is ever placed off these structures — demo routing / graduation is
+  // a separate board decision.
+  //
+  // TRA-5208 — `enabled` resolves through the demo-flags overlay, not bare
+  // process.env. The flag is on DEMO_FLAG_ALLOWLIST, so the engine's own read
+  // honours demo-flags.json (file wins); a process-env-only readout here was
+  // right only while the key happened to be set both places, and would publish
+  // a confident wrong answer the first time someone armed or disarmed via the
+  // file alone. `enabledSource` + `wheelRouting` follow the
+  // /api/health/option-real-fill-shadow idiom.
   app.get('/api/health/short-premium', (_req, res) => {
     const summary = summarizeShortPremiumScans(now());
+    const flagEnv = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
+    const enabled = isOptionShortPremiumScannerEnabled(flagEnv);
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
-      enabled: isOptionShortPremiumScannerEnabled(),
+      enabled,
+      enabledSource: enabled
+        ? isOptionShortPremiumScannerEnabled(process.env)
+          ? 'process_env'
+          : 'demo_flags_file'
+        : 'off',
+      flag: OPTION_SHORT_PREMIUM_SCANNER_FLAG,
+      armableViaDemoFlagsFile: DEMO_FLAG_ALLOWLIST.includes(OPTION_SHORT_PREMIUM_SCANNER_FLAG),
+      // TRA-5208 — the wheel rides THIS scanner (two-leg AND), so its arm state
+      // is published here as well as on /wheel-promotion-gate.
+      wheelRouting: buildWheelRoutingArmState(flagEnv),
       ...summary,
       // TRA-5171 — the empty-store WHY, in one read. `ivStoreProvenance.bootLoad`
       // separates file-absent / parse-error / parsed-but-shallow (three states
@@ -5864,6 +5932,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // it reflects a daemon-free arm). OFF ⇒ the filter is observe-only and the gate
   // reads mostly `pending` on a calm/empty forward book — an honest not-yet, never
   // a silent pass. Read-only: routes no order. Live stays gated on TRA-382.
+  //
+  // TRA-5208 — a bare `enabled` on a route named wheel-promotion-gate reads as
+  // "the wheel is on", and an operator following the TRA-5207 runbook read its
+  // `false` as a failed arm over a wheel that WAS armed. The field keeps its
+  // meaning (the IV entry filter — existing consumers unbroken) but now carries
+  // `enabledMeans` beside it, and the actual wheel-routing arm is published as
+  // `wheelRouting` (the flag's only consumer is signal-engine's routeWheel read;
+  // nothing else published it at all).
   app.get('/api/health/wheel-promotion-gate', (_req, res) => {
     const env = resolveDemoFlagEnvFromEnv(); // TRA-5037 — trims; blank DATA_DIR behaves as unset
     const ivFilterEnabled = isWheelIvEntryFilterEnabled(env);
@@ -5872,6 +5948,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       enabled: ivFilterEnabled,
+      enabledMeans:
+        `${WHEEL_IV_FILTER_FLAG} (the IV entry filter) — NOT the wheel-routing arm; `
+        + 'read wheelRouting.armed for that',
+      wheelRouting: buildWheelRoutingArmState(env),
       liveCapitalReachable: false,
       ...buildWheelPromotionGateSummary({ now: now(), ivFilterEnabled }),
     });
