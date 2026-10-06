@@ -238,6 +238,12 @@ export const DEMO_FLAG_ALLOWLIST = [
   // code change. Allowlisted so QuantTrader can arm/disarm the exploration
   // daemon-free, same as the gate flag above.
   'ENABLE_DIRECTIONAL_EXPLORATION_ALLOWANCE',
+  // TRA-WHEEL-DEMO-FLAG — the demo wheel (cash-secured put → covered call) router.
+  // Consulted only inside the demo-only short-premium pass; opens `mode:'demo'`
+  // with no Tradier mirror, so it is structurally incapable of touching capital.
+  // Requires ENABLE_OPTION_SHORT_PREMIUM_SCANNER (process env or this file).
+  'ENABLE_OPTION_WHEEL_ROUTING',
+  'ENABLE_OPTION_SHORT_PREMIUM_SCANNER',
   // TRA-3391 — `OPTION_COST_GATE_WIN_PROB_DELTA_MULT`, `_DEFAULT_REWARD_R` and
   // `_WIN_PROB_CAP` were removed from this allowlist with the estimator they
   // parameterised. QuantTrader's TRA-3388 ruling rejected the CONSTRUCTION, not a
