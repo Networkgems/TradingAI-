@@ -462,3 +462,88 @@ describe('TRA-4378 gate integration (costAwareGateReject demo branch)', () => {
     expect(summarizeExplorationAllowance(process.env, ARM_DAY).rowsUsed).toBe(0); // …no row spent.
   });
 });
+
+// ── TRA-5223: reachability folds in the HOST gate ────────────────────────────
+// `armed` is the allowance's OWN flag and reads identically whether the host
+// cost-aware gate (whose demo branch returns before any allowance consult) is
+// armed or not — the exact two states TRA-5188 needed the field to separate.
+// `reachable` is the fold; `disarmedReason` stays the terminal persisted field
+// the board ruling keys on, untouched in every case below.
+describe('TRA-5223 explorationAllowance reachability (host-gate fold)', () => {
+  let dir: string;
+  const ALLOWANCE_ON = { [DIRECTIONAL_EXPLORATION_FLAG]: '1' };
+  const HOST_ON = { ENABLE_OPTION_COST_AWARE_GATE: '1' };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'exploration-5223-'));
+    clearExplorationAllowanceForTests();
+    hydrateExplorationAllowanceFromDisk(dir);
+  });
+
+  afterEach(() => {
+    clearExplorationAllowanceForTests();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('AC: host gate ABSENT ⇒ armed allowance reads reachable:false naming cost_aware_gate_disarmed; disarmedReason/counters untouched', () => {
+    // The 2026-10-06T12:50:40Z defect instant: allowance flag "1", host gate off.
+    const s = summarizeExplorationAllowance(ALLOWANCE_ON, ARM_DAY);
+    expect(s.armed).toBe(true); // the field that could not separate the states — unchanged
+    expect(s.flagValue).toBe('1');
+    expect(s.hostGateFlag).toBe('ENABLE_OPTION_COST_AWARE_GATE');
+    expect(s.hostGateArmed).toBe(false);
+    expect(s.reachable).toBe(false);
+    expect(s.unreachableReason).toBe('cost_aware_gate_disarmed');
+    expect(s.disarmedReason).toBeNull(); // terminal field NOT overloaded
+    expect(s.rowsUsed).toBe(0);
+    expect(s.rowCap).toBe(EXPLORATION_CAPS.rowCap);
+    expect(s.note).toContain('ARMED BUT UNREACHABLE');
+  });
+
+  it('AC: host gate explicitly =0 ⇒ same unreachable verdict', () => {
+    const s = summarizeExplorationAllowance(
+      { ...ALLOWANCE_ON, ENABLE_OPTION_COST_AWARE_GATE: '0' },
+      ARM_DAY,
+    );
+    expect(s.armed).toBe(true);
+    expect(s.reachable).toBe(false);
+    expect(s.unreachableReason).toBe('cost_aware_gate_disarmed');
+    expect(s.disarmedReason).toBeNull();
+  });
+
+  it('AC: host gate =1 + allowance armed with rows remaining ⇒ reachable:true', () => {
+    openOne('r1');
+    const s = summarizeExplorationAllowance({ ...ALLOWANCE_ON, ...HOST_ON }, ARM_DAY);
+    expect(s.armed).toBe(true);
+    expect(s.rowsUsed).toBe(1); // rows remaining (1 of 25)
+    expect(s.hostGateArmed).toBe(true);
+    expect(s.reachable).toBe(true);
+    expect(s.unreachableReason).toBeNull();
+    expect(s.note).toContain('ARMED (demo-only, TRA-4378)'); // armed note unchanged when reachable
+  });
+
+  it('host gate =1 but allowance flag off ⇒ allowance_disarmed, with disarmedReason still naming flag_off', () => {
+    const s = summarizeExplorationAllowance(HOST_ON, ARM_DAY);
+    expect(s.armed).toBe(false);
+    expect(s.reachable).toBe(false);
+    expect(s.unreachableReason).toBe('allowance_disarmed');
+    expect(s.disarmedReason).toBe('flag_off');
+  });
+
+  it('host gate =1 over a TERMINAL self-disarm ⇒ allowance_disarmed, disarmedReason keeps the terminal value', () => {
+    openOne('t1');
+    handleExplorationJournalClose('t1', { realizedPnlUsd: -700 }, ARM_DAY, 2_000);
+    const s = summarizeExplorationAllowance({ ...ALLOWANCE_ON, ...HOST_ON }, ARM_DAY);
+    expect(s.armed).toBe(false);
+    expect(s.reachable).toBe(false);
+    expect(s.unreachableReason).toBe('allowance_disarmed');
+    expect(s.disarmedReason).toBe('pnl_cap'); // the board-read field, untouched
+  });
+
+  it('BOTH off ⇒ the host gate outranks (mirrors the demo branch: it returns first)', () => {
+    const s = summarizeExplorationAllowance({}, ARM_DAY);
+    expect(s.reachable).toBe(false);
+    expect(s.unreachableReason).toBe('cost_aware_gate_disarmed');
+    expect(s.disarmedReason).toBe('flag_off');
+  });
+});

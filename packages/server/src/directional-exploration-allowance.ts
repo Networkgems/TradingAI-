@@ -72,6 +72,7 @@ import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 import { isMarketDayIso } from './scheduler.js';
+import { isOptionCostAwareGateEnabled, OPTION_COST_AWARE_GATE_FLAG } from './option-cost-gate.js';
 import { DIRECTIONAL_STRUCTURE_LABEL, classifySpreadCeilingAccount } from './option-spread-cost.js';
 import { appendBoundedTapeLineSync } from './data-tape-bounds.js';
 
@@ -528,6 +529,17 @@ export interface ExplorationAllowanceSummary {
   sessionBox: number;
   expiresEtDay: string | null;
   disarmedReason: ExplorationTerminalReason | 'flag_off' | null;
+  // TRA-5223 — `armed` is the allowance's OWN flag and cannot separate can-fire
+  // from cannot-fire: the demo branch of `costAwareGateReject` returns before any
+  // allowance consult when the HOST gate (ENABLE_OPTION_COST_AWARE_GATE) is off,
+  // so an armed allowance under a disarmed host gate can never mint a grant,
+  // `rowsUsed` can never advance and `row_cap` can never fire. `reachable` folds
+  // the host gate in; `disarmedReason` above stays the TERMINAL persisted field
+  // (the TRA-5188 board ruling keys on it) and is NOT overloaded.
+  hostGateFlag: string;
+  hostGateArmed: boolean;
+  reachable: boolean;
+  unreachableReason: 'cost_aware_gate_disarmed' | 'allowance_disarmed' | 'state_unreadable' | null;
   demoOnly: true;
   liveCapitalReachable: false;
   refusalsSinceBoot: Record<string, number>;
@@ -557,6 +569,19 @@ export function summarizeExplorationAllowance(
   const disarmedReason: ExplorationTerminalReason | 'flag_off' | null =
     terminal ?? (on ? null : 'flag_off');
   const armed = on && !stateUnreadable && terminal == null;
+  // TRA-5223 — reachability folds in the HOST gate, resolved off the SAME env the
+  // trade pass reads (the route hands us resolveDemoFlagEnvFromEnv()'s output).
+  // Order mirrors signal-engine's demo branch: the host-gate check runs before the
+  // allowance is ever consulted, so a disarmed host gate outranks allowance state.
+  const hostGateArmed = isOptionCostAwareGateEnabled(env);
+  const reachable = armed && hostGateArmed;
+  const unreachableReason: ExplorationAllowanceSummary['unreachableReason'] = reachable
+    ? null
+    : !hostGateArmed
+      ? 'cost_aware_gate_disarmed'
+      : stateUnreadable
+        ? 'state_unreadable'
+        : 'allowance_disarmed';
   const sessions = armedEtDay != null && !stateUnreadable
     ? explorationSessionsElapsed(armedEtDay, todayEtDay)
     : null;
@@ -581,6 +606,10 @@ export function summarizeExplorationAllowance(
     sessionBox: EXPLORATION_CAPS.sessionBox,
     expiresEtDay: armedEtDay != null ? boxExpiryEtDay(armedEtDay) : null,
     disarmedReason,
+    hostGateFlag: OPTION_COST_AWARE_GATE_FLAG,
+    hostGateArmed,
+    reachable,
+    unreachableReason,
     demoOnly: true,
     liveCapitalReachable: false,
     refusalsSinceBoot: { ...refusals },
@@ -593,7 +622,9 @@ export function summarizeExplorationAllowance(
     },
     note: stateUnreadable
       ? 'STATE UNREADABLE — the on-disk allowance ledger exists but could not be read; every grant fails closed and every counter above is null. This is UNREAD, not quiet.'
-      : armed
+      : armed && !hostGateArmed
+        ? `ARMED BUT UNREACHABLE (TRA-5223): ${DIRECTIONAL_EXPLORATION_FLAG}=1 yet the HOST gate ${OPTION_COST_AWARE_GATE_FLAG} is off — the demo branch of costAwareGateReject returns before this allowance is ever consulted, so NO grant can be minted, rowsUsed cannot advance and row_cap cannot fire. 'armed' here is the allowance's own flag only; do not read it as can-fire. Arm the host gate to restore reach.`
+        : armed
         ? `ARMED (demo-only, TRA-4378): a flat cost-bar reject on a DESK-book demo '${EXPLORATION_GATE_STRUCTURE}' candidate is admitted while every cap holds (fixture/unattributed books refuse fixture_book/unattributed_book — TRA-4418); admits land on retained.byStructure[${EXPLORATION_GATE_STRUCTURE}] (assert barR != null on the row you read — the '${DIRECTIONAL_STRUCTURE_LABEL}' twin carries spread-ceiling counters only). Caps: ${EXPLORATION_CAPS.rowCap} opens, $${EXPLORATION_CAPS.perOpenAtRiskCapUsd} at-risk/open, ${EXPLORATION_CAPS.pnlCapUsd} USD realized, ${EXPLORATION_CAPS.maxConcurrent} concurrent / ${EXPLORATION_CAPS.maxPerSession} per session, ${EXPLORATION_CAPS.sessionBox}-session box (expires after ${armedEtDay != null ? boxExpiryEtDay(armedEtDay) : 'n/a'}). Zero live-capital reach: consulted only on the demo branch of the gate.`
         : disarmedReason === 'flag_off'
           ? `DISARMED (default-off): set ${DIRECTIONAL_EXPLORATION_FLAG}=1 (DATA_DIR/demo-flags.json or env) to arm. No exploration open can occur while this reads false.${armedEtDay != null ? ' Previously armed — counters above are the durable record and still bind on re-arm.' : ''}`

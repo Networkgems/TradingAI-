@@ -2187,6 +2187,10 @@ describe('TRA-1602 cost-aware fire-bar health route', () => {
         maxPerSession: number;
         sessionBox: number;
         disarmedReason: string | null;
+        hostGateFlag: string;
+        hostGateArmed: boolean;
+        reachable: boolean;
+        unreachableReason: string | null;
         demoOnly: boolean;
         liveCapitalReachable: boolean;
       };
@@ -2209,6 +2213,13 @@ describe('TRA-1602 cost-aware fire-bar health route', () => {
     expect(ea.sessionBox).toBe(40);
     expect(ea.demoOnly).toBe(true);
     expect(ea.liveCapitalReachable).toBe(false);
+    // TRA-5223 — the reachability fold is ON THE WIRE: with the host gate off
+    // (no env flag in this test process) the block itself says it cannot fire,
+    // naming the host gate, without touching the terminal disarmedReason above.
+    expect(ea.hostGateFlag).toBe('ENABLE_OPTION_COST_AWARE_GATE');
+    expect(ea.hostGateArmed).toBe(false);
+    expect(ea.reachable).toBe(false);
+    expect(ea.unreachableReason).toBe('cost_aware_gate_disarmed');
   });
 });
 
