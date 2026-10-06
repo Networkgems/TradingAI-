@@ -43,13 +43,19 @@
  * daily-cache set surveyed in spec §4).
  *
  * Usage:
- *   node scripts/tra4386-phase1-feeder-replay.mjs --fetch      # cache 2y bars
- *   node scripts/tra4386-phase1-feeder-replay.mjs              # grade
- *   node scripts/tra4386-phase1-feeder-replay.mjs --controls   # controls + mutations
- * Exit: 0 = graded (PASS or FAIL alike) · 3 = BLIND (data/controls broken).
+ *   node scripts/tra4386-phase1-feeder-replay.mjs --fetch        # fetch/refresh 2y bars;
+ *                                     a cached symbol whose last bar is older than the
+ *                                     previous session is RE-FETCHED (TRA-5137)
+ *   node scripts/tra4386-phase1-feeder-replay.mjs --fetch --no-refetch  # old skip-if-present
+ *                                     behavior; spans are still printed per symbol
+ *   node scripts/tra4386-phase1-feeder-replay.mjs                # grade (BLIND on a stale cache)
+ *   node scripts/tra4386-phase1-feeder-replay.mjs --controls     # controls + mutations
+ * Exit: 0 = graded (PASS or FAIL alike) · 3 = BLIND (data missing, cache stale
+ *       by more than STALE_SESSIONS completed sessions, or controls broken).
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -67,6 +73,54 @@ const T_THRESHOLD = 2.498; // two-sided p <= .05/4
 const N_POWER = 224;
 const HORIZON = 5; // sessions
 const WARMUP = 50; // SMA50 warmup, uniform across feeders
+const STALE_SESSIONS = 5; // grade reads BLIND when the newest cached bar is further behind (TRA-5137)
+
+// ---------- session arithmetic ----------
+// Weekday approximation: holidays are counted as sessions, so `sessionsBehind`
+// slightly overstates — the STALE_SESSIONS allowance absorbs that, and the
+// error is in the safe direction (trips earlier, never later).
+
+function todayISO() { return new Date().toISOString().slice(0, 10); }
+
+function isWeekdayUTC(d) { const day = d.getUTCDay(); return day !== 0 && day !== 6; }
+
+/** Most recent weekday strictly before `iso` — the last session a daily cache could be expected to hold. */
+function prevSessionISO(iso) {
+  const d = new Date(`${iso}T00:00:00Z`);
+  do { d.setUTCDate(d.getUTCDate() - 1); } while (!isWeekdayUTC(d));
+  return d.toISOString().slice(0, 10);
+}
+
+/** Completed weekday sessions in (lastBarISO, prevSession(todayIso)]. 0 = cache is current. */
+function sessionsBehind(lastBarISO, todayIso) {
+  const end = prevSessionISO(todayIso);
+  let n = 0;
+  const d = new Date(`${lastBarISO}T00:00:00Z`);
+  for (;;) {
+    d.setUTCDate(d.getUTCDate() + 1);
+    const iso = d.toISOString().slice(0, 10);
+    if (iso > end) return n;
+    if (isWeekdayUTC(d)) n++;
+    if (n > 10000) return n; // degenerate-input guard
+  }
+}
+
+/**
+ * Window + staleness over a loaded cache. `maxSessions=Infinity` disarms the
+ * threshold — that is the mutation lever ARM4's mutation uses, never a runtime path.
+ */
+function cacheStaleness(barsBySym, todayIso = todayISO(), maxSessions = STALE_SESSIONS) {
+  let minFirst = null, maxLast = null;
+  for (const bars of barsBySym.values()) {
+    const first = bars[0].date, last = bars[bars.length - 1].date;
+    if (minFirst == null || first < minFirst) minFirst = first;
+    if (maxLast == null || last > maxLast) maxLast = last;
+  }
+  let symbolsBehindNewest = 0;
+  for (const bars of barsBySym.values()) if (bars[bars.length - 1].date < maxLast) symbolsBehindNewest++;
+  const behindSessions = sessionsBehind(maxLast, todayIso);
+  return { minFirst, maxLast, symbolsBehindNewest, behindSessions, stale: behindSessions > maxSessions };
+}
 
 // ---------- data ----------
 
@@ -89,11 +143,29 @@ async function fetchYahoo(symbol) {
   return bars;
 }
 
-async function doFetch() {
+/**
+ * TRA-5137: refresh by default. A cached symbol whose last bar is older than the
+ * previous session is re-fetched unless --no-refetch; either way the span is
+ * printed — a bare `cached SYM` was indistinguishable from a fresh one, and a
+ * stale run graded the old window silently.
+ */
+async function doFetch(opts = {}) {
+  const refetch = !opts.noRefetch;
   mkdirSync(DATA_DIR, { recursive: true });
+  const prevSession = prevSessionISO(todayISO());
   for (const sym of UNIVERSE) {
     const p = resolve(DATA_DIR, `${sym}.json`);
-    if (existsSync(p)) { console.log(`cached  ${sym}`); continue; }
+    if (existsSync(p)) {
+      let bars = null;
+      try { ({ bars } = JSON.parse(readFileSync(p, 'utf8'))); } catch { /* unreadable => refetch */ }
+      const last = bars?.length ? bars[bars.length - 1].date : null;
+      if (last != null && (last >= prevSession || !refetch)) {
+        const staleNote = last < prevSession ? ` STALE (last bar < previous session ${prevSession}; kept by --no-refetch)` : '';
+        console.log(`cached  ${sym} (${bars[0].date}..${last})${staleNote}`);
+        continue;
+      }
+      console.log(`stale   ${sym} (last bar ${last ?? 'unreadable'} < previous session ${prevSession}) — refetching`);
+    }
     const bars = await fetchYahoo(sym);
     writeFileSync(p, JSON.stringify({ symbol: sym, fetchedAt: Date.now(), bars }));
     console.log(`fetched ${sym}: ${bars.length} bars ${bars[0].date}..${bars[bars.length - 1].date}`);
@@ -101,10 +173,10 @@ async function doFetch() {
   }
 }
 
-function loadBars() {
+function loadBars(dir = DATA_DIR, universe = UNIVERSE) {
   const out = new Map();
-  for (const sym of UNIVERSE) {
-    const p = resolve(DATA_DIR, `${sym}.json`);
+  for (const sym of universe) {
+    const p = resolve(dir, `${sym}.json`);
     if (!existsSync(p)) return null;
     const { bars } = JSON.parse(readFileSync(p, 'utf8'));
     out.set(sym, bars);
@@ -322,6 +394,38 @@ function runControls(barsBySym, sentimentBySym) {
   console.log(`ARM3 non-overlap: violations=${overlapViolations} ${arm3ok ? 'OK' : 'FAILED'}`);
   if (!arm3ok) failures.push('ARM3');
 
+  // ARM4 — the staleness gate trips on a planted stale cache FILE and stays
+  // green on a fresh one. TRA-5137: ARM0–ARM3 were all green over a cache that
+  // ended 11 days earlier — the suite could not go red for staleness at all.
+  // The plant goes through writeFileSync -> loadBars, the same path the real
+  // cache takes, not a hand-built map.
+  const today = todayISO();
+  const arm4tmp = mkdtempSync(join(tmpdir(), 'tra4386-arm4-'));
+  let arm4StaleMap = null;
+  try {
+    const spyBars = barsBySym.get('SPY');
+    const cut = new Date(`${today}T00:00:00Z`);
+    cut.setUTCDate(cut.getUTCDate() - 42);
+    const cutISO = cut.toISOString().slice(0, 10);
+    const truncated = spyBars.filter((b) => b.date <= cutISO);
+    const staleBars = truncated.length ? truncated : [{ ...spyBars[0], date: cutISO }];
+    writeFileSync(join(arm4tmp, 'SPY.json'), JSON.stringify({ symbol: 'SPY', plantedBy: 'ARM4', bars: staleBars }));
+    arm4StaleMap = loadBars(arm4tmp, ['SPY']);
+    const freshBars = [...spyBars.slice(0, -1), { ...spyBars[spyBars.length - 1], date: prevSessionISO(today) }];
+    writeFileSync(join(arm4tmp, 'SPY.json'), JSON.stringify({ symbol: 'SPY', plantedBy: 'ARM4', bars: freshBars }));
+    const arm4FreshMap = loadBars(arm4tmp, ['SPY']);
+    const sStale = arm4StaleMap && cacheStaleness(arm4StaleMap, today);
+    const sFresh = arm4FreshMap && cacheStaleness(arm4FreshMap, today);
+    const arm4ok = !!sStale && !!sFresh && sStale.stale === true && sFresh.stale === false;
+    console.log(
+      `ARM4 staleness-gate: planted last=${sStale?.maxLast} (${sStale?.behindSessions} sessions behind) => stale=${sStale?.stale} (expect true) · ` +
+      `planted last=${sFresh?.maxLast} => stale=${sFresh?.stale} (expect false) ${arm4ok ? 'OK' : 'FAILED'}`,
+    );
+    if (!arm4ok) failures.push('ARM4');
+  } finally {
+    rmSync(arm4tmp, { recursive: true, force: true });
+  }
+
   // Mutations — each control must be demonstrably able to fail.
   const mutations = [];
   const m1 = grade(events.supertrend_flip, barsBySym, { ignoreDirection: true });
@@ -337,6 +441,10 @@ function runControls(barsBySym, sentimentBySym) {
     for (const idxs of bySym.values()) { idxs.sort((a, b) => a - b); for (let j = 1; j < idxs.length; j++) if (idxs[j] - idxs[j - 1] < HORIZON) v++; }
   }
   mutations.push({ name: 'allow-overlap => ARM3 fails', fails: v > 0 });
+  mutations.push({
+    name: 'disable-staleness-threshold => ARM4 fails',
+    fails: arm4StaleMap != null && cacheStaleness(arm4StaleMap, today, Infinity).stale !== true,
+  });
   for (const m of mutations) {
     console.log(`MUTATION ${m.name}: ${m.fails ? 'CAUGHT (control goes red)' : 'NOT CAUGHT — control is decorative'}`);
     if (!m.fails) failures.push(`mutation:${m.name}`);
@@ -348,7 +456,7 @@ function runControls(barsBySym, sentimentBySym) {
 
 const args = process.argv.slice(2);
 if (args.includes('--fetch')) {
-  await doFetch();
+  await doFetch({ noRefetch: args.includes('--no-refetch') });
   process.exit(0);
 }
 
@@ -358,14 +466,35 @@ if (!barsBySym) {
   process.exit(3);
 }
 const spans = [...barsBySym.values()].map((b) => b.length);
-console.log(`universe: ${barsBySym.size} symbols · bars/symbol min=${Math.min(...spans)} max=${Math.max(...spans)}`);
+const staleness = cacheStaleness(barsBySym);
+console.log(
+  `universe: ${barsBySym.size} symbols · bars/symbol min=${Math.min(...spans)} max=${Math.max(...spans)} · ` +
+  `window: ${staleness.minFirst}..${staleness.maxLast} · symbols behind newest last bar: ${staleness.symbolsBehindNewest}`,
+);
 const sentimentBySym = loadSentiment();
 
 if (args.includes('--controls')) {
+  if (staleness.stale) {
+    console.warn(
+      `note: cache window ends ${staleness.maxLast} (${staleness.behindSessions} sessions behind today ${todayISO()}) — ` +
+      'the grade path reads BLIND on this cache; controls still run (they grade the harness, not the window).',
+    );
+  }
   const failures = runControls(barsBySym, sentimentBySym);
   if (failures.length) { console.error(`BLIND: controls failed: ${failures.join(', ')}`); process.exit(3); }
   console.log('all controls OK, all mutations caught');
   process.exit(0);
+}
+
+// TRA-5137: a stale window must be re-fetched, never graded silently — the grade
+// is board-facing evidence about "now", and a months-old window reproduces its
+// old numbers with full confidence. BLIND, not FAIL: the feeders were not measured.
+if (staleness.stale) {
+  console.error(
+    `BLIND: bar cache stale — newest bar ${staleness.maxLast} is ${staleness.behindSessions} completed sessions ` +
+    `behind today ${todayISO()} (allowance ${STALE_SESSIONS}). Run --fetch (it refreshes stale symbols by default).`,
+  );
+  process.exit(3);
 }
 
 // Controls run inline ahead of the grade — a grade off a broken harness is BLIND, not a verdict.
@@ -386,5 +515,5 @@ for (const [name, list] of Object.entries(events)) {
 }
 const anyPass = Object.values(results).some((r) => r.verdict === 'PASS');
 console.log(`\nPhase 1 verdict: ${anyPass ? 'AT LEAST ONE FEEDER PASSES — Phase 2 eligible (board card, never a position)' : 'NO FEEDER PASSES'}`);
-writeFileSync(resolve(HERE, 'tra4386-phase1-results.json'), JSON.stringify({ gradedAt: new Date().toISOString(), tThreshold: T_THRESHOLD, nPower: N_POWER, results }, null, 2));
+writeFileSync(resolve(HERE, 'tra4386-phase1-results.json'), JSON.stringify({ gradedAt: new Date().toISOString(), window: `${staleness.minFirst}..${staleness.maxLast}`, tThreshold: T_THRESHOLD, nPower: N_POWER, results }, null, 2));
 process.exit(0);
