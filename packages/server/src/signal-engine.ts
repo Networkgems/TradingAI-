@@ -507,10 +507,14 @@ import {
   recordEquityCandidate,
   recordEquityEntryRejected,
   recordEquityEntryAdmitted,
+  recordEquityDailyTradesGate,
   recordEquitySymbolEvaluated,
   recordEquitySymbolSkipped,
   type EquityEntryPassGateReason,
 } from './equity-entry-funnel.js';
+// TRA-5202 — the daily equity cap counts EQUITY rows only; the options sleeves
+// push into the same `dailySignals` list and must not consume this budget.
+import { splitDailySignalsForEquityGate } from './daily-trades-gate.js';
 import { etDateString } from './scheduler.js';
 // TRA-4478 — the fail-closed leg of the exchange calendar. An out-of-coverage
 // ET date refuses new EQUITY/OPTIONS entries; exits are never gated by it, and
@@ -21400,14 +21404,28 @@ export class SignalEngine {
     // automatic at midnight ET without a separate day-roll counter).
     // Checked here — before the broker order — so no Tradier OTOCO is
     // submitted when the cap has already been reached.
+    //
+    // TRA-5202 — EQUITY rows only. `dailySignals` is pooled: the options
+    // sleeves push `relative_value`/`otm_mispricing` rows into it too —
+    // including rows for option signals that were REFUSED and never booked a
+    // trade — and on 2026-10-05 those rows consumed this cap on a 1-trade day
+    // (8 of 14 demo candidates rejected here). The options sleeves have their
+    // own cap (`optionsDailyTradesLimit`); this one charges only its own sleeve.
     const equityDayKey = etDateString(new Date());
-    const equityTradesOpenedToday = this.dailySignals.filter(
-      s => etDateString(new Date(s.firedAt)) === equityDayKey,
-    ).length;
+    const dailyTradesSplit = splitDailySignalsForEquityGate(this.dailySignals, equityDayKey);
+    const equityTradesOpenedToday = dailyTradesSplit.equityCount;
     if (equityTradesOpenedToday >= this.equityDailyTradesLimit) {
       signal.liveSkipReason = `daily equity limit reached (${equityTradesOpenedToday}/${this.equityDailyTradesLimit})`;
       this.pushRecentSignal(signal);
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'daily_trades_limit');
+      // TRA-5202 ask 3 — publish the limit and BOTH counts beside the reject, so
+      // "budget exhausted by my own sleeve" and "budget exhausted by a sibling
+      // sleeve" stop reading the same on /api/health/equity-entry-funnel.
+      recordEquityDailyTradesGate(funnelMode, funnelEngineId, {
+        limit: this.equityDailyTradesLimit,
+        equityCount: dailyTradesSplit.equityCount,
+        optionSleeveCount: dailyTradesSplit.optionSleeveCount,
+      });
       return null;
     }
 

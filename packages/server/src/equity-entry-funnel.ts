@@ -91,6 +91,7 @@ import {
   ledgerRecordCandidate,
   ledgerRecordRejected,
   ledgerRecordAdmitted,
+  ledgerRecordDailyTradesGate,
 } from './equity-entry-funnel-ledger.js';
 
 /** Which book the funnel row describes. Demo and live are NEVER pooled. */
@@ -239,6 +240,28 @@ export type EquityEntryFunnelStatus =
 
 type Counter<K extends string> = Partial<Record<K, number>>;
 
+/**
+ * TRA-5202 — what the TRA-554 daily equity trades gate SAW when it last tripped.
+ *
+ * `daily_trades_limit: 8` on its own cannot say whether the budget was spent by
+ * the equity sleeve itself or consumed by a sibling sleeve's rows (on 2026-10-05
+ * the options sleeve's `dailySignals` rows gated the demo equity sleeve off on a
+ * 1-trade day, and the two states read identically on this surface). This detail
+ * publishes the cap and BOTH counts, so the discrimination no longer needs a
+ * source dive. After the TRA-5202 fix `optionSleeveCount` is informational — the
+ * gate counts `equityCount` only — and `optionSleeveCount >= limit` alongside
+ * `equityCount < limit` is exactly the cross-sleeve exhaustion that would have
+ * been invisible before.
+ */
+export interface EquityDailyTradesGateDetail {
+  /** The equity cap in force when the gate tripped (`activeEquityDailyLimit`). */
+  limit: number;
+  /** Today's EQUITY-sleeve `dailySignals` rows — the count the gate compares to `limit`. */
+  equityCount: number;
+  /** Today's options-sleeve rows (`relative_value`/`otm_mispricing`) — NOT counted. */
+  optionSleeveCount: number;
+}
+
 interface ModeLedger {
   passCount: number;
   gatedPassCount: number;
@@ -296,6 +319,9 @@ interface ModeLedger {
    * `iteratedPassCount` for the rate. Bounded by the universe size (≤21 under swing mode).
    */
   cumSymbolsSkippedByName: Partial<Record<EquitySymbolSkipReason, Record<string, number>>>;
+
+  /** TRA-5202 — what the daily gate saw at its most recent trip; null until one. */
+  lastDailyTradesGate: (EquityDailyTradesGateDetail & { at: number }) | null;
 }
 
 function emptyLedger(): ModeLedger {
@@ -324,6 +350,7 @@ function emptyLedger(): ModeLedger {
     cumSymbolsEvaluated: 0,
     cumSymbolsSkipped: {},
     cumSymbolsSkippedByName: {},
+    lastDailyTradesGate: null,
   };
 }
 
@@ -623,6 +650,22 @@ export function recordEquityEntryRejected(mode: EquityEntryMode, engineId: strin
   }
 }
 
+/**
+ * TRA-5202 — the TRA-554 daily gate tripped; publish what it saw. Called at the
+ * same chokepoint as the `daily_trades_limit` reject, so the pair can never
+ * disagree about whether the gate fired. Observe-only, like every hook here.
+ */
+export function recordEquityDailyTradesGate(
+  mode: EquityEntryMode,
+  engineId: string,
+  detail: EquityDailyTradesGateDetail,
+  at: number = Date.now(),
+): void {
+  const slot = slotFor(mode, engineId);
+  slot.led.lastDailyTradesGate = { ...detail, at };
+  ledgerRecordDailyTradesGate(mode, engineId, detail, at);
+}
+
 /** A candidate reached `openPosition` / the broker and a position exists. */
 export function recordEquityEntryAdmitted(mode: EquityEntryMode, engineId: string, at: number = Date.now()): void {
   const slot = slotFor(mode, engineId);
@@ -711,6 +754,18 @@ export interface EquityEntryFunnelView {
      */
     symbolsSkippedByName: Partial<Record<EquitySymbolSkipReason, Record<string, number>>> | null;
   };
+  /**
+   * TRA-5202 — the daily gate's most recent trip since boot: the cap, the equity
+   * count it compared, and the options-sleeve rows present (and NOT counted).
+   * `null` = the gate has not tripped this boot — a reading of "no trip", never
+   * "no instrument". Read beside `rejectedByReason.daily_trades_limit`.
+   */
+  dailyTradesGate: {
+    limit: number;
+    equityCount: number;
+    optionSleeveCount: number;
+    at: string;
+  } | null;
 }
 
 function viewOf(led: ModeLedger): EquityEntryFunnelView {
@@ -756,6 +811,14 @@ function viewOf(led: ModeLedger): EquityEntryFunnelView {
       symbolsSkippedByReason: swept ? led.cumSymbolsSkipped : null,
       symbolsSkippedByName: swept ? led.cumSymbolsSkippedByName : null,
     },
+    dailyTradesGate: led.lastDailyTradesGate === null
+      ? null
+      : {
+          limit: led.lastDailyTradesGate.limit,
+          equityCount: led.lastDailyTradesGate.equityCount,
+          optionSleeveCount: led.lastDailyTradesGate.optionSleeveCount,
+          at: new Date(led.lastDailyTradesGate.at).toISOString(),
+        },
   };
 }
 

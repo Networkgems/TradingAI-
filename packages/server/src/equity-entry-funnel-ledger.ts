@@ -73,6 +73,7 @@ import type {
   EquityEntryRejectReason,
   EquityEntrySource,
   EquitySymbolSkipReason,
+  EquityDailyTradesGateDetail,
 } from './equity-entry-funnel.js';
 
 const log = logger.child({ module: 'equity-entry-funnel-ledger' });
@@ -161,6 +162,16 @@ export interface EquityFunnelDayRecord {
   /** Stage 5 — reached a book. */
   admitted: number;
 
+  /**
+   * TRA-5202 — what the TRA-554 daily gate saw at its LAST trip this day, or
+   * null/absent when it never tripped. `rejectedByReason.daily_trades_limit`
+   * carries the trip COUNT; this carries the cap and the per-sleeve split, so a
+   * post-hoc review can tell "budget spent by the equity sleeve" from "budget
+   * consumed by a sibling sleeve's rows" without reading source. Optional so
+   * pre-TRA-5202 lines hydrate as null, never as a fabricated zero.
+   */
+  dailyTradesGate?: (EquityDailyTradesGateDetail & { at: number }) | null;
+
   firstAt: number;
   lastAt: number;
 }
@@ -182,6 +193,8 @@ interface DayAgg {
   candidatesBySource: Tally<EquityEntrySource>;
   rejectedByReason: Tally<EquityEntryRejectReason>;
   admitted: number;
+  /** TRA-5202 — last daily-gate trip this day; null when it never tripped. */
+  dailyTradesGate: (EquityDailyTradesGateDetail & { at: number }) | null;
   firstAt: number;
   lastAt: number;
   /** Dirty/flush bookkeeping — never persisted. */
@@ -241,6 +254,7 @@ function emptyAgg(etDay: string, mode: EquityEntryMode, engineId: string, now: n
     candidatesBySource: {},
     rejectedByReason: {},
     admitted: 0,
+    dailyTradesGate: null,
     firstAt: now,
     lastAt: now,
     dirty: false,
@@ -301,6 +315,7 @@ function toRecord(agg: DayAgg, ts: number): EquityFunnelDayRecord {
     candidatesBySource: { ...agg.candidatesBySource },
     rejectedByReason: { ...agg.rejectedByReason },
     admitted: agg.admitted,
+    dailyTradesGate: agg.dailyTradesGate === null ? null : { ...agg.dailyTradesGate },
     firstAt: agg.firstAt,
     lastAt: agg.lastAt,
   };
@@ -437,6 +452,22 @@ export function ledgerRecordRejected(
   flush(agg, now, false);
 }
 
+/**
+ * TRA-5202 — the TRA-554 daily gate tripped; persist what it saw (last-wins for
+ * the day; the trip COUNT lives in `rejectedByReason.daily_trades_limit`).
+ */
+export function ledgerRecordDailyTradesGate(
+  mode: EquityEntryMode,
+  engineId: string,
+  detail: EquityDailyTradesGateDetail,
+  now: number = Date.now(),
+): void {
+  const agg = aggFor(etDayOf(now), mode, engineId, now);
+  agg.dailyTradesGate = { ...detail, at: now };
+  touch(agg, now);
+  flush(agg, now, false);
+}
+
 /** One candidate reached a book. Forced to disk: admits are rare and load-bearing. */
 export function ledgerRecordAdmitted(
   mode: EquityEntryMode,
@@ -478,6 +509,25 @@ function tally<K extends string>(v: unknown): Tally<K> {
     if (n > 0) out[k] = n;
   }
   return out as Tally<K>;
+}
+
+/**
+ * TRA-5202 — coerce a persisted daily-gate trip. Any missing/non-finite member
+ * yields `null` (no trip recorded), never a fabricated zero: a `limit: 0` that
+ * was never measured would read as "cap set to zero", which is a verdict.
+ */
+function coerceDailyTradesGate(v: unknown): (EquityDailyTradesGateDetail & { at: number }) | null {
+  if (v == null || typeof v !== 'object' || Array.isArray(v)) return null;
+  const o = v as Record<string, unknown>;
+  const limit = o.limit;
+  const equityCount = o.equityCount;
+  const optionSleeveCount = o.optionSleeveCount;
+  const at = o.at;
+  if (typeof limit !== 'number' || !Number.isFinite(limit)) return null;
+  if (typeof equityCount !== 'number' || !Number.isFinite(equityCount)) return null;
+  if (typeof optionSleeveCount !== 'number' || !Number.isFinite(optionSleeveCount)) return null;
+  if (typeof at !== 'number' || !Number.isFinite(at)) return null;
+  return { limit, equityCount, optionSleeveCount, at };
 }
 
 /**
@@ -541,6 +591,7 @@ export function hydrateEquityEntryFunnelFromDisk(
     agg.candidatesBySource = tally(rec.candidatesBySource);
     agg.rejectedByReason = tally(rec.rejectedByReason);
     agg.admitted = num(rec.admitted);
+    agg.dailyTradesGate = coerceDailyTradesGate(rec.dailyTradesGate); // TRA-5202 — absent on old lines ⇒ null
     agg.firstAt = num(rec.firstAt) || rec.ts;
     agg.lastAt = num(rec.lastAt) || rec.ts;
     agg.dirty = false;
@@ -628,6 +679,13 @@ export interface EquityFunnelDaySummary {
   zeroedCount: number | null;
   /** The biggest named bucket inside that stage, or `null` when the stage has none. */
   zeroedDetail: EquityFunnelZeroDetail | null;
+  /**
+   * TRA-5202 — the newest daily-gate trip recorded for this (day, mode), with the
+   * cap and the per-sleeve split of what the gate counted. `null` = the gate never
+   * tripped (or the day predates TRA-5202 — absent is UNRECORDED, not zero). Read
+   * beside `rejectedByReason.daily_trades_limit`, which carries the trip count.
+   */
+  dailyTradesGate: (EquityDailyTradesGateDetail & { at: number }) | null;
   /** Per-engine rows, so one dead engine on an admitting day is still visible. */
   byEngine: EquityFunnelEngineSummary[];
   firstAt: number;
@@ -754,6 +812,7 @@ export function summarizeEquityEntryFunnelLedger(): EquityFunnelLedgerSummary {
         zeroedAtStage: null,
         zeroedCount: null,
         zeroedDetail: null,
+        dailyTradesGate: null,
         byEngine: [],
         firstAt: a.firstAt,
         lastAt: a.lastAt,
@@ -772,6 +831,13 @@ export function summarizeEquityEntryFunnelLedger(): EquityFunnelLedgerSummary {
     addTally(d.candidatesBySource, a.candidatesBySource);
     addTally(d.rejectedByReason, a.rejectedByReason);
     d.admitted += a.admitted;
+    // TRA-5202 — newest trip wins across engines; a detail is a reading of ONE
+    // gate evaluation, so summing per-sleeve counts across engines would
+    // fabricate a population no gate ever saw.
+    if (a.dailyTradesGate !== null
+      && (d.dailyTradesGate === null || a.dailyTradesGate.at > d.dailyTradesGate.at)) {
+      d.dailyTradesGate = { ...a.dailyTradesGate };
+    }
     if (a.firstAt < d.firstAt) d.firstAt = a.firstAt;
     if (a.lastAt > d.lastAt) d.lastAt = a.lastAt;
     d.byEngine.push({
