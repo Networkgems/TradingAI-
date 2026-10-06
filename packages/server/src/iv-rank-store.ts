@@ -1,5 +1,6 @@
 import { readFile, writeFile, mkdir, rename, rm } from 'fs/promises';
 import { existsSync } from 'fs';
+import { randomUUID } from 'crypto';
 import { dirname, join } from 'path';
 import type { OptionChainRow } from '@trading-app/engine';
 import { logger } from './observability/index.js';
@@ -38,6 +39,7 @@ export function setIvStoreFileForTests(path: string | null): void {
   loadFailed = false;
   persistRefusals = 0;
   corruptFileRenamedTo = null;
+  persistChain = Promise.resolve();
 }
 function storeFile(): string {
   return storeFileOverride ?? defaultStoreFile();
@@ -211,7 +213,23 @@ async function ensureLoaded(): Promise<Map<string, IvSample[]>> {
   return cache;
 }
 
-async function persist(): Promise<void> {
+// TRA-5240 — persists are SERIALISED through this chain. The tmp suffix used to
+// be `pid-ms` only, and with one process `Date.now()` was the sole source of
+// uniqueness: two persists entering in the same millisecond computed the SAME
+// tmp path, the first rename consumed it, and the second rename ENOENT'd —
+// 298/1407 writes (21.2%) on bqb1. Each queued write reads `cache` at its own
+// turn and the payload is the whole snapshot, so serialising loses nothing.
+let persistChain: Promise<void> = Promise.resolve();
+
+function persist(): Promise<void> {
+  const run = persistChain.then(persistOnce);
+  // A failed persist rejects ITS caller (counted in persistOnce) without
+  // poisoning the chain for the next one.
+  persistChain = run.catch(() => {});
+  return run;
+}
+
+async function persistOnce(): Promise<void> {
   if (!cache) return;
   const path = storeFile();
 
@@ -250,7 +268,9 @@ async function persist(): Promise<void> {
   // `recordDailyIv` call, so a kill mid-write (deploy SIGTERM, or the memory
   // watchdog's pm2 self-restart, which writes no deploy record at all) left a
   // truncated file the next boot could not parse.
-  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  // TRA-5240 — the randomUUID suffix keeps the tmp path collision-proof even
+  // if a second entry path into persist() ever bypasses the chain above.
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}-${randomUUID()}`;
   try {
     await writeFile(tmp, JSON.stringify(payload), 'utf-8');
     await rename(tmp, path);

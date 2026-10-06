@@ -8,12 +8,19 @@ import { join } from 'path';
 // one-shot throw from `rename` simulates a kill between the tmp write and the
 // swap. Passthrough when disarmed, so every other suite in this file runs
 // against the real fs.
-const fsFault = vi.hoisted(() => ({ failWriteOnce: false, failRenameOnce: false }));
+const fsFault = vi.hoisted(() => ({
+  failWriteOnce: false,
+  failRenameOnce: false,
+  // TRA-5240 — when non-null, every writeFile target path is recorded so the
+  // tmp-path-uniqueness suite can assert the pid+ms collision cannot recur.
+  tmpPathsSeen: null as string[] | null,
+}));
 vi.mock('fs/promises', async (importOriginal) => {
   const real = await importOriginal<typeof import('fs/promises')>();
   return {
     ...real,
     writeFile: async (...args: Parameters<typeof real.writeFile>) => {
+      if (fsFault.tmpPathsSeen) fsFault.tmpPathsSeen.push(String(args[0]));
       if (fsFault.failWriteOnce) {
         fsFault.failWriteOnce = false;
         throw new Error('TRA-5172 simulated kill mid-write');
@@ -481,5 +488,71 @@ describe('atomic persist + fail-closed load (TRA-5172)', () => {
     view = readIvStoreProvenanceSync();
     expect(view.persistRefusals).toBe(2);
     expect(readFileSync(view.corruptFileRenamedTo!, 'utf-8')).toBe(garbage);
+  });
+});
+
+// TRA-5240 — the tmp path was `pid+ms`, and with one process `Date.now()` was
+// the only uniqueness: two persists entering in the same millisecond computed
+// the SAME tmp path (A writes, B rewrites, A renames it away, B's rename
+// ENOENTs) — 298/1407 writes (21.2%) measured live on bqb1. Persists are now
+// serialised through a single-flight chain and the tmp suffix carries a
+// per-call randomUUID.
+describe('concurrent persists do not collide (TRA-5240)', () => {
+  let dir: string;
+  let path: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'iv-5240-'));
+    path = join(dir, 'iv-history.json');
+    setIvStoreFileForTests(path);
+    fsFault.failWriteOnce = false;
+    fsFault.failRenameOnce = false;
+    fsFault.tmpPathsSeen = [];
+  });
+  afterEach(() => {
+    fsFault.tmpPathsSeen = null;
+    setIvStoreFileForTests(null);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('25 same-instant persists: zero errors, every write lands, no tmp litter', async () => {
+    await initIvRankStore();
+    const day = Date.parse('2026-10-06T15:00:00Z');
+    await Promise.all(
+      Array.from({ length: 25 }, (_, i) => recordDailyIv(`SYM${i}`, 0.2 + i * 0.01, day)),
+    );
+    const view = readIvStoreProvenanceSync();
+    // The incident read: persistErrors 298 of persistCount+persistErrors 1705.
+    expect(view.persistErrors).toBe(0);
+    expect(view.lastPersistError).toBeNull();
+    expect(view.persistCount).toBe(25);
+    expect(readdirSync(dir)).toEqual(['iv-history.json']); // no .tmp-* litter
+    const parsed = JSON.parse(readFileSync(path, 'utf-8')) as { symbols: Record<string, unknown[]> };
+    expect(Object.keys(parsed.symbols)).toHaveLength(25); // the final snapshot carries every sample
+  });
+
+  it('every tmp path is unique and UUID-suffixed — the pid+ms collision cannot recur', async () => {
+    await initIvRankStore();
+    const day = Date.parse('2026-10-06T15:00:00Z');
+    await Promise.all(
+      Array.from({ length: 10 }, (_, i) => recordDailyIv(`SYM${i}`, 0.2 + i * 0.01, day)),
+    );
+    const tmps = fsFault.tmpPathsSeen!;
+    expect(tmps).toHaveLength(10);
+    expect(new Set(tmps).size).toBe(10); // pid+ms alone would collide same-ms
+    for (const t of tmps) {
+      expect(t).toMatch(/\.tmp-\d+-\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    }
+  });
+
+  it('counters stay cumulative: a later success neither resets persistErrors nor clears lastPersistError', async () => {
+    await recordDailyIv('AAA', 0.3);
+    fsFault.failWriteOnce = true;
+    await expect(recordDailyIv('AAA', 0.9, Date.now() + DAY)).rejects.toThrow('simulated kill mid-write');
+    // A failed persist must not poison the chain for the next caller.
+    await recordDailyIv('AAA', 0.5, Date.now() + 2 * DAY);
+    const view = readIvStoreProvenanceSync();
+    expect(view.persistCount).toBe(2);
+    expect(view.persistErrors).toBe(1); // cumulative — the post-deploy acceptance discriminator
+    expect(view.lastPersistError).toContain('simulated kill mid-write');
   });
 });
