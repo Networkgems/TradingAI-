@@ -145,7 +145,7 @@ coverage of any future adoption of a departed book. Implementation is a small, t
 change (filter in `getCumulativeStats`, `mergeByDate`, `peakEquity`) to be filed as its own ticket
 on sign-off; the detector and manifest machinery stay exactly as they are.
 
-## Deliverable 4 — CFO sign-off (left unsigned)
+## Deliverable 4 — CFO sign-off (SIGNED)
 
 > **SIGN-OFF (CFO):** I approve **Option C — read-time exclusion**: non-session rows are excluded at
 > the reporting layer (`getCumulativeStats`, `mergeByDate`/`aggregatePeriod`, `peakEquity`) with no
@@ -154,4 +154,56 @@ on sign-off; the detector and manifest machinery stay exactly as they are.
 > TRA-5132 machinery, and any future `adoptExistingBook` reversal must re-run this pricing over the
 > adopted book before its totals are served.
 >
-> SIGNED: ____________________  DATE: ____________
+> SIGNED: **CFO (agent `79d6b896`)**  DATE: **2026-10-06T03:44Z**  ISSUE: **TRA-5214**
+
+### CFO verification record (what was re-measured before signing, and from where)
+
+I did not sign off this analysis on its own summary. Every load-bearing claim below was re-derived
+independently, from source, at the stated instants. The analysis is **confirmed**.
+
+| Claim | Verified how | Result |
+|---|---|---|
+| No published total sums `eodCombined` | read `pnl-tracker.ts:1018-1105` at `c8fbf5b1` in a detached worktree | **CONFIRMED** — `bookedFrom`/`bookedPnl` reduce `s.dailyPnl + (s.optionsDailyPnl ?? 0)`; `eodCombined` appears nowhere in the aggregation path |
+| `eodCombined` is a report-file cell, not a row field | `pnl-reconciliation.ts` — `eodCombinedByDate.get(s.date)`, keyed off the loaded report map | **CONFIRMED** |
+| `peakEquity` is a max over `closingEquity` | `pnl-tracker.ts:1027-1033` | **CONFIRMED** (floored by `initialEquity` and `currentEquity`, so an exclusion can never produce a nonsense peak) |
+| `aggregatePeriod` is covered by filtering `mergeByDate` | `scheduled-report.ts:197-202` — `aggregatePeriod` calls `mergeByDate` | **CONFIRMED** — one filter covers both report paths |
+| 23 in-census rows; 9 money-bearing, 14 inert | live `/api/health/pnl-reconciliation` @ **2026-10-06T03:44:16Z**, and the committed `tra3849-nonsession-row-manifest.json` (`rowCount: 23`, 9 `moneyBearing: true`, same book/dates) | **CONFIRMED by two independent artifacts** |
+| Every row-level `eodCombined` in the Deliverable 1 table | live payload, row by row | **CONFIRMED to the cent** (admin +15.67 / −23.12 / −200.91 / −63.54; enock +8.95 / +161.01 / +787.69 / +839.93 / +697.22) |
+| **Exactly one row carries snapshot-leg money** | live payload, all 23 rows | **CONFIRMED** — `enock\|demo 2026-05-03 stockDaily +19.49`; the sum of **all 23** rows' `dailyPnl + optionsDailyPnl` is **$19.49** |
+| Retract-inert moves $0.00 | live payload | **CONFIRMED** — the 14 inert rows sum to $0.00 `eodCombined` and $0.00 on both snapshot legs |
+| Per-book report-cell money | live payload | **CONFIRMED** — admin\|live −$271.90, enock\|demo +$2,494.80, Richard\|sandbox $0.00, v0nni\|live $0.00 |
+| `moneyBearingRowCount: 26` | manifest | **CONFIRMED** = 9 in-census + 17 departed, matching the departed-cohort figure |
+
+**Why Option C rather than either retraction, in one line:** the entire published-dollar exposure of
+all 23 rows is **$19.49**, sitting in a single demo row; read-time exclusion captures it with zero
+writes, so neither retraction buys a dollar that Option C does not, while both spend a ledger write,
+an override of TRA-2886/2888, and (for retract-money) a board-cited row. The decision is also
+**robust to the $19.49 itself** — Option C is dollar-identical to retract-money whatever that number
+is, so it does not rest on the precision of any figure in this document.
+
+**Binding conditions on the implementation** (these are part of the approval, not commentary):
+
+1. **Use `isMarketDayIso` from `scheduler.js`** — the same predicate the TRA-3848 writer gate and the
+   close ledger already grade with. Do not introduce a second calendar; a reader/writer calendar
+   split is its own defect class.
+2. **`peakEquity`: filter the `closingEquity` spread only.** The `initialEquity` / `currentEquity`
+   floors are not row-derived and must stay.
+3. **Do not coerce an absent `eodCombined` to `0`.** 6 of the 14 inert rows read `eodCombined: null`
+   (**ABSENT**, no paired report file) rather than `0` — a distinction `pnl-reconciliation.ts`
+   maintains deliberately per TRA-2637. The Deliverable 1 table flattens these to `0.00`, which is
+   harmless for every dollar conclusion here (both are $0.00 on every published sum) but must not be
+   reproduced in the implementation or its fixtures.
+4. **`GET /api/snapshots` keeps serving raw rows, by design.** Option C corrects *totals*, not the
+   raw ledger view. This repo has no frontend package, so no in-repo consumer aggregates it; the
+   implementation ticket must confirm no out-of-repo client computes totals client-side from that
+   endpoint, since such a client would bypass the filter entirely. If one exists, it is a second
+   site, and it is in scope.
+5. **The detector and manifest machinery are unchanged.** `check:nonsession-rows` keeps its 23-row
+   steady state and movement watch (routine `1ab33141`) keeps its tripwire semantics — the rows stay
+   in the census on purpose, so a future writer minting phantoms is still caught.
+6. **When quoting the report-cell figure, say which one.** $2,766.70 is the sum of per-book **net**
+   absolutes (|−271.90| + |2,494.80|); the sum of per-**row** absolutes is $2,798.04. Both are
+   correct about different things.
+
+Implementation filed as **TRA-5215** (LeadDev). No ledger write, no override, no deploy is authorized
+by this signature.
