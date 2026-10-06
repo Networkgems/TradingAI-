@@ -784,11 +784,16 @@ export function pickTrendCandles(
  * call only fires when both Yahoo paths are dark (TRA-586).
  */
 async function readIndexTrend(indexSymbol: string, proxySymbol: string): Promise<SpxTrendSource> {
-  const primary = await fetchDailyCandles(indexSymbol, TREND_FETCH_BARS).catch(() => [] as Candle[]);
+  // TRA-5092 — both Yahoo pulls pass `'none'`: this cascade labels each leg's
+  // PROVIDER in the regime read, so the in-feed Tradier fallback would report
+  // a Tradier serve as `provider: 'yahoo'`.
+  const primary = await fetchDailyCandles(indexSymbol, TREND_FETCH_BARS, 'crumb', 'none').catch(
+    () => [] as Candle[],
+  );
   if (primary.length >= MA_PERIOD) {
     return { candles: primary, symbol: indexSymbol, viaFallback: false, provider: 'yahoo' };
   }
-  const yahooFallback = await fetchDailyCandles(proxySymbol, TREND_FETCH_BARS).catch(
+  const yahooFallback = await fetchDailyCandles(proxySymbol, TREND_FETCH_BARS, 'crumb', 'none').catch(
     () => [] as Candle[],
   );
   if (yahooFallback.length >= MA_PERIOD) {

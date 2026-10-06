@@ -11,6 +11,10 @@ import {
   type IvRankCoverageCode,
   type IvRankCoverageReading,
 } from './iv-rank-store.js';
+// TRA-5176 — every recorded scan also folds into the DURABLE per-session
+// arrival ledger (the dated series TRA-5173 item 2 grades on). The in-memory
+// store below stays exactly what it was: a live snapshot.
+import { recordShortPremiumArrival } from './short-premium-arrival-ledger.js';
 
 // TRA-1292 — wire the defined-risk SHORT-PREMIUM engine (credit spreads / iron
 // condors) into the live pipeline, OBSERVE-ONLY and flag-gated
@@ -201,6 +205,9 @@ export function recordShortPremiumScan(
     if (oldest === undefined) break;
     store.delete(oldest);
   }
+  // TRA-5176 — fold into the durable session ledger. Synchronous enqueue (the
+  // ledger serialises its own I/O); cannot throw into the scan pass.
+  recordShortPremiumArrival(result, now);
 }
 
 /** Test seam — drop every recorded scan. */

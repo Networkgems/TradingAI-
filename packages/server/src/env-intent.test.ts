@@ -263,7 +263,9 @@ describe('overlay-backed levers (TRA-5014)', () => {
     // because it reads as a tidy stand-down rather than a missing instrument.
     const s = summarizeEnvIntent(armed);
     expect(s.ok).toBe(false);
-    expect(s.blindLevers).toEqual([ARM_FLAG]);
+    // Every overlay-backed lever goes blind together — TRA-5172 added the wheel
+    // IV filter (its home is the same demo-flags overlay).
+    expect(s.blindLevers).toEqual([ARM_FLAG, 'ENABLE_WHEEL_IV_ENTRY_FILTER']);
     expect(s.mismatches).toEqual([]);
     expect(s.levers.find((l) => l.key === ARM_FLAG)).toMatchObject({
       matches: null,
@@ -300,6 +302,62 @@ describe('overlay-backed levers (TRA-5014)', () => {
     const s = summarizeEnvIntent(RULED_PROD_ENV, hostileOverlay);
     expect(s.ok).toBe(true);
     expect(s.mismatches).toEqual([]);
+  });
+
+  // ── TRA-5172: the two IVR-gated flags ─────────────────────────────────────
+  // Both consumers are a HARD FAIL on an unknown ivRank (expectancy gate `drop`,
+  // wheel `passesRoutingGate` never routes), while the store reads depth 2 of 20
+  // on 82/82 scans — so arming either today suppresses 100% of credit structures
+  // with a drop rate that reads exactly like "the gate is working". The rows
+  // make that precondition machine-readable on /api/health/durability instead
+  // of living in a comment (the TRA-2206 warning was prose, and prose did not
+  // stop it).
+  describe('the IVR-gated flags are registered, intended off (TRA-5172 / TRA-5170 ruling)', () => {
+    const EXPECT_FLAG = 'ENABLE_OPTIONS_IDEA_EXPECTANCY_GATE';
+    const WHEEL_FLAG = 'ENABLE_WHEEL_IV_ENTRY_FILTER';
+
+    it('both rows grade matches:true on the ruled env — absent key, code default off', () => {
+      const s = graded(RULED_PROD_ENV);
+      expect(s.ok).toBe(true);
+      for (const key of [EXPECT_FLAG, WHEEL_FLAG]) {
+        expect(s.levers.find((l) => l.key === key), key).toMatchObject({
+          intended: 'off',
+          effective: 'off',
+          present: false,
+          matches: true,
+        });
+      }
+      // The provenance a /api/health/durability reader sees names the ruling
+      // and the measurable precondition, not just a ticket number.
+      for (const key of [EXPECT_FLAG, WHEEL_FLAG]) {
+        const p = PRODUCTION_ENV_INTENT.find((l) => l.key === key)!.provenance;
+        expect(p).toContain('TRA-5170');
+        expect(p).toContain('ivRankMeasured');
+      }
+    });
+
+    it('the expectancy gate found armed is a named mismatch, for every raw its consumer accepts', () => {
+      for (const raw of ['1', 'true', 'yes', 'on']) {
+        const s = graded({ ...RULED_PROD_ENV, [EXPECT_FLAG]: raw });
+        expect(s.ok).toBe(false);
+        expect(s.mismatches).toEqual([EXPECT_FLAG]);
+      }
+    });
+
+    it('the wheel IV filter is OVERLAY-backed: a daemon-free overlay arm is a named mismatch', () => {
+      // Its home is demo-flags.json (the TRA-2028 board-arm path), so the arm
+      // arrives through the overlay — exactly where this row must be reading.
+      const s = summarizeEnvIntent(RULED_PROD_ENV, { ...RULED_PROD_ENV, [ARM_FLAG]: '1', [WHEEL_FLAG]: '1' });
+      expect(s.ok).toBe(false);
+      expect(s.mismatches).toEqual([WHEEL_FLAG]);
+      expect(s.levers.find((l) => l.key === WHEEL_FLAG)).toMatchObject({
+        effective: 'on',
+        intended: 'off',
+        matches: false,
+        overlayBacked: true,
+        overlayVisible: true,
+      });
+    });
   });
 
   it('no manifest lever is writable through the demo-flags overlay allowlist', () => {

@@ -29,6 +29,7 @@ import type {
   ProfitFloorLadderStep,
   OptionProfitFloorPdtHold,
   OptionMarkProvenance,
+  OptionExecBidUnquotedReason,
 } from '@trading-app/shared';
 import {
   EXIT_CHANDELIER_ATR_MULT,
@@ -269,6 +270,7 @@ import { computeOptionStopBasisR } from './option-stop-basis-r.js';
 // TRA-4997 — the exit-side quote stamp + its measured cross. Pure; imports
 // nothing back from here.
 import { resolveExitQuote, exitQuoteCrossUsd } from './option-exit-quote.js';
+import { ExitSpreadShadow, type ExitSpreadShadowSnapshot } from './option-exit-spread-shadow.js';
 // TRA-3946 — the observe-only average-down shadow (phase 1, zero capital).
 import {
   resolveAverageDownConfig,
@@ -1664,6 +1666,28 @@ function stampProfitFloorPdtFire(opt: OptionPosition, mark: number): void {
  */
 function stampExitMarkProvenance(opt: OptionPosition, provenance: OptionMarkProvenance): void {
   if (opt.exitMarkProvenance === undefined) opt.exitMarkProvenance = provenance;
+}
+
+/**
+ * TRA-5162 — the reason-code half of the executable-bid stamp, shared by the
+ * profit-lock and take-profit-early fire sites (the TRA-4759 cross-link). Both
+ * sites compute `execBid = quoteAtFire !== null && quoteAtFire.bid > 0 ?
+ * quoteAtFire.bid : null`; this names WHICH disjunct nulled it, so a null on
+ * the journal row stops being indistinguishable from "never attempted" —
+ * 19/19 `profit_lock` forensics rows read bare-null when TRA-5162 was filed,
+ * and attributing the one stamped one took a raw-row read of `markProvenance`.
+ * Returns a spreadable fragment: empty when the bid was served (the stamp
+ * carries no reason beside a measured value), the discriminated reason
+ * otherwise. The `book_halt_flat` relabel site stamps its own
+ * `halt_flat_no_exit_tick` constant instead — that path evaluates no tick, so
+ * there is no `quoteAtFire` to discriminate on.
+ */
+function execBidUnquotedReasonFragment(
+  quoteAtFire: { bid: number; ask: number } | null,
+): { execBidUnquotedReason?: OptionExecBidUnquotedReason } {
+  if (quoteAtFire === null) return { execBidUnquotedReason: 'no_usable_quote_at_fire' };
+  if (!(quoteAtFire.bid > 0)) return { execBidUnquotedReason: 'bid_zero_at_fire' };
+  return {};
 }
 
 /**
@@ -6775,6 +6799,8 @@ export class PaperOptionsAccount {
    * "never reached" if you only publish one of the two numbers.
    */
   private escalatedExits = 0;
+  /** TRA-4944 — observe-only exit-quote spread census (no threshold, refuses nothing). */
+  private readonly exitSpreadShadow = new ExitSpreadShadow();
   /**
    * TRA-3217 — how many chandelier fires this process VETOED because the
    * breach was carried out of a suppressed window (PDT/swing hold or the live
@@ -12760,6 +12786,8 @@ export class PaperOptionsAccount {
                 captureFrac: tp.captureFrac,
                 markAtFire: mark,
                 execBidAtFire: execBid,
+                // TRA-5162 — a null bid carries its cause; a served bid carries nothing.
+                ...execBidUnquotedReasonFragment(quoteAtFire),
                 tp1Premium: opt.tp1Premium,
                 peakPremium: opt.peakPremium,
                 peakPremiumExec:
@@ -13030,6 +13058,11 @@ export class PaperOptionsAccount {
                   levelPremium: opt.premiumPaid + levelR * lock.R,
                   markAtFire: mark,
                   execBidAtFire: execBid,
+                  // TRA-5162 — a null bid carries its cause; a served bid carries
+                  // nothing. The NOK261016C00011000 2026-09-11 fire (4 stale-mark
+                  // ticks, `delta_backstop` mark, dark quote) would have stamped
+                  // `no_usable_quote_at_fire` here instead of a bare null.
+                  ...execBidUnquotedReasonFragment(quoteAtFire),
                   // TRA-4246 (AC2) — the decision's own operands, off the SAME
                   // `lock` the level came from. `peakPremiumAtFire` is the peak
                   // the rule CONSUMED, which under TRA-4285 is the executable
@@ -13204,6 +13237,15 @@ export class PaperOptionsAccount {
         // header on `stampExitMarkProvenance` for why this is one call site and
         // not the three the ticket enumerated.
         stampExitMarkProvenance(opt, markProvenance);
+        // TRA-4944 — SHADOW ONLY (ruled 2026-10-04): count the exit quote's
+        // relative spread at the seam; no level is named and nothing is refused.
+        this.exitSpreadShadow.observe({
+          sleeve: opt.engineOriginSleeve ?? opt.signalType ?? 'unknown',
+          mode: opt.mode ?? 'demo',
+          reason: exitJournalReason ?? exitKind,
+          quote: markProvenance.quoteAtFire,
+          markSource: markProvenance.markSource,
+        });
         if (waitAndHold) {
           // TRA-354 — stage the full exit at the trigger (SL or trailing)
           // price; engine submits a Tradier limit sell_to_close. The paper
@@ -14451,6 +14493,11 @@ export class PaperOptionsAccount {
    * on a live row until the daily-close window (one per row per ET day).
    * Since-boot; the live read is `liveStopActionability.byReason.daily_close_hold`.
    */
+  /** TRA-4944 — since-boot exit-spread shadow census (counts only, no OCC symbols; TRA-2163). */
+  getExitSpreadShadow(): ExitSpreadShadowSnapshot {
+    return this.exitSpreadShadow.snapshot();
+  }
+
   getSlDailyCloseHolds(): number {
     return this.slDailyCloseHolds;
   }
@@ -17710,6 +17757,9 @@ export class PaperOptionsAccount {
             levelPremium: opt.premiumPaid + levelR * lock.R,
             markAtFire: closePrice,
             execBidAtFire: null,
+            // TRA-5162 — and the null names its cause: this path evaluates no
+            // quoted exit-pass tick, so the basis can never be executable here.
+            execBidUnquotedReason: 'halt_flat_no_exit_tick',
             // TRA-4246 (AC2) — same operands, same decision. `execBidAtFire` is
             // null here by construction, so `peakPremiumAtFire` is the MID
             // high-water mark: this path evaluated the mid basis, and the stamp

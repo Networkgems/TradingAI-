@@ -129,6 +129,24 @@ services:
       mountPath: /data
       sizeGB: 1
     envVars:
+      # ================================================================
+      # TRA-5185 (2026-10-05, MEASURED): rows in this envVars block DO NOT
+      # REACH the bqb1 service. There is NO blueprint sync on
+      # srv-d7mb7rr7uimc73ev0chg and autoDeploy is OFF (deliberate pin,
+      # TRA-1653/TRA-1665) — a push to main neither deploys nor syncs any
+      # `value:` below. The three real apply paths are:
+      #   (1) boot self-heals (RENDER_RATIFIED_DEMO_DEFAULTS /
+      #       renderInfraDefaults in demo-flags.ts) for their mapped keys;
+      #   (2) API write + pinned redeploy (TRA-3718/TRA-3724):
+      #       PUT /v1/services/{id}/env-vars/{key}, re-GET, then
+      #       scripts/render-redeploy.mjs --commit=<sha already serving>;
+      #   (3) a demo-flags.json write via /api/admin/demo-flags
+      #       (layers OVER env and wins).
+      # All per-key NOTEs claiming a push-to-main apply path were corrected
+      # 2026-10-05; treat any reappearance as stale. Grade an arm off
+      # GET /api/health/env-drift -> selfHealed[] plus the flag's own
+      # health surface, never off a row in this file (TRA-2402 trap).
+      # ================================================================
       - key: AUTH_SECRET
         generateValue: true
       # TRA-404 — session-token max lifetime in hours. Leave unset for the
@@ -234,7 +252,9 @@ services:
       # contention from fewer arenas is negligible. Behaviour/rate/capital-neutral.
       # Rollback = clear this value + redeploy. The 57f99dd watchdog breadcrumb is
       # retained, so if a trip still occurs `lastTrip` will still record whether
-      # RSS is the driver (falsifiable). Ships via the git-push autoDeploy lever.
+      # RSS is the driver (falsifiable). Applied via the API env write + pinned
+      # redeploy (TRA-5185 NOTE at the top of envVars — there is no git-push
+      # autoDeploy lever on bqb1).
       - key: MALLOC_ARENA_MAX
         value: "2"
       # TRA-4629 — the TRA-1565 CRYPTO_TICK_RSS_RELIEF flag was retired here:
@@ -401,8 +421,8 @@ services:
       # render.yaml entry keeps render.yaml the source of truth. QuantTrader forward-
       # validates on TRA-1630 (D1 incremental expectancy + D2 lean-hit-rate) via
       # `GET /api/health/news-catalyst-signals` (`flagEnabled/chosenCount/leanCount`).
-      # NOTE: blueprint sync != autoDeploy on bqb1 (TRA-1289) — the push to main
-      # triggers the redeploy via autoDeploy; the self-heal delivers the value.
+      # NOTE (corrected, TRA-5185): no blueprint sync + autoDeploy OFF on bqb1 — a
+      # push to main neither deploys nor syncs this row; the self-heal delivers the value.
       # Revert = clear this value + remove the demo-defaults entry + redeploy.
       # Accepts 1/true/yes/on.
       - key: ENABLE_NEWS_CATALYST_WATCHLIST
@@ -423,8 +443,8 @@ services:
       # only ever makes the demo book open LESS — it can never create or up-size an
       # open. QuantTrader forward-validates via `GET /api/health/cost-aware-gate`
       # (armed / bars / admitted / rejected / avg modeled gross R either side).
-      # NOTE: blueprint sync != autoDeploy on bqb1 (TRA-1289) — the push to main
-      # triggers the redeploy via autoDeploy; the RENDER_RATIFIED_DEMO_DEFAULTS
+      # NOTE (corrected, TRA-5185): no blueprint sync + autoDeploy OFF on bqb1 — a
+      # push to main neither deploys nor syncs this row; the RENDER_RATIFIED_DEMO_DEFAULTS
       # self-heal (demo-flags.ts) delivers the value. Daemon-free DISARM: write
       # `{"ENABLE_OPTION_COST_AWARE_GATE":"0"}` via `/api/admin/demo-flags` — the file
       # layers OVER env and wins. Accepts 1/true/yes/on.
@@ -532,9 +552,9 @@ services:
       # sub-$300k opens and <=2 opens/name/day; invalidation = a name we'd WANT gets
       # rejected on the floors, or demo directional P&L doesn't beat the -$432.50
       # AMPG baseline -> re-tune ($300k->$250k and/or cap 2->3), no live push. Revert
-      # = clear this value + redeploy. NOTE: blueprint sync != autoDeploy on bqb1
-      # (TRA-1289) — a push to main triggers autoDeploy, which is what makes these
-      # vars take effect. Accepts 1/true/yes/on.
+      # = clear this value + redeploy. NOTE (corrected, TRA-5185): these rows never
+      # sync and a push does not deploy; the RENDER_RATIFIED_DEMO_DEFAULTS self-heal
+      # delivers them. Accepts 1/true/yes/on.
       - key: ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE
         value: "1"
       - key: OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE
@@ -828,9 +848,9 @@ services:
       # locked 744-close / +0.0243 avgR baseline (daily routine `6213da0a`). The
       # option-journal is DATA_DIR-persisted (`option-trade-journal.jsonl`), so
       # this redeploy preserves that baseline. Revert = clear this value + redeploy.
-      # NOTE: blueprint sync ≠ autoDeploy on bqb1 (TRA-1289) — a redeploy (which a
-      # push to main triggers via autoDeploy, or the DATA_DIR/demo-flags.json
-      # override) is needed for this var to take effect. Accepts 1/true/yes/on.
+      # NOTE (corrected, TRA-5185): this row never syncs and a push does not deploy;
+      # the RENDER_RATIFIED_DEMO_DEFAULTS self-heal (or a DATA_DIR/demo-flags.json
+      # override) delivers it. Accepts 1/true/yes/on.
       - key: RV_EXIT_RETUNE_ENABLED
         value: "true"
       - key: RV_EXIT_RETUNE_CONFIRM_BARS
@@ -846,10 +866,44 @@ services:
       # This starts QuantTrader's >=100-post-arm-close forward validation via
       # `GET /api/health/option-journal` (`byStructure.single_leg_rv`) and unblocks
       # the RV-long live-promotion path (TRA-1582). Revert = clear this value +
-      # redeploy. NOTE: blueprint sync != autoDeploy on bqb1 (TRA-1289) — the push
-      # to main triggers the redeploy via autoDeploy. Accepts a negative fraction.
+      # redeploy. NOTE (corrected, TRA-5185): this row never syncs and a push does
+      # not deploy; the RENDER_RATIFIED_DEMO_DEFAULTS self-heal delivers it.
+      # Accepts a negative fraction.
       - key: RV_EXIT_FLIP_MIN_LOSS_PCT
         value: "-0.20"
+      # TRA-5099 (CFO arm authorization off the 2026-10-04 weekly roll-up, parent
+      # TRA-5097; design + opt-in offer TRA-4992) — point the option swing-exit
+      # chandelier trail at a DAILY ATR(14) instead of the 5-minute shadow series.
+      # 3.0x is Chande's constant SPECIFIED against a daily ATR; fed ATR(14) on a
+      # 300000 ms series it trails 0.2-1.0% of spot above entry and released 35-DTE
+      # positions in under 90 minutes (both graded rows of 2026-09-27..10-03; a
+      # specification repair, NOT a parameter tune — atrMult/atrMultHighBeta/
+      # highBetaAtrPct/atrPeriod are deliberately untouched, multSource stays
+      # `compiled`). Reaches DEMO directional + RV single-leg rows only: otmArmed,
+      # directionalArmed and rvArmed were all false at arm time and
+      # otmSleeveExitRule.chandelierRetired is true, so no real money moves. Gated
+      # pre-arm on a NON-VACUOUS in-RTH `chandelier.ratchets` read (rowsSeen 141 >
+      # 0, skipped.no_daily_atr structural-0 pre-flip, daily-cold share 19.1% <
+      # 25% stop — TRA-5099 comment `f7330634`) and on the pre-registered
+      # comparator `prereg-chandelier-daily-atr-20261004` rev 1 (TRA-5098; cell
+      # `strategyExits`, NOT H0c and NOT the chandelier sub-cell). Grade the arm
+      # from deployed bytes: `GET /api/health/option-swing-exits -> chandelier`
+      # must read atrTimeframe.source=env, timeframe=daily, atrSeries off
+      # `supertrend_shadow_5m`, atrTimeframeMs != 300000; per-row proof is each
+      # close's own `chandelier.atrTimeframeMs`. A symbol outside the `mtfSymbols`
+      # snapshot sweep lands in `skipped.no_daily_atr` (no level, NO fire at all) —
+      # watch that counter post-arm. Revert = clear this value + redeploy.
+      # ⛔ APPLY-PATH CORRECTION (measured 2026-10-05, TRA-5099): this render.yaml
+      # row is SOURCE-OF-RECORD ONLY — Render does NOT blueprint-sync envVars on
+      # srv-d7mb7rr7uimc73ev0chg (28 of this file's 80 keys were absent from the
+      # service env, this one included, after the 4172134a deploy went live;
+      # autoDeploy=no). The working path is TRA-3718/TRA-3724's env-only apply:
+      # PUT /v1/services/{id}/env-vars/CHANDELIER_ATR_TIMEFRAME, re-GET it, then
+      # `node scripts/render-redeploy.mjs --commit=<sha already serving>` to bake
+      # it with a zero-byte code delta. An env write alone applies NOTHING (no
+      # self-deploy here since 2026-07-23), and POST /restart replays the OLD env.
+      - key: CHANDELIER_ATR_TIMEFRAME
+        value: "daily"
       # TRA-1408 (parent TRA-1406, board confirmation `3f248ea1` = accepted 07-07)
       # — arm the per-name churn + same-day-loss brake on the DEMO book. GIS
       # churned 95 closes for -$2,236 in one session while conviction-DCA kept
@@ -863,9 +917,9 @@ services:
       # cap (default 3, code default is also 3). QuantTrader forward-validates from
       # `GET /api/health/conviction-dca` + the option/equity journal (acceptance:
       # no symbol exceeds the per-session cap; DCA never adds to a same-day
-      # net-negative name). Revert = clear this value + redeploy. NOTE: blueprint
-      # sync != autoDeploy on bqb1 (TRA-1289) — a push to main triggers autoDeploy,
-      # which is what makes this var take effect. Accepts 1/true/yes/on.
+      # net-negative name). Revert = clear this value + redeploy. NOTE (corrected,
+      # TRA-5185): this row never syncs and a push does not deploy; the
+      # RENDER_RATIFIED_DEMO_DEFAULTS self-heal is what arms it. Accepts 1/true/yes/on.
       - key: ENABLE_CHURN_LOSS_BRAKE
         value: "1"
       - key: CHURN_SAME_SESSION_OPEN_CAP
@@ -886,10 +940,10 @@ services:
       # `GET /api/health/option-journal` (`byStructure.single_leg_otm`). QuantTrader
       # forward-validates: single_leg_otm avgR >= 0 over the next >=100 closes. The
       # option-journal is DATA_DIR-persisted (`option-trade-journal.jsonl`), so this
-      # redeploy preserves the baseline. Revert = clear this value + redeploy. NOTE:
-      # blueprint sync != autoDeploy on bqb1 (TRA-1289) — a push to main triggers
-      # autoDeploy, which is what makes this var take effect (or the
-      # DATA_DIR/demo-flags.json override). Accepts 1/true/yes/on.
+      # redeploy preserves the baseline. Revert = clear this value + redeploy.
+      # NOTE (corrected, TRA-5185): this row never syncs and a push does not deploy;
+      # apply via the API env write + pinned redeploy (or the DATA_DIR/demo-flags.json
+      # override, which layers OVER env and wins). Accepts 1/true/yes/on.
       - key: OTM_DELTA_FLOOR_ENABLED
         value: "1"
       - key: OTM_DELTA_FLOOR

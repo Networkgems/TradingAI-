@@ -20,6 +20,14 @@
 //
 // It refuses to serve a deploy POST at all, so a stubbed run cannot become a real one even
 // if --dry-run were dropped from the command.
+//
+// TRA-5180 adds ONE opt-in exception to that refusal, for the deploy-POST response-handling
+// arms: `deployPost: { status: number, body: string }` makes POST /services/{id}/deploys
+// return that canned LOCAL Response instead of throwing. This does not weaken the
+// cannot-become-real property — fetch is replaced wholesale, so nothing here reaches a
+// network under any config — it only lets the suite grade what the script does AFTER the
+// POST: an empty 2xx body (the TRA-5175 incident), an empty 5xx, and the valid-JSON path.
+// Absent the key, every POST still throws exactly as before.
 
 const cfg = JSON.parse(process.env.TRA2387_STUB ?? '{}');
 const service = cfg.service ?? { id: 'srv-stub', name: 'stub-service', branch: 'main' };
@@ -32,6 +40,12 @@ globalThis.fetch = async (url, init) => {
   const method = (init?.method ?? 'GET').toUpperCase();
 
   if (method === 'POST') {
+    if (cfg.deployPost && /\/services\/[^/]+\/deploys$/.test(u.replace(/\?.*$/, ''))) {
+      return new Response(cfg.deployPost.body ?? '', {
+        status: cfg.deployPost.status ?? 201,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
     throw new Error(`[tra2387-stub] refusing to serve a ${method} to ${u} — this stub is read-only by design.`);
   }
   if (/\/services\?name=/.test(u)) return json([{ service }]);

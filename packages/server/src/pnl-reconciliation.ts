@@ -2828,6 +2828,30 @@ export function summarizeLiveCombinedAgreement(
 }
 
 /**
+ * TRA-5182 -- `liveStockLegProbeOk` is RETIRED as a live signal (accepted standing
+ * red, disposition C, same as TRA-2943's `eodInteriorAbsentOk`). Six pre-mark-onset
+ * rows (mark capture starts 2026-08-25; no backfill, TRA-4009) can never be
+ * differenced, so the boolean is pinned false. ADDITIVE ONLY: the boolean, the $1
+ * tolerance and the offender rows are unchanged and stay visible.
+ */
+export const LIVE_STOCK_LEG_PROBE_OK_RETIREMENT = Object.freeze({
+  ticket: 'TRA-5182',
+  field: 'liveStockLegProbeOk',
+  state: 'RETIRED -- PINNED FALSE. Not a live signal.',
+  since: '2026-10-05',
+  discriminatorOfRecord:
+    'The offending-WITH-mark SET: liveStockLegProbeOffendingBooks[].dates MINUS that book datesWithoutMark, published as liveStockLegProbeOffendingBooks[].offendingDatesWithMark. Not this boolean, and not a count: a count is as dead as the boolean once the pre-onset rows permanently occupy the low slots. A new offender is a new (book, date) pair that appears carrying a mark.',
+  why:
+    'Mark capture (openOptionMarkUsd, TRA-3954) starts 2026-08-25 on both live books. Rows dated 2026-08-17..2026-08-24 carry no mark (basis null or mark-not-measured); an evidence archive has no backfill (TRA-4009), so the probe can never difference a mark on them and the boolean is false for as long as they stay in the window. Accepted standing red, not suppressed.',
+  stillGradeable: Object.freeze([
+    'liveStockLegProbeOffendingBooks[].offendingDatesWithMark -- the discriminator of record; empty = no offender carries a mark.',
+    'liveStockLegProbeOffendingWithMarkCount -- fleet count of that set (read the set, not the count).',
+    'liveStockLegProbeOffendingBooks[].datesWithoutMark / liveStockLegProbeOffendingWithoutMarkCount -- the pre-onset rows, still RED and unchanged.',
+    'liveStockLegProbeMarkDifferencedCount, liveStockLegProbeOvernightReconciledCount -- how much of the book the four-operand probe actually covers.',
+  ]),
+});
+
+/**
  * TRA-3948 — fleet fold of the BOOKED-`0` STOCK LEG's equity probe over the
  * LIVE cohort: is there a per-session equity move that neither booked leg
  * accounts for?
@@ -2903,6 +2927,8 @@ export function summarizeLiveStockLegProbe(
     maxProbeUsd: number | null;
     /** TRA-3954 — the subset of `dates` whose probe lacks the mark operand. */
     datesWithoutMark: string[];
+    /** TRA-5182 -- `dates` minus `datesWithoutMark`: offenders carrying a mark. The discriminator of record. */
+    offendingDatesWithMark: string[];
   }>;
   maxLiveStockLegProbeUsd: number | null;
   liveStockLegBasisCounts: Record<string, number>;
@@ -2917,6 +2943,9 @@ export function summarizeLiveStockLegProbe(
    * reading, none is yet attributable to a missed trade.
    */
   liveStockLegProbeOffendingWithoutMarkCount: number;
+  /** TRA-5182 -- fleet count of `offendingDatesWithMark`. Grade the SET, not this count. */
+  liveStockLegProbeOffendingWithMarkCount: number;
+  liveStockLegProbeOkRetirement: typeof LIVE_STOCK_LEG_PROBE_OK_RETIREMENT;
   /**
    * TRA-3954 — live discriminating sessions that held an option overnight AND
    * reconciled within tolerance under the four-operand probe. The GREEN branch
@@ -2963,6 +2992,9 @@ export function summarizeLiveStockLegProbe(
         dates: e.stockLegProbeOffendingDates,
         maxProbeUsd: e.maxStockLegProbeUsd,
         datesWithoutMark: e.stockLegProbeOffendingWithoutMarkDates ?? [],
+        offendingDatesWithMark: e.stockLegProbeOffendingDates.filter(
+          d => !(e.stockLegProbeOffendingWithoutMarkDates ?? []).includes(d),
+        ),
       })),
     maxLiveStockLegProbeUsd: measuredMaxima.length === 0 ? null : Math.max(...measuredMaxima),
     liveStockLegProbeMarkDifferencedCount: liveBooks.reduce(
@@ -2973,6 +3005,15 @@ export function summarizeLiveStockLegProbe(
       (n, e) => n + (e.stockLegProbeOffendingWithoutMarkDates ?? []).length,
       0,
     ),
+    liveStockLegProbeOffendingWithMarkCount: liveBooks.reduce(
+      (n, e) =>
+        n +
+        e.stockLegProbeOffendingDates.filter(
+          d => !(e.stockLegProbeOffendingWithoutMarkDates ?? []).includes(d),
+        ).length,
+      0,
+    ),
+    liveStockLegProbeOkRetirement: LIVE_STOCK_LEG_PROBE_OK_RETIREMENT,
     liveStockLegProbeOvernightReconciledCount: liveBooks.reduce(
       (n, e) => n + (e.stockLegProbeOvernightReconciledCount ?? 0),
       0,

@@ -512,6 +512,7 @@ import {
   resolveTradierAccountCreds,
   resolveTradierAccountCredsFromSaved,
   decideTradierAccountRefusalResponse,
+  decideBrokerOrderVerbResponse,
   type TradierAccountScopeRefusal,
 } from './tradier-client-scope.js';
 import {
@@ -678,6 +679,8 @@ import {
   atmIvFromRows,
   seedFromArchive,
 } from './iv-rank-store.js';
+// TRA-5176 — the durable per-session short-premium candidate-arrival ledger.
+import { initShortPremiumArrivalLedger } from './short-premium-arrival-ledger.js';
 // TRA-4644 — availability accounting for the `ivPercentile` sibling field on
 // the OTM/RV nomination read surface (published on the decomposition probe).
 import { ivPercentileCoverageHealth } from './iv-percentile-coverage.js';
@@ -688,6 +691,10 @@ import {
   isIvArchiveSeedEnabled,
   IV_ARCHIVE_SEED_FLAG,
 } from './iv-rank-archive.js';
+// TRA-5171 — the read-only seedable-depth census behind the TRA-5170 seed
+// decision, warmed in the background at boot so /api/health/short-premium can
+// state the archive's depth as a number instead of a stale code comment.
+import { ensureArchiveSeedCensusFresh } from './iv-seed-census.js';
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
 import {
@@ -1028,7 +1035,7 @@ import { isTestAccount as isTestAccountName } from './test-accounts.js';
 import type { TradierEnv } from '@trading-app/shared';
 // TRA-3068 — the split calendar, read at the EOD report's generation path.
 import type { CorporateAction } from '@trading-app/shared';
-import { fetchQuotes, fetchDailyCandles, fetchTradierDailyCandles, fetchShortInterestFundamentals, fetchRecentSplits } from './yahoo-feed.js';
+import { fetchQuotes, fetchDailyCandles, fetchShortInterestFundamentals, fetchRecentSplits } from './yahoo-feed.js';
 import {
   runFirstBootMigration,
   runTra237OptionsReset,
@@ -1143,6 +1150,7 @@ import {
   PROMOTION_DIVERGENCE_RECOMPUTE_MS,
 } from './promotion-divergence-monitor.js';
 import { resolveDataDir } from './data-dir.js';
+import { mergeExitSpreadShadow } from './option-exit-spread-shadow.js';
 // TRA-3595 — the host execution path for the TRA-2906 v1→v2 cash-flow rebuild.
 // Inert unless `TRA2906_CASH_FLOW_REBUILD` is set; see that module's header for
 // why an env-armed boot one-shot is not the standing automated write TRA-3595
@@ -1391,10 +1399,8 @@ log.info('rv-scanner initialized', {
 // (Yahoo primary, Tradier fallback when Yahoo's breaker is open).
 const shortSqueezeScannerService = new ShortSqueezeScannerService({
   fetchFundamentals: (symbol) => fetchShortInterestFundamentals(symbol),
-  fetchDailyBars: async (symbol, count) => {
-    const bars = await fetchDailyCandles(symbol, count);
-    return bars.length > 0 ? bars : fetchTradierDailyCandles(symbol, count);
-  },
+  // TRA-5092 — the Yahoo → Tradier cascade is inside `fetchDailyCandles` now.
+  fetchDailyBars: async (symbol, count) => fetchDailyCandles(symbol, count),
 });
 
 // TRA-563 (TRA-410 A1) — install the notification dispatcher. Preferences are
@@ -1527,6 +1533,16 @@ void runMacroRefresh();
 // synchronous `ivRankSync` read used by the AI Options Ideas fusion has data
 // available right after boot. The store is appended to as chains are pulled.
 await initIvRankStore();
+
+// TRA-5176 — warm (and ARM disk persistence for) the short-premium arrival
+// ledger so the dated per-session series survives bqb1's several-a-day
+// restarts and is readable on /api/health/short-premium right after boot.
+await initShortPremiumArrivalLedger();
+
+// TRA-5171 — kick the chain-archive seedable-depth census (a cached disk walk)
+// in the background. Deliberately NOT awaited: a large archive must never delay
+// boot, and the health route reads an honest `pending` until it lands.
+void ensureArchiveSeedCensusFresh();
 
 // TRA-2206 (TRA-1965) — optionally deepen that store from the recorded chain
 // archive. The store only starts accumulating for a symbol once that symbol
@@ -13555,6 +13571,9 @@ app.get('/api/health/options-live', async (_req, res) => {
       // rising while `escalatedTotal` stays flat is this bug, still open.
       //
       // Resets on restart by design, same as `abandonedStagedExits`.
+      // TRA-4944 — observe-only exit-quote spread census; read `evaluated` WITH
+      // each cell's `noQuote` (an unmeasured exit is never a tight one).
+      exitSpreadShadow: mergeExitSpreadShadow(getAllUserContexts().map((c) => c.engine.getExitSpreadShadow())),
       expiredExits: getAllUserContexts().reduce(
         (acc, c) => {
           const s = c.engine.getExpiredExitStats();
@@ -17276,6 +17295,27 @@ function respondTradierAccountRefusal(
   res.status(status).json(body);
 }
 
+/**
+ * TRA-5127 (board ruling 2B on TRA-3925) — refuse every broker ORDER verb for
+ * non-operators, even with valid saved per-user creds. Sits IN FRONT of
+ * credential resolution on each gated route, so the refusal is about the verb
+ * and a pasted production token changes nothing. Keyed on the TRA-857
+ * operator pin: an explicitly empty `LIVE_EQUITY_BOOT_USER` disarms everyone
+ * (AC6). Read verbs (positions/balances sync, test-connection) never call
+ * this — the published verb enumeration lives on TRA-5127 (CEO condition b).
+ *
+ * Returns true when the 403 has been written and the caller must return.
+ */
+function refuseBrokerOrderVerbForNonOperator(
+  res: express.Response,
+  username: string | undefined,
+): boolean {
+  const decision = decideBrokerOrderVerbResponse(isLiveBrokerOperator(username));
+  if (decision.allowed) return false;
+  res.status(decision.status).json(decision.body);
+  return true;
+}
+
 // TRA-229 — start/stop are scoped to the dashboard's current account mode
 // (demo or live) so a user can run live trading while leaving demo paused, or
 // vice versa. The mode is taken from saved settings; clients can also pass an
@@ -17534,6 +17574,17 @@ app.post('/api/positions/:id/close', requireAuth, async (req, res) => {
   }
   const sym = state.symbols.find(s => s.symbol === pos.symbol);
   const price = sym?.price ?? pos.entryPrice;
+  // TRA-5127 (ruling 2B) — ORDER verb iff this row would mirror to the broker:
+  // a live equity row's manual close cancels the OCO leg and submits a real
+  // market sell (TRA-335), and in live mode `state.account.openPositions` IS
+  // the live book. The gate keys on the engine's own mirror predicate so
+  // paper closes stay open to every book.
+  if (
+    ctx.engine.wouldMirrorEquityCloseToBroker(id)
+    && refuseBrokerOrderVerbForNonOperator(res, String(res.locals['authUser'] ?? ''))
+  ) {
+    return;
+  }
   // TRA-4658 — a manual close is an intervention; the resulting exit row is
   // booked separately at the engine's exit emitter.
   auditIntervention({
@@ -17582,6 +17633,12 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
   // filled at 0.05 instead of ~0.11.
   const imported = ctx.engine.findImportedOption(id);
   if (imported) {
+    // TRA-5127 (ruling 2B) — ORDER verb: a close on an imported row always
+    // routes a real `sell_to_close`. Gated before any state or credential
+    // question, so a non-operator's valid saved token changes nothing. The
+    // row lookup above is per-user (`userCtx`), so another user's :id never
+    // enters this branch — it misses both lookups and 404s below (AC3).
+    if (refuseBrokerOrderVerbForNonOperator(res, username)) return;
     // TRA-407 (C4) — pending-close double-submit guard. The desktop UI
     // already swaps the Close button for a disabled "Pending #N" badge once
     // `pendingCloseOrderId` is set, but a stale client or a double-click
@@ -17796,6 +17853,11 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
   }
   const liveMirror = engineOpened.position.mode === 'live';
   if (liveMirror) {
+    // TRA-5127 (ruling 2B) — ORDER verb: an engine-opened LIVE close routes a
+    // real limit `sell_to_close` through the engine's per-user account client.
+    // Demo closes fall through below untouched — paper gates nothing, and the
+    // TRA-5126 per-user demo books need manual closes for every user.
+    if (refuseBrokerOrderVerbForNonOperator(res, username)) return;
     // TRA-358 — user-driven LIMIT close on engine-opened live positions.
     // The body carries the price + qty + duration the user picked in the
     // Close drawer (mirrors Tradier's web close panel). The smart-walk
@@ -17912,6 +17974,12 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
  * engine-fired exits and may want to cancel those too).
  */
 app.post('/api/options/:id/cancel-pending-exit', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  // TRA-5127 (ruling 2B) — ORDER verb: cancelling a staged/working exit hits
+  // Tradier's `cancelOrder` on the account surface. Gated whole-route: a
+  // `pendingExit` only ever exists on a broker-backed row (demo paper closes
+  // are instantaneous), so a demo book loses nothing to this refusal.
+  if (refuseBrokerOrderVerbForNonOperator(res, username)) return;
   const ctx = await userCtx(res);
   const { id } = req.params as Record<string, string>;
   const outcome = await ctx.engine.cancelManualPendingExit(id);

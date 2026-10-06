@@ -1,6 +1,7 @@
 import {
   TradierOptionsClient,
   findRelativeValueOpportunities,
+  explainRelativeValueNoCandidates,
   findMispricedOtmContracts,
   findTermStructureDislocations,
   type OptionChainRow,
@@ -359,6 +360,12 @@ export interface RelativeValueScanResult {
     | 'quota_held'
     | 'fetch_error';
   errorMessage?: string;
+  /**
+   * TRA-5154 — set iff `reason === 'ok'` and `candidates` is empty: the single
+   * first-binding label for WHY (`min_group_size`, `row_gate:<gate>`, …). Absent
+   * on a non-empty scan, so the caller can count one per `no_candidates` pass.
+   */
+  noCandidatesReason?: string;
 }
 
 /**
@@ -1481,7 +1488,15 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       return { symbol: upper, spot, expiration, candidates: [], reason: 'no_chain' };
     }
 
-    const candidates = findRelativeValueOpportunities(chain, spot, { now: this.now(), ...opts });
+    const scanOpts = { now: this.now(), ...opts };
+    const candidates = findRelativeValueOpportunities(chain, spot, scanOpts);
+    if (candidates.length === 0) {
+      const why = explainRelativeValueNoCandidates(chain, spot, scanOpts);
+      return {
+        symbol: upper, spot, expiration, candidates, reason: 'ok',
+        noCandidatesReason: why?.reason ?? 'unattributed',
+      };
+    }
     return { symbol: upper, spot, expiration, candidates, reason: 'ok' };
   }
 

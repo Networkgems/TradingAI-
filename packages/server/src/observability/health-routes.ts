@@ -123,6 +123,12 @@ import {
 } from '../rv-scan-telemetry.js'; // TRA-2193 / TRA-2245
 import { gradeRvScanRthStaleness } from '../rv-scan-rth-staleness.js'; // TRA-5087
 import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
+// TRA-5171 — WHY the trailing-IV store is what it is: boot-load provenance plus
+// the chain-archive seedable-depth census behind the TRA-5170 seed decision.
+import { readIvStoreProvenanceSync } from '../iv-rank-store.js';
+import { readArchiveSeedCensusSync, summarizeSeedableUniverse } from '../iv-seed-census.js';
+// TRA-5176 — the durable, dated per-session candidate-arrival series.
+import { readShortPremiumArrivalHistorySync } from '../short-premium-arrival-ledger.js';
 import { buildWheelPromotionGateSummary } from '../wheel-promotion-gate-store.js'; // TRA-2028
 import {
   summarizeConvictionDca,
@@ -3370,8 +3376,26 @@ export interface OptionJournalReleaseForensic {
   stopBasisPremium: number | null;
   markAtFire: number | null;
   execBidAtFire: number | null;
+  /**
+   * TRA-5162 — why `execBidAtFire` is null, so "the tick was dark" and "never
+   * attempted" stop sharing a bare null. The stamp's own reason code when it
+   * carries one (`no_usable_quote_at_fire` / `bid_zero_at_fire` /
+   * `halt_flat_no_exit_tick`); `stamp_predates_reason_codes` for a stamped
+   * null written by a pre-TRA-5162 build; `null` when the bid was measured or
+   * the row carries no stamp at all (`stamped: false` already names that case).
+   */
+  execBidUnquotedReason: string | null;
   /** Broker exit fill — TRA-2819 restated rows only. ⛔ Never the mark standing in. */
   exitFillPremium: number | null;
+  /**
+   * TRA-5162 — why `exitFillPremium` is null, same convention.
+   * `not_broker_fill_restated` ⇒ the row was never TRA-2819-restated (demo /
+   * desk modeled closes live here permanently — the fill basis only ever
+   * exists on live broker closes); `fill_premium_absent_on_restated_row` ⇒
+   * restated but the fill column is missing (a defect, loud on purpose);
+   * `null` ⇔ `exitFillPremium` is measured.
+   */
+  exitFillUnmeasuredReason: string | null;
   /** `exitFillPremium − levelPremium`: the execution slip. Null unless both are measured. */
   fillVsLevelPremium: number | null;
   /** The same slip in stop-basis R (÷ `stopBasisPremium`). */
@@ -3624,6 +3648,27 @@ function crossTabStructureExit(
         ...(() => {
           const num = (v: unknown): number | null =>
             typeof v === 'number' && Number.isFinite(v) ? v : null;
+          // TRA-5162 — the two null-reason reads. A null instrument column now
+          // always travels with its cause, so the AC3 grader (one unrepeatable
+          // live row) can tell a dark tick from a dropped field from a row that
+          // was never restated — without holding the host's disk.
+          const execBidReason = (
+            stamped: boolean,
+            execBid: number | null,
+            stampReason: unknown,
+          ): string | null => {
+            if (!stamped || execBid !== null) return null;
+            return typeof stampReason === 'string' ? stampReason : 'stamp_predates_reason_codes';
+          };
+          const exitFillReason = (
+            r: OptionTradeJournalRecord,
+            exitFillPremium: number | null,
+          ): string | null => {
+            if (exitFillPremium !== null) return null;
+            return r.pnlBasis === 'broker-fill'
+              ? 'fill_premium_absent_on_restated_row'
+              : 'not_broker_fill_restated';
+          };
           const trail = list
             .filter((r) =>
               r.profitLockFire !== undefined
@@ -3684,7 +3729,13 @@ function crossTabStructureExit(
                   stopBasisPremium,
                   markAtFire,
                   execBidAtFire: num(tpf.execBidAtFire),
+                  execBidUnquotedReason: execBidReason(
+                    true,
+                    num(tpf.execBidAtFire),
+                    tpf.execBidUnquotedReason,
+                  ),
                   exitFillPremium,
+                  exitFillUnmeasuredReason: exitFillReason(r, exitFillPremium),
                   fillVsLevelPremium,
                   fillVsLevelR:
                     fillVsLevelPremium !== null && stopBasisPremium !== null && stopBasisPremium > 0
@@ -3725,7 +3776,13 @@ function crossTabStructureExit(
                 stopBasisPremium,
                 markAtFire,
                 execBidAtFire: num(f?.execBidAtFire),
+                execBidUnquotedReason: execBidReason(
+                  f !== undefined,
+                  num(f?.execBidAtFire),
+                  f?.execBidUnquotedReason,
+                ),
                 exitFillPremium,
+                exitFillUnmeasuredReason: exitFillReason(r, exitFillPremium),
                 fillVsLevelPremium,
                 fillVsLevelR:
                   fillVsLevelPremium !== null && stopBasisPremium !== null && stopBasisPremium > 0
@@ -5722,12 +5779,27 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // ever placed off these structures — demo routing / graduation is a separate
   // board decision.
   app.get('/api/health/short-premium', (_req, res) => {
+    const summary = summarizeShortPremiumScans(now());
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       enabled: isOptionShortPremiumScannerEnabled(),
-      ...summarizeShortPremiumScans(now()),
+      ...summary,
+      // TRA-5171 — the empty-store WHY, in one read. `ivStoreProvenance.bootLoad`
+      // separates file-absent / parse-error / parsed-but-shallow (three states
+      // that used to serialise identically); the census blocks state what the
+      // deferred archive seed (TRA-5170) would actually deliver. Observe-only:
+      // nothing here gates, and the fail-open IVR floor is untouched.
+      ivStoreProvenance: readIvStoreProvenanceSync(),
+      archiveSeedCensus: readArchiveSeedCensusSync(Date.now()),
+      seedableUniverse: summarizeSeedableUniverse(summary.scans.map((s) => s.symbol)),
+      // TRA-5176 — the durable, dated per-session arrival ledger (newest
+      // first). `candidateCount` above is a live snapshot one sweep wide; THIS
+      // is the series TRA-5173 item 2 grades: distinct (symbol, expiration,
+      // structure) per ET session, restart-durable, with absent-vs-zero
+      // preserved. Observe-only like everything else on this route.
+      arrivalHistory: readShortPremiumArrivalHistorySync(),
     });
   });
 
@@ -7999,8 +8071,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
             {
               code: 'cost_bar_edge_input_stale',
               issue: 'TRA-4875',
-              /** TRA-4978 — the remedy ticket: attribution split + stand-down. */
-              remedyIssue: 'TRA-4978',
+              /**
+               * TRA-4925 (in passing) — the remedy is DELIVERED, not pending:
+               * TRA-4978 (closed 2026-10-03) shipped the attribution split and
+               * the per-cell stand-down verdicts that ride on this very payload
+               * (`cells[].standDown`, `standDown`). The field used to be
+               * `remedyIssue: 'TRA-4978'`, which promised an OPEN remedy row and
+               * sent every reader to a closed ticket once it landed (it cost
+               * TRA-5164 a hop). A pointer at delivered history cannot go stale
+               * the same way; the live instrument to read is `standDown`.
+               */
+              remedyShipped: 'TRA-4978',
               gate: COST_BAR_GATE,
               /**
                * `degraded`, not `critical`: the gate is REFUSING, which is the

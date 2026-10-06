@@ -257,6 +257,7 @@ describe('TRA-3948 — the fleet fold', () => {
         dates: ['2026-08-17', '2026-08-18', '2026-08-20', '2026-08-21'],
         maxProbeUsd: 197.36,
         datesWithoutMark: [],
+        offendingDatesWithMark: ['2026-08-17', '2026-08-18', '2026-08-20', '2026-08-21'],
       },
     ]);
     expect(s.maxLiveStockLegProbeUsd).toBeCloseTo(197.36, 2);
@@ -456,5 +457,25 @@ describe('TRA-3954 — a discriminating session WITH an overnight position recon
     expect(PNL_STOCK_LEG_PROBE_NOTE).toContain('liveStockLegProbeOffendingWithoutMarkCount');
     expect(PNL_STOCK_LEG_PROBE_NOTE).toContain('liveStockLegProbeOvernightReconciledCount');
     expect(PNL_STOCK_LEG_PROBE_NOTE).toContain('NOT `journalOptionsPnl`');
+  });
+});
+
+describe('TRA-5182 liveStockLegProbeOk retirement', () => {
+  it('publishes the offending-WITH-mark set and keeps the red visible', () => {
+    const s = summarizeLiveStockLegProbe([
+      {
+        ...LIVE_FLEET()[0],
+        stockLegProbeOk: false,
+        stockLegProbeOffendingDates: ['2026-08-17', '2026-09-01'],
+        stockLegProbeOffendingWithoutMarkDates: ['2026-08-17'],
+      },
+    ] as ProbeBook[]);
+    expect(s.liveStockLegProbeOk).toBe(false);
+    expect(s.liveStockLegProbeOffendingBooks[0].dates).toEqual(['2026-08-17', '2026-09-01']);
+    expect(s.liveStockLegProbeOffendingBooks[0].offendingDatesWithMark).toEqual(['2026-09-01']);
+    expect(s.liveStockLegProbeOffendingWithMarkCount).toBe(1);
+    expect(s.liveStockLegProbeOkRetirement.ticket).toBe('TRA-5182');
+    expect(s.liveStockLegProbeOkRetirement.state).toContain('PINNED FALSE');
+    expect(s.liveStockLegProbeOkRetirement.discriminatorOfRecord).toContain('not a count');
   });
 });

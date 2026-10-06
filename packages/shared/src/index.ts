@@ -2805,6 +2805,29 @@ export interface OptionExitQuote {
   ageMs: number;
 }
 /**
+ * TRA-5162 — WHY a fire's `execBidAtFire` is null, stamped beside it. A bare
+ * null is indistinguishable from "never attempted" (the exact ambiguity that
+ * cost TRA-5162 a month: 19/19 `profit_lock` forensics rows read null with no
+ * tell), so a null now carries its cause and a non-null carries nothing.
+ * Present ⇔ `execBidAtFire === null` on stamps written by this build;
+ * absent beside a null ⇒ the stamp predates the reason codes.
+ *
+ * - `no_usable_quote_at_fire` — `liveQuoteFor` served nothing on the firing
+ *   tick (symbol missing from the pass's quote map, or the book was crossed /
+ *   half-empty / non-finite). The NOK261016C00011000 2026-09-11 fire is this:
+ *   4 stale-mark ticks, `delta_backstop` mark, `quoteAtFire: null`.
+ * - `bid_zero_at_fire` — a two-sided book WAS served but `bid === 0`:
+ *   "nobody will buy this", a real price the basis must not rest on.
+ * - `halt_flat_no_exit_tick` — the TRA-4335 `book_halt_flat` relabel path,
+ *   which runs off the halt's close mark and by construction evaluates no
+ *   quoted exit-pass tick at all.
+ */
+export type OptionExecBidUnquotedReason =
+  | 'no_usable_quote_at_fire'
+  | 'bid_zero_at_fire'
+  | 'halt_flat_no_exit_tick';
+
+/**
  * TRA-4317 (AC1) — the profit-lock give-back rule's OWN release level, stamped
  * at the tick it chose to exit. The level is the one quantity a reader of the
  * close row cannot re-derive (`markProvenance.quoteAtFire` gives the quote,
@@ -2828,6 +2851,8 @@ export interface OptionProfitLockFire {
   markAtFire: number;
   /** The executable bid the decision priced against (TRA-4285), `null` on an unquoted tick. */
   execBidAtFire: number | null;
+  /** TRA-5162 — present ⇔ `execBidAtFire` is null on a post-TRA-5162 stamp; see the type. */
+  execBidUnquotedReason?: OptionExecBidUnquotedReason;
   /**
    * TRA-4246 (AC2) — the decision's OWN operands, so "did the rule arm" and
    * "where did it arm from" stop being inferences off a constant.
@@ -3032,6 +3057,8 @@ export interface OptionTakeProfitEarlyFire {
   markAtFire: number;
   /** The executable bid this tick served, `null` on an unquoted tick. */
   execBidAtFire: number | null;
+  /** TRA-5162 — present ⇔ `execBidAtFire` is null on a post-TRA-5162 stamp; see the type. */
+  execBidUnquotedReason?: OptionExecBidUnquotedReason;
   /** The rule's max-profit reference — the TP1 target the capture fraction is measured against. */
   tp1Premium: number;
   /** The mid high-water mark at the fire. */

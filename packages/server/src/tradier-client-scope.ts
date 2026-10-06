@@ -213,6 +213,50 @@ export const NO_CREDS_CODE = 'tradier_no_creds';
  * and only ever appears in the 409 text — the 403 must NOT be route-flavoured,
  * because it says something about the ACCOUNT, not about the operation.
  */
+/** TRA-5127 — stable code for the order-verb operator gate, distinct from both codes above. */
+export const BROKER_ORDER_OPERATOR_GATE_CODE = 'broker_order_operator_gate';
+
+export type BrokerOrderVerbDecision =
+  | { allowed: true }
+  | { allowed: false; status: 403; body: { error: string; code: typeof BROKER_ORDER_OPERATOR_GATE_CODE } };
+
+/**
+ * TRA-5127 (board ruling 2B on TRA-3925, card e550875f, CEO under TRA-5122
+ * delegation) — the per-user broker link is READ-ONLY. EVERY account ORDER
+ * verb is refused for non-operators, and the refusal is a statement about the
+ * VERB, not the credentials: TRA-3112 deliberately kept SAVED per-user creds
+ * working for account verbs (orders included), and the CEO ruled that
+ * residual order path closed. So this gate sits IN FRONT of credential
+ * resolution — a valid saved production token changes nothing here.
+ *
+ * It takes `isOperator` as a boolean (the call site passes
+ * `isLiveBrokerOperator(username)`) for the same import-cycle reason as
+ * `allowEnvFallback` above. Keying on the TRA-857 operator pin is what makes
+ * AC6 hold: an explicitly empty `LIVE_EQUITY_BOOT_USER` means no user is the
+ * operator, so an unset pin disarms every order verb for everyone.
+ *
+ * The 403 is deliberately NOT route-flavoured (same rule as the
+ * `operator_pinned` 403): it says something about the ACCOUNT's authority,
+ * not about the operation. Read verbs (positions/balances sync,
+ * test-connection) never consult this gate — see the enumeration on TRA-5127.
+ */
+export function decideBrokerOrderVerbResponse(isOperator: boolean): BrokerOrderVerbDecision {
+  if (isOperator) return { allowed: true };
+  return {
+    allowed: false,
+    status: 403,
+    body: {
+      error:
+        'Broker ORDER verbs (close, cancel, and every other order placement or cancellation) are ' +
+        'restricted to the pinned live broker operator — the per-user broker link is read-only ' +
+        '(TRA-5127, board ruling 2B on TRA-3925). Saved per-user Tradier credentials keep working ' +
+        'for the read-only mirror (positions sync, balances, test-connection); they do not open an ' +
+        'order path.',
+      code: BROKER_ORDER_OPERATOR_GATE_CODE,
+    },
+  };
+}
+
 export function decideTradierAccountRefusalResponse(
   reason: TradierAccountScopeRefusal,
   env: TradierEnv,

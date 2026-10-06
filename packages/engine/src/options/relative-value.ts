@@ -527,36 +527,114 @@ function prepareRow(
   opts: Required<Omit<RelativeValueScannerOptions, 'now'>>,
   now: number,
 ): PreparedRow | null {
+  return classifyRow(row, underlyingPrice, opts, now).prepared;
+}
+
+/**
+ * TRA-5154 — first-binding gate of {@link prepareRow}, in evaluation order. A
+ * row that clears every gate has `gate: null`. This is the SINGLE implementation
+ * of the filter chain: `prepareRow` is a thin wrapper, so the attribution below
+ * cannot drift from the population the fit actually grades.
+ */
+export type RvRowRejectGate =
+  | 'no_two_sided_quote'
+  | 'min_mark'
+  | 'max_spread_pct'
+  | 'min_open_interest'
+  | 'min_daily_volume'
+  | 'expired'
+  | 'min_days_to_expiry'
+  | 'no_iv';
+
+function classifyRow(
+  row: OptionChainRow,
+  underlyingPrice: number,
+  opts: Required<Omit<RelativeValueScannerOptions, 'now'>>,
+  now: number,
+): { prepared: PreparedRow; gate: null } | { prepared: null; gate: RvRowRejectGate } {
   const bid = row.bid ?? 0;
   const ask = row.ask ?? 0;
-  if (bid <= 0 || ask <= 0 || ask < bid) return null;
+  if (bid <= 0 || ask <= 0 || ask < bid) return { prepared: null, gate: 'no_two_sided_quote' };
   const mark = (bid + ask) / 2;
-  if (mark < opts.minMark) return null;
+  if (mark < opts.minMark) return { prepared: null, gate: 'min_mark' };
   const spreadPct = (ask - bid) / mark;
-  if (spreadPct > opts.maxSpreadPct) return null;
+  if (spreadPct > opts.maxSpreadPct) return { prepared: null, gate: 'max_spread_pct' };
   const oi = row.openInterest ?? 0;
-  if (oi < opts.minOpenInterest) return null;
+  if (oi < opts.minOpenInterest) return { prepared: null, gate: 'min_open_interest' };
   // TRA-1057 — today-volume liquidity floor (default 0 = off). Complements
   // the resting-book OI gate above: rejects rows that aren't actually
   // trading today so a fill is realistic and the mark is fresh.
   const vol = row.volume ?? 0;
-  if (vol < opts.minDailyVolume) return null;
+  if (vol < opts.minDailyVolume) return { prepared: null, gate: 'min_daily_volume' };
 
   const dte = daysToExpiration(row.expiration, now);
-  if (dte <= 0) return null;
+  if (dte <= 0) return { prepared: null, gate: 'expired' };
   // TRA-495 — defense in depth on the swing thesis: reject rows whose
   // expiration is closer than the configured floor (default 7d). The
   // scanner's auto-pick already filters expirations by `dteMin`/`dteMax`,
   // but a cached chain for a stale expiration shouldn't slip a near-DTE
   // lottery ticket through.
-  if (dte < opts.minDaysToExpiry) return null;
+  if (dte < opts.minDaysToExpiry) return { prepared: null, gate: 'min_days_to_expiry' };
   const T = dte / 365;
 
   const iv = resolveIv(row, mark, underlyingPrice, T, opts.riskFreeRate, opts.dividendYield);
-  if (iv == null || iv <= 0 || !Number.isFinite(iv)) return null;
+  if (iv == null || iv <= 0 || !Number.isFinite(iv)) return { prepared: null, gate: 'no_iv' };
 
   const x = Math.log(row.strike / underlyingPrice);
-  return { row, mark, spreadPct, iv, x, dte, T };
+  return { prepared: { row, mark, spreadPct, iv, x, dte, T }, gate: null };
+}
+
+/**
+ * TRA-5154 — why did {@link findRelativeValueOpportunities} return nothing?
+ *
+ * Exactly ONE label per call, so a caller counting one per symbol-pass gets a
+ * split that sums to its `no_candidates` bucket. Mirrors the function's own
+ * early-outs and its group-size rule:
+ *   • `bad_underlying_price` / `empty_chain` — the two `return []` guards;
+ *   • `min_group_size` — rows survived the quality gates but no
+ *     (expiration, type) group reached `minGroupSize`, so no skew could be fit;
+ *   • otherwise every row died at a gate: the label is the gate that killed the
+ *     MOST rows (ties → earlier in evaluation order), `row_gate:<gate>`.
+ * `rowGates` is the full histogram, for the reader who wants the interior.
+ * Returns null when the scan would NOT be empty (a diagnosis of a non-event
+ * must not be manufactured).
+ */
+export function explainRelativeValueNoCandidates(
+  chain: OptionChainRow[],
+  underlyingPrice: number,
+  options: RelativeValueScannerOptions = {},
+): { reason: string; rowGates: Partial<Record<RvRowRejectGate, number>> } | null {
+  if (!Number.isFinite(underlyingPrice) || underlyingPrice <= 0) return { reason: 'bad_underlying_price', rowGates: {} };
+  if (chain.length === 0) return { reason: 'empty_chain', rowGates: {} };
+  const opts = { ...DEFAULTS, ...options };
+  const now = options.now ?? Date.now();
+
+  const rowGates: Partial<Record<RvRowRejectGate, number>> = {};
+  const groupSizes = new Map<string, number>();
+  let prepared = 0;
+  for (const row of chain) {
+    const r = classifyRow(row, underlyingPrice, opts, now);
+    if (r.gate) {
+      rowGates[r.gate] = (rowGates[r.gate] ?? 0) + 1;
+      continue;
+    }
+    prepared += 1;
+    const key = `${row.expiration}|${row.optionType}`;
+    groupSizes.set(key, (groupSizes.get(key) ?? 0) + 1);
+  }
+  for (const n of groupSizes.values()) if (n >= opts.minGroupSize) return null;
+  if (prepared > 0) return { reason: 'min_group_size', rowGates };
+  const order: RvRowRejectGate[] = [
+    'no_two_sided_quote', 'min_mark', 'max_spread_pct', 'min_open_interest',
+    'min_daily_volume', 'expired', 'min_days_to_expiry', 'no_iv',
+  ];
+  let best: RvRowRejectGate = order[0];
+  let bestN = -1;
+  for (const g of order) {
+    const n = rowGates[g] ?? 0;
+    if (n > bestN) { best = g; bestN = n; }
+  }
+  return { reason: `row_gate:${best}`, rowGates };
 }
 
 /**

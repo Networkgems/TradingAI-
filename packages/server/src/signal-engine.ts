@@ -212,6 +212,8 @@ import {
   type AdvisoryShortlist,
 } from './agents-advisory-bound.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan, type ShortPremiumScanResult } from './short-premium-scanner.js';
+// TRA-5176 — one completed whole-universe sweep = one arrival-ledger "cycle".
+import { noteShortPremiumCycleComplete } from './short-premium-arrival-ledger.js';
 // TRA-4570/4626 — observe-only swing scanners + fusion ranking; TRA-4706 — one
 // injected pass (daily series, recent earnings, per-cause summary).
 import type { SwingSignalCandidate, SwingScanSummary } from '@trading-app/shared';
@@ -808,6 +810,7 @@ import { emitAlert } from './notifications/index.js';
 import { dispatchAlert } from './observability/alerts.js';
 // TRA-3962 (Q2, board ruling 2026-10-04) — the over-cap page classifier.
 import { classifyOverCapPage } from './tra3962-over-cap-page.js';
+import { mergeExitSpreadShadow, type ExitSpreadShadowSnapshot } from './option-exit-spread-shadow.js';
 
 const balanceLog = logger.child({ module: 'signal-engine' });
 const log = logger.child({ module: 'signal-engine' });
@@ -8891,7 +8894,10 @@ export class SignalEngine {
             // TRA-5065 — …and the Tradier leg behind it, so the sweep is not
             // pinned to a provider that 429s ~permanently on this host.
             const pulled = await fetchSma200CandlesShared(
-              sym, SMA200_DAILY_BARS, (s, n) => fetchDailyCandles(s, n),
+              // TRA-5092 — `'none'`: this pull owns its own budgeted fallback
+              // leg below; the in-feed Tradier leg would bypass the budget and
+              // count Tradier serves as `servedPrimary`.
+              sym, SMA200_DAILY_BARS, (s, n) => fetchDailyCandles(s, n, 'crumb', 'none'),
               {
                 breakerOpen: () => isYahooBreakerOpen(),
                 fallback: {
@@ -11875,6 +11881,12 @@ export class SignalEngine {
    *
    * Counts and timestamps only — no OCC symbols (TRA-2163).
    */
+  getExitSpreadShadow(): ExitSpreadShadowSnapshot {
+    return mergeExitSpreadShadow(
+      (['sandbox', 'production'] as const).map((env) => this.optionsAccounts[env].getExitSpreadShadow()),
+    );
+  }
+
   getExpiredExitStats(): {
     expiredTotal: number;
     expiredLiveTotal: number;
@@ -13844,8 +13856,14 @@ export class SignalEngine {
             spot: result.spot,
           });
         }
-        if (result.reason !== 'ok' || result.candidates.length === 0) {
-          scanRun.reject(result.reason !== 'ok' ? `scan:${result.reason}` : 'no_candidates');
+        if (result.reason !== 'ok') {
+          scanRun.reject(`scan:${result.reason}`);
+          continue;
+        }
+        if (result.candidates.length === 0) {
+          // TRA-5154 — same `no_candidates` bucket, now split by the first-binding
+          // reason the scanner stamped. One call, so parent and split agree.
+          scanRun.rejectSub('no_candidates', result.noCandidatesReason ?? 'unattributed');
           continue;
         }
 
@@ -17434,7 +17452,9 @@ export class SignalEngine {
       // through `withRetry`, which returns `[]` while Yahoo is rate-limited, so an
       // un-asked breaker would launder an outage into `fetchEmpty`.
       run: (batch) => runOtmDailySeriesBatch(batch, {
-        fetch: (sym) => fetchDailyCandles(sym, OTM_DAILY_SERIES_BARS),
+        // TRA-5092 — `'none'`: the batch module attributes primary vs fallback
+        // behaviourally; the in-feed Tradier leg would relabel fallback serves.
+        fetch: (sym) => fetchDailyCandles(sym, OTM_DAILY_SERIES_BARS, 'crumb', 'none'),
         breakerOpen: () => isYahooBreakerOpen(),
         // TRA-4424 (09-18) — Yahoo 429s ~permanently on Render (TRA-1230): measured
         // live, a Yahoo-only refresh left 142 of 145 seam reads `absent`. Tradier
@@ -18500,10 +18520,10 @@ export class SignalEngine {
         // the backfill is session- and Yahoo-breaker-independent.
         let dailyCloses = getSharedDailyCloses(sym) ?? [];
         if (dailyCloses.length === 0) {
-          let bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
-          if (bars.length === 0) {
-            bars = await fetchTradierDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
-          }
+          // TRA-5092 — the Yahoo → Tradier cascade this comment describes now
+          // lives inside `fetchDailyCandles` itself; the explicit second leg
+          // was folded in rather than left to double-spend a history request.
+          const bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
           if (bars.length > 0) {
             dailyCloses = bars.map((b) => b.close);
             setSharedDailyCloses(sym, dailyCloses);
@@ -18597,10 +18617,10 @@ export class SignalEngine {
         // prime the cache so the next pass is warm.
         let dailyCloses = getSharedDailyCloses(sym) ?? [];
         if (dailyCloses.length === 0) {
-          let bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
-          if (bars.length === 0) {
-            bars = await fetchTradierDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
-          }
+          // TRA-5092 — the Yahoo → Tradier cascade this comment describes now
+          // lives inside `fetchDailyCandles` itself; the explicit second leg
+          // was folded in rather than left to double-spend a history request.
+          const bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
           if (bars.length > 0) {
             dailyCloses = bars.map((b) => b.close);
             setSharedDailyCloses(sym, dailyCloses);
@@ -18662,6 +18682,11 @@ export class SignalEngine {
     // TRA-2262 — once per COMPLETED sweep, not once per budgeted slice, so the
     // wheel keeps exactly its pre-bound cadence and sees a whole-universe map.
     if (pass.complete) {
+      // TRA-5176 — count the completed sweep into the durable arrival ledger
+      // (sweep units, not budgeted slices, so `cycleCount` matches TRA-2262's
+      // cadence) and let it persist the session row. Synchronous enqueue; the
+      // ledger serialises its own I/O and can never break the scan pass.
+      noteShortPremiumCycleComplete(Date.now());
       if (routeWheel) {
         try {
           this.runWheelCycle(wheelScans, Date.now());
@@ -22416,6 +22441,18 @@ export class SignalEngine {
   /** TRA-1023 — operator reset of the options-sleeve breaker for the current day. */
   resetOptionsBreaker(): void {
     this.optionsBreaker.reset();
+  }
+
+  /**
+   * TRA-5127 — the broker-mirror predicate for a manual equity close, exposed
+   * so the close route can gate the ORDER verb without duplicating the
+   * decision `manualClosePosition` makes internally: a row in
+   * `liveEquityPositions` with a constructed live client routes a REAL
+   * Tradier market sell via `closeTradierEquityPosition`; everything else is
+   * a paper close and must stay open to every book.
+   */
+  wouldMirrorEquityCloseToBroker(positionId: string): boolean {
+    return this.liveEquityPositions.has(positionId) && this.tradierLiveEquityClient !== null;
   }
 
   manualClosePosition(positionId: string, currentPrice: number): Position | null {

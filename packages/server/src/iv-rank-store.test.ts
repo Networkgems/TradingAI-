@@ -1,7 +1,34 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'fs';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+
+// TRA-5172 — fault injection for the atomic-persist tests: a one-shot throw
+// from `writeFile` simulates a kill while the TMP file is being written, and a
+// one-shot throw from `rename` simulates a kill between the tmp write and the
+// swap. Passthrough when disarmed, so every other suite in this file runs
+// against the real fs.
+const fsFault = vi.hoisted(() => ({ failWriteOnce: false, failRenameOnce: false }));
+vi.mock('fs/promises', async (importOriginal) => {
+  const real = await importOriginal<typeof import('fs/promises')>();
+  return {
+    ...real,
+    writeFile: async (...args: Parameters<typeof real.writeFile>) => {
+      if (fsFault.failWriteOnce) {
+        fsFault.failWriteOnce = false;
+        throw new Error('TRA-5172 simulated kill mid-write');
+      }
+      return real.writeFile(...args);
+    },
+    rename: async (...args: Parameters<typeof real.rename>) => {
+      if (fsFault.failRenameOnce) {
+        fsFault.failRenameOnce = false;
+        throw new Error('TRA-5172 simulated rename failure');
+      }
+      return real.rename(...args);
+    },
+  };
+});
 import type { OptionChainRow } from '@trading-app/engine';
 import {
   computeIvRank,
@@ -13,6 +40,7 @@ import {
   atmIvFromRows,
   setIvStoreFileForTests,
   MIN_IV_SAMPLES,
+  readIvStoreProvenanceSync,
   readIvRankCoverageSync,
   isIvRankStoreLoaded,
   IV_RANK_COVERAGE_CODES,
@@ -294,5 +322,164 @@ describe('readIvRankCoverageSync (TRA-4917) — the five null branches are separ
       expect(IV_RANK_COVERAGE_CODES).toContain(extra);
       expect(IV_PERCENTILE_COVERAGE_CODES as readonly string[]).not.toContain(extra);
     }
+  });
+});
+
+// TRA-5171 — boot-load provenance: the three ways the store can read empty
+// (file absent / corrupt / parsed-but-shallow) must never serialise identically.
+describe('iv-store boot-load provenance (TRA-5171)', () => {
+  let dir: string;
+  let path: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'iv-prov-'));
+    path = join(dir, 'iv-history.json');
+    setIvStoreFileForTests(path);
+  });
+  afterEach(() => {
+    setIvStoreFileForTests(null);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reads loaded:false with bootLoad:null (never zeros) before the store loads', () => {
+    const view = readIvStoreProvenanceSync();
+    expect(view.loaded).toBe(false);
+    expect(view.bootLoad).toBeNull();
+    expect(view.storeFile).toBe(path);
+  });
+
+  it('file absent: storeFileExisted:false, parseError:null, zero samples', async () => {
+    await initIvRankStore();
+    const b = readIvStoreProvenanceSync().bootLoad!;
+    expect(b.storeFileExisted).toBe(false);
+    expect(b.parseError).toBeNull();
+    expect(b.symbolsLoadedAtBoot).toBe(0);
+    expect(b.samplesLoadedAtBoot).toBe(0);
+  });
+
+  it('NEGATIVE CONTROL: a TRUNCATED store file surfaces parseError — never the file-absent shape', async () => {
+    const valid = JSON.stringify({
+      version: 1,
+      updatedAt: 1,
+      symbols: { AAPL: [{ day: '2026-09-01', iv: 0.3 }] },
+    });
+    // A kill mid-write: syntactically broken JSON, exactly the TRA-5170 wipe mechanism.
+    writeFileSync(path, valid.slice(0, Math.floor(valid.length / 2)), 'utf-8');
+    await initIvRankStore();
+    const b = readIvStoreProvenanceSync().bootLoad!;
+    expect(b.storeFileExisted).toBe(true);
+    expect(b.parseError).not.toBeNull();
+    expect(b.samplesLoadedAtBoot).toBe(0);
+    // The forbidden serialisation: corrupt must NOT read as { samples: 0, parseError: null }.
+    expect(b.parseError === null && b.samplesLoadedAtBoot === 0).toBe(false);
+  });
+
+  it('a VALID 30-day store reads samplesLoadedAtBoot:30 with the depth histogram keyed at 30 — depth is a measurement, not an instrument ceiling', async () => {
+    const nowMs = Date.now();
+    const thirty = Array.from({ length: 30 }, (_, i) => ({
+      day: new Date(nowMs - (30 - i) * DAY).toISOString().slice(0, 10),
+      iv: 0.2 + i * 0.01,
+    }));
+    writeFileSync(path, JSON.stringify({ version: 1, updatedAt: nowMs, symbols: { AAPL: thirty } }), 'utf-8');
+    await initIvRankStore();
+    const b = readIvStoreProvenanceSync().bootLoad!;
+    expect(b.storeFileExisted).toBe(true);
+    expect(b.parseError).toBeNull();
+    expect(b.symbolsLoadedAtBoot).toBe(1);
+    expect(b.samplesLoadedAtBoot).toBe(30);
+    expect(b.distinctDaysInStore).toBe(30);
+    expect(b.depthHistogram).toEqual({ '30': 1 });
+    expect(b.oldestSampleDay).toBe(thirty[0]!.day);
+    expect(b.newestSampleDay).toBe(thirty[29]!.day);
+  });
+
+  it('counts successful persists since boot', async () => {
+    await initIvRankStore();
+    await recordDailyIv('AAA', 0.3);
+    await recordDailyIv('AAA', 0.4, Date.now() + DAY);
+    const view = readIvStoreProvenanceSync();
+    expect(view.persistCount).toBe(2);
+    expect(view.persistErrors).toBe(0);
+    expect(view.lastPersistError).toBeNull();
+  });
+});
+
+describe('atomic persist + fail-closed load (TRA-5172)', () => {
+  let dir: string;
+  let path: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'iv-5172-'));
+    path = join(dir, 'iv-history.json');
+    setIvStoreFileForTests(path);
+    fsFault.failWriteOnce = false;
+    fsFault.failRenameOnce = false;
+  });
+  afterEach(() => {
+    setIvStoreFileForTests(null);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('a kill during the tmp write leaves the PREVIOUS good file intact and parseable', async () => {
+    await recordDailyIv('AAA', 0.3); // a good store on disk
+    const before = readFileSync(path, 'utf-8');
+    expect(() => JSON.parse(before)).not.toThrow(); // control: parseable going in
+    fsFault.failWriteOnce = true;
+    await expect(recordDailyIv('AAA', 0.9, Date.now() + DAY)).rejects.toThrow('simulated kill mid-write');
+    expect(fsFault.failWriteOnce).toBe(false); // control: the plant actually fired
+    // The destination is BYTE-IDENTICAL to the previous good file — the in-place
+    // rewrite this ticket removes would have left it truncated here.
+    expect(readFileSync(path, 'utf-8')).toBe(before);
+    expect(readIvStoreProvenanceSync().persistErrors).toBe(1);
+  });
+
+  it('a kill between the tmp write and the swap also leaves the destination untouched, and the tmp is cleaned up', async () => {
+    await recordDailyIv('AAA', 0.3);
+    const before = readFileSync(path, 'utf-8');
+    fsFault.failRenameOnce = true;
+    await expect(recordDailyIv('AAA', 0.9, Date.now() + DAY)).rejects.toThrow('simulated rename failure');
+    expect(readFileSync(path, 'utf-8')).toBe(before);
+    expect(readdirSync(dir)).toEqual(['iv-history.json']); // no .tmp-* litter
+  });
+
+  it('THE WIPE, CLOSED: an unreadable store is never overwritten — refused persist, original bytes renamed aside', async () => {
+    const garbage = '{"version":1,"updatedAt":9,"symbols":{"AAPL":[{"day"';
+    writeFileSync(path, garbage, 'utf-8');
+    // The TRA-5170 wipe mechanism: load fails, and the very next recordDailyIv
+    // used to persist the empty map over the file.
+    await recordDailyIv('AAA', 0.3);
+    const view = readIvStoreProvenanceSync();
+    expect(view.loadFailed).toBe(true);
+    expect(view.persistRefusals).toBeGreaterThanOrEqual(1);
+    expect(view.corruptFileRenamedTo).toMatch(/iv-history\.corrupt-[0-9TZ-]+\.json$/);
+    // The ORIGINAL bytes are still on disk — renamed aside, not overwritten.
+    expect(readFileSync(view.corruptFileRenamedTo!, 'utf-8')).toBe(garbage);
+    // And nothing silently replaced the store path in the refused write.
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it('after the rename-aside a fresh store accumulates, and the refused sample is not lost', async () => {
+    writeFileSync(path, 'not json at all', 'utf-8');
+    await recordDailyIv('AAA', 0.3); // refused + renamed aside
+    await recordDailyIv('AAA', 0.4, Date.now() + DAY); // fresh store writes
+    const view = readIvStoreProvenanceSync();
+    expect(view.persistRefusals).toBe(1);
+    expect(view.persistCount).toBe(1);
+    const fresh = JSON.parse(readFileSync(path, 'utf-8')) as { symbols: Record<string, unknown[]> };
+    expect(fresh.symbols['AAA']).toHaveLength(2); // the refused day came along in the cache
+  });
+
+  it('while the rename-aside itself fails, EVERY persist keeps refusing and the original is never clobbered', async () => {
+    const garbage = 'junk{{{';
+    writeFileSync(path, garbage, 'utf-8');
+    fsFault.failRenameOnce = true; // the first aside attempt fails (locked file, perms, ...)
+    await recordDailyIv('AAA', 0.3);
+    let view = readIvStoreProvenanceSync();
+    expect(view.persistRefusals).toBe(1);
+    expect(view.corruptFileRenamedTo).toBeNull();
+    expect(readFileSync(path, 'utf-8')).toBe(garbage); // still fail-CLOSED, nothing clobbered
+    // Next write attempt: still refused, but the retry of the rename succeeds.
+    await recordDailyIv('AAA', 0.4, Date.now() + DAY);
+    view = readIvStoreProvenanceSync();
+    expect(view.persistRefusals).toBe(2);
+    expect(readFileSync(view.corruptFileRenamedTo!, 'utf-8')).toBe(garbage);
   });
 });

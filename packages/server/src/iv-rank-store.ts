@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, rename, rm } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import type { OptionChainRow } from '@trading-app/engine';
@@ -31,6 +31,13 @@ let storeFileOverride: string | null = null;
 export function setIvStoreFileForTests(path: string | null): void {
   storeFileOverride = path;
   cache = null;
+  bootProvenance = null;
+  persistCount = 0;
+  persistErrors = 0;
+  lastPersistError = null;
+  loadFailed = false;
+  persistRefusals = 0;
+  corruptFileRenamedTo = null;
 }
 function storeFile(): string {
   return storeFileOverride ?? defaultStoreFile();
@@ -64,11 +71,109 @@ function utcDay(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
+// ── Boot-load provenance (TRA-5171) ─────────────────────────────────────────
+//
+// bqb1 published `ivSampleDepth: 2` on 82/82 scans after THREE MONTHS of daily
+// recording, and no surface could say WHY the store was that shallow. The three
+// candidate mechanisms serialise identically without this block:
+//   file absent      → storeFileExisted:false, parseError:null,  samples 0
+//   file corrupt     → storeFileExisted:true,  parseError:"...", samples 0
+//   parsed + shallow → storeFileExisted:true,  parseError:null,  samples N>0
+// Those three MUST never read the same — that identity is the defect this
+// exists to kill. Captured at the moment the store is actually loaded (boot via
+// `initIvRankStore`, or the first lazy `recordDailyIv`), never re-derived.
+
+/** What the trailing-IV store found the moment it loaded from disk. */
+export interface IvStoreBootProvenance {
+  /** Resolved store path, so a reader can see which disk root it lives under. */
+  storeFile: string;
+  /** Did the file exist when the load ran. */
+  storeFileExisted: boolean;
+  /** The load's catch reason, verbatim — non-null means the file was unreadable/corrupt. */
+  parseError: string | null;
+  symbolsLoadedAtBoot: number;
+  samplesLoadedAtBoot: number;
+  oldestSampleDay: string | null;
+  newestSampleDay: string | null;
+  distinctDaysInStore: number;
+  /**
+   * Usable in-window depth (as of load time) → symbol count. The live incident's
+   * uniform depth-2 shape is itself evidence; publish it rather than making a
+   * grader re-derive it from 82 per-scan rows.
+   */
+  depthHistogram: Record<string, number>;
+  loadedAt: string;
+}
+
+let bootProvenance: IvStoreBootProvenance | null = null;
+let persistCount = 0;
+let persistErrors = 0;
+let lastPersistError: string | null = null;
+
+// ── Fail-closed load failure (TRA-5172) ─────────────────────────────────────
+//
+// Before this, a load failure started an empty cache and the very next
+// `recordDailyIv` persisted that empty map over the file: one unreadable byte
+// permanently destroyed up to a year of history, with no deploy and no error
+// anyone could see (bqb1 exposes no log surface to a grader). Now a failed load
+// sets `loadFailed`, and `persist()` REFUSES to write for as long as the
+// unreadable original still sits at the destination path — a degraded in-memory
+// store is strictly better than a destroyed on-disk one. Each refused write
+// attempts to move the original aside to `iv-history.corrupt-<ts>.json` so the
+// bytes survive for forensics; only a successful rename re-opens the write path.
+
+/** True once a load attempt failed in this process (`bootLoad.parseError` has the reason). */
+let loadFailed = false;
+/** Writes refused because the unreadable original was still at the store path. */
+let persistRefusals = 0;
+/** Where the unreadable file was moved for forensics, once the rename succeeds. */
+let corruptFileRenamedTo: string | null = null;
+
+/** The forensics path: `iv-history.corrupt-<ts>.json` beside the store (`:`/`.` are not Windows-safe). */
+function corruptAsidePath(path: string, atMs: number): string {
+  const stamp = new Date(atMs).toISOString().replace(/[:.]/g, '-');
+  return path.endsWith('.json')
+    ? `${path.slice(0, -'.json'.length)}.corrupt-${stamp}.json`
+    : `${path}.corrupt-${stamp}`;
+}
+
+function captureBootProvenance(
+  map: Map<string, IvSample[]>,
+  path: string,
+  storeFileExisted: boolean,
+  parseError: string | null,
+  loadedAtMs: number,
+): void {
+  let samplesLoaded = 0;
+  const days = new Set<string>();
+  const depthHistogram: Record<string, number> = {};
+  for (const arr of map.values()) {
+    samplesLoaded += arr.length;
+    for (const s of arr) days.add(s.day);
+    const depth = usableInWindowDepth(arr, loadedAtMs);
+    depthHistogram[String(depth)] = (depthHistogram[String(depth)] ?? 0) + 1;
+  }
+  const sortedDays = [...days].sort();
+  bootProvenance = {
+    storeFile: path,
+    storeFileExisted,
+    parseError,
+    symbolsLoadedAtBoot: map.size,
+    samplesLoadedAtBoot: samplesLoaded,
+    oldestSampleDay: sortedDays[0] ?? null,
+    newestSampleDay: sortedDays[sortedDays.length - 1] ?? null,
+    distinctDaysInStore: days.size,
+    depthHistogram,
+    loadedAt: new Date(loadedAtMs).toISOString(),
+  };
+}
+
 async function ensureLoaded(): Promise<Map<string, IvSample[]>> {
   if (cache) return cache;
   const path = storeFile();
   if (!existsSync(path)) {
     cache = new Map();
+    captureBootProvenance(cache, path, false, null, Date.now());
     return cache;
   }
   try {
@@ -92,11 +197,16 @@ async function ensureLoaded(): Promise<Map<string, IvSample[]>> {
       }
     }
     cache = map;
+    captureBootProvenance(cache, path, true, null, Date.now());
   } catch (err) {
-    log.error('failed to read IV store, starting empty', {
-      reason: err instanceof Error ? err.message : String(err),
-    });
+    const reason = err instanceof Error ? err.message : String(err);
+    log.error('failed to read IV store, starting empty in-memory; persists refused until the file is moved aside', { reason });
     cache = new Map();
+    // TRA-5172 — fail CLOSED: mark the failure so persist() refuses to clobber
+    // the unreadable original (the leading wipe hypothesis on TRA-5170). The
+    // provenance block makes the mechanism readable from the health route.
+    loadFailed = true;
+    captureBootProvenance(cache, path, true, reason, Date.now());
   }
   return cache;
 }
@@ -104,6 +214,29 @@ async function ensureLoaded(): Promise<Map<string, IvSample[]>> {
 async function persist(): Promise<void> {
   if (!cache) return;
   const path = storeFile();
+
+  // TRA-5172 — while the unreadable original still occupies the store path, a
+  // write would destroy the only copy of the bytes. Refuse (counted), try to
+  // move the original aside for forensics, and only let a FUTURE persist write
+  // once the rename has succeeded. The refused sample is not lost: it stays in
+  // the cache and lands with the next persist. Never silently replace.
+  if (loadFailed && corruptFileRenamedTo == null) {
+    persistRefusals++;
+    const aside = corruptAsidePath(path, Date.now());
+    try {
+      await rename(path, aside);
+      corruptFileRenamedTo = aside;
+      log.warn('unreadable IV store moved aside for forensics; a fresh store will start accumulating', { aside });
+    } catch (err) {
+      // Rename failed (locked, perms, already gone) — stay closed and keep
+      // serving the in-memory store; the next persist attempt retries.
+      log.error('refusing to persist over an unreadable IV store (rename-aside failed)', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
+
   const dir = dirname(path);
   if (!existsSync(dir)) await mkdir(dir, { recursive: true });
   const payload: StoreFile = {
@@ -111,7 +244,70 @@ async function persist(): Promise<void> {
     updatedAt: Date.now(),
     symbols: Object.fromEntries(cache),
   };
-  await writeFile(path, JSON.stringify(payload), 'utf-8');
+  // TRA-5172 — tmp + rename, the same durability idiom the package's sibling
+  // stores use (cost-aware-gate-ledger, hard-controls, chain-partition-compactor
+  // …): this store used to rewrite the whole file IN PLACE on every
+  // `recordDailyIv` call, so a kill mid-write (deploy SIGTERM, or the memory
+  // watchdog's pm2 self-restart, which writes no deploy record at all) left a
+  // truncated file the next boot could not parse.
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    await writeFile(tmp, JSON.stringify(payload), 'utf-8');
+    await rename(tmp, path);
+    persistCount++;
+  } catch (err) {
+    // Counted, then rethrown; the previous good file is untouched either way.
+    await rm(tmp, { force: true }).catch(() => {});
+    persistErrors++;
+    lastPersistError = err instanceof Error ? err.message : String(err);
+    throw err;
+  }
+}
+
+/** Provenance + since-boot persist counters, as published on /api/health/short-premium. */
+export interface IvStoreProvenanceView {
+  /** Whether the store has been loaded in this process (false ⇒ `bootLoad` is null). */
+  loaded: boolean;
+  /** Resolved store path — readable even before the store loads. */
+  storeFile: string;
+  /** Null until the store loads; never fabricated from defaults. */
+  bootLoad: IvStoreBootProvenance | null;
+  /** Successful whole-store writes since boot. */
+  persistCount: number;
+  /** Failed whole-store writes since boot. */
+  persistErrors: number;
+  lastPersistError: string | null;
+  /**
+   * TRA-5172 — true once a load attempt failed in this process. Read beside
+   * `bootLoad.parseError` (the reason) and `corruptFileRenamedTo`: failed +
+   * renamed means a fresh store is accumulating and the original bytes are
+   * safe; failed + not renamed means every persist is being refused.
+   */
+  loadFailed: boolean;
+  /** Writes refused because the unreadable original was still at the store path. */
+  persistRefusals: number;
+  /** Forensics path the unreadable original was moved to, once the rename succeeds. */
+  corruptFileRenamedTo: string | null;
+}
+
+/**
+ * TRA-5171 — synchronous read of the boot-load provenance for the health route.
+ * Honest-null discipline: an unloaded store reads `bootLoad: null`, which can
+ * never be confused with a loaded-but-empty one (`bootLoad.samplesLoadedAtBoot: 0`
+ * plus the file-existed/parse-error discriminators).
+ */
+export function readIvStoreProvenanceSync(): IvStoreProvenanceView {
+  return {
+    loaded: cache != null,
+    storeFile: storeFile(),
+    bootLoad: bootProvenance,
+    persistCount,
+    persistErrors,
+    lastPersistError,
+    loadFailed,
+    persistRefusals,
+    corruptFileRenamedTo,
+  };
 }
 
 /** Eagerly load the store so the sync accessor has data right after boot. */
@@ -258,6 +454,17 @@ function windowFor(samples: readonly IvSample[], asOf: number): IvSample[] {
   const cutoffMs = asOf - TRAILING_DAYS * 86_400_000;
   const cutoff = utcDay(cutoffMs);
   return samples.filter((s) => s.day >= cutoff);
+}
+
+/**
+ * TRA-5171 — USABLE in-window sample depth: the trailing window further filtered
+ * to finite positive IVs, i.e. exactly the count {@link MIN_IV_SAMPLES} binds
+ * against inside {@link computeIvRank}. Exported so the boot-provenance depth
+ * histogram and the chain-archive seedable-depth census measure the SAME
+ * statistic the live gate does, not a near-miss of it.
+ */
+export function usableInWindowDepth(samples: readonly IvSample[], asOf: number = Date.now()): number {
+  return windowFor(samples, asOf).filter((s) => Number.isFinite(s.iv) && s.iv > 0).length;
 }
 
 /**
