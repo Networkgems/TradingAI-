@@ -66,6 +66,39 @@
 // running max over every day on disk, seeded from the measurement above. They are
 // read off identity, the clock and row COUNTS only — never a quote.
 //
+// ── THE FORWARD EXPECTATION DECAYS OVER THE SLOT'S LIFE (TRA-5211, policy v4) ─
+// v3's reserve and share denominator were forward-looking and NEVER RELEASED:
+// `floorK × unseen` held rows for every symbol the learner still expected, and
+// the share divided headroom by the learner's whole-slot row max, to the last
+// minute of the slot. When the expected demand did not present — measured
+// 2026-10-02/10-05: utilisation 61.5%/57.0%, with 4,289/4,575 rows shed in
+// slots that still had headroom, in EVERY slot on both days — the headroom
+// expired unused while real rows had been turned away against it. A de facto
+// 38% sample cut, bought without a ruling (TRA-4905 ruled NO-CUT).
+// v4 keeps both terms but gives them the LIFETIME v3 forgot: at slot fraction
+// `f`, each is capped by a uniform-rate projection from what has ACTUALLY
+// arrived (`arrivals × (1−f)/f`), so an expectation the tape is still owed
+// stands, and one the arrival process has falsified releases. Both caps read
+// counts and the clock only — never a quote. Two asymmetries are deliberate:
+//   - the RESERVE projects on raw `f` and its `ceil` keeps ≥1 symbol's floor
+//     reserved until the slot's final minute — the straggler guard, which is
+//     why this is a decay and not a deletion (deleting the reserve re-opens
+//     the TRA-4954 starvation defect);
+//   - the SHARE projects on `f + one minute` (rows observed by a pass stamped
+//     at minute `m` arrived within `[0, m+1)` minutes — the correct estimator
+//     at minute resolution, not a tuning constant). At `f == 0` BOTH terms
+//     fall back to the learner — no observation window exists yet, and that
+//     is what keeps minute-0 passes (and the v3 fixtures) byte-identical.
+//     Simulated on uniform / mixed / back-loaded arrival shapes:
+//     shed-while-budget-free 0.2–3.6% vs 29.7–32.3% measured live, with
+//     per-pass spending no more arrival-order-correlated than v3 (heavy-slot
+//     min banked per symbol 13, unchanged).
+// A slot whose WHOLE demand lands in its first minutes and then goes silent
+// still under-fills (the projection refuses to under-read demand that early —
+// spending the budget first-come is the v2 defect, not a remedy); live
+// arrivals are spread by the ~45-min universe cycle, so that shape is not the
+// operating one.
+//
 // 🔴 WHICH rows survive a truncation is chosen by `fnv1a(occSymbol)` rank, NOT by
 // chain position. Truncating by chain position correlates with strike and
 // therefore with mark — the thing rule 2 exists to avoid. A hash rank is a
@@ -166,14 +199,20 @@ export const OTM_ADMISSION_TAPE = 'otm-admission-tape';
  * Rows written by this build carry this; v1 rows (no field) are open-biased.
  *
  * `2` = the slot sampler with WHOLE-PASS budget eviction (2026-09-19 → 10-02).
- * `3` = the same sampler with THINNING eviction (TRA-4954). A v3 slot is a
- * per-symbol-capped subsample of its own demand where a v2 slot was a
- * first-come prefix of it, so the two must not be pooled inside one readout —
- * filter `samplingPolicy === 3` for anything that reads per-symbol coverage.
- * Both are quote-independent, so `>= 2` remains the correct filter for the
- * TRA-4623 AC4 session count and for any mark/spread retention ratio.
+ * `3` = the same sampler with THINNING eviction (TRA-4954, 2026-10-02 →
+ * 10-05). A v3 slot is a per-symbol-capped subsample of its own demand where
+ * a v2 slot was a first-come prefix of it.
+ * `4` = v3 thinning with a DECAYING forward expectation (TRA-5211): same
+ * floors, same budgets, same hash-rank truncation — only the slot's
+ * within-life spending profile moved (v3 banked 57.0–61.5% of the budget and
+ * shed ~4.4k desk rows/session against free headroom). Policies must not be
+ * pooled inside one readout: filter `samplingPolicy >= 3` for per-symbol
+ * coverage, `=== 4` for anything that reads within-slot density or
+ * utilisation. All of 2..4 are quote-independent, so `>= 2` remains the
+ * correct filter for the TRA-4623 AC4 session count and for any mark/spread
+ * retention ratio.
  */
-export const OTM_ADMISSION_SAMPLING_POLICY = 3;
+export const OTM_ADMISSION_SAMPLING_POLICY = 4;
 /** ET slot width for the sampler (rule 1) and the budget (rule 3). */
 const SLOT_MINUTES = 30;
 /**
@@ -523,6 +562,16 @@ export function otmAdmissionSlot(ms: number): number {
   return Math.floor((hour * 60 + minute) / SLOT_MINUTES);
 }
 
+/**
+ * TRA-5211 — fraction of the ET 30-minute slot elapsed at an instant, minute
+ * resolution (`0, 1/30, …, 29/30`). Exported so a grader can reproduce a live
+ * allowance off the row's own `ts` without reading source.
+ */
+export function otmAdmissionSlotFraction(ms: number): number {
+  const { hour, minute } = etClockParts(new Date(ms));
+  return ((hour * 60 + minute) % SLOT_MINUTES) / SLOT_MINUTES;
+}
+
 // Hydrate memo: every row of a pass shares one ts, so this almost always hits.
 let slotMemoTs = Number.NaN;
 let slotMemo = 0;
@@ -579,6 +628,14 @@ export interface OtmAdmissionSlotState {
   expectedRows: number;
   /** The pass's full size, in candidate rows. */
   passRows: number;
+  /**
+   * TRA-5211 — fraction of the ET slot already elapsed at this pass, in
+   * `[0, 1)` at minute resolution (see {@link otmAdmissionSlotFraction}).
+   * Clock-derived upstream — identity and the clock only, never a quote.
+   * ABSENT or `0` (a slot's first minute: no observation window yet) ⇒ both
+   * projections stay off and the function computes exactly the v3 allowance.
+   */
+  slotFractionElapsed?: number;
 }
 
 /**
@@ -587,11 +644,29 @@ export interface OtmAdmissionSlotState {
  * function, provable without a session of tape.
  *
  * ```
- *   floorK  = min(FLOOR_ROWS_PER_SYMBOL, budget / expectedSymbols)   ≥ 1
- *   reserve = floorK × (symbols expected but not yet presented, incl. this one)
- *   share   = ceil((budget − banked − reserve) × n / rows still expected)
- *   allow   = min(n, max(share, isNew ? floorK : 0), budget − banked)
+ *   floorK   = min(FLOOR_ROWS_PER_SYMBOL, budget / expectedSymbols)   ≥ 1
+ *   unseen   = min(symbols expected but not yet presented,            // TRA-5211:
+ *                  ceil(arrivals × (1−f) / f))      // the arrival projection —
+ *                                                   // what the slot's own tape
+ *                                                   // says can still come
+ *   reserve  = floorK × (unseen + 1 if this symbol is new)
+ *   remain   = min(rows still expected, ceil(presentedᵢₙcₗ × (1−fₑ) / fₑ))
+ *              where fₑ = f + one minute (the observation window's true end)
+ *   share    = ceil((budget − banked − reserve) × n / max(n, remain))
+ *   allow    = min(n, max(share, isNew ? floorK : 0), budget − banked)
  * ```
+ *
+ * `slotFractionElapsed` ABSENT skips both projections — the undecayed v3
+ * formula, byte for byte. With it, the learner's whole-slot expectation is a
+ * CEILING the arrival process pays down rather than a lien held to the last
+ * minute: a slot that is owed more rows keeps its reserve (the projection
+ * exceeds the learner cap and the cap governs, exactly as before), and a slot
+ * whose expected demand is measurably not arriving releases the headroom to
+ * rows that DID present — instead of shedding them against budget that then
+ * expires unused (57.0–61.5% utilisation measured 2026-10-02/05, TRA-5211).
+ * The reserve's `ceil` keeps ≥ 1 symbol's floor reserved until the slot's
+ * final minute, so the decay can never re-open the TRA-4954 starvation
+ * defect by itself; only the share's denominator uses the one-minute lead.
  *
  * Two invariants fall straight out of that, and the tests assert both:
  *   - **AC1 (no starvation).** After admitting a new symbol,
@@ -625,14 +700,43 @@ export function otmAdmissionSlotAllowance(state: OtmAdmissionSlotState): number 
   // an under-read would hand the tail's reserve to whoever scanned first.
   const expectedSymbols = Math.max(1, state.expectedSymbols, seen + (state.symbolIsNew ? 1 : 0));
   const floorK = Math.max(1, Math.min(FLOOR_ROWS_PER_SYMBOL, Math.floor(budget / expectedSymbols)));
+
+  // TRA-5211 — the slot's elapsed fraction. `undefined` disables both
+  // projections (the v3 shape); the caller passes it on every live pass.
+  const f = state.slotFractionElapsed == null
+    ? null
+    : Math.min(1, Math.max(0, state.slotFractionElapsed));
+
   // Includes THIS symbol while it is still unseen; `guaranteed` is how it draws
   // its own share back out, which is what keeps the invariant exact.
-  const unseen = Math.max(0, expectedSymbols - seen);
+  // TRA-5211: capped by the uniform-rate arrival projection on RAW `f` — a
+  // symbol population that has stopped arriving releases its reserve, while
+  // `ceil` holds ≥ 1 symbol's floor to the slot's last minute (the straggler
+  // guard; deleting the reserve outright re-opens TRA-4954's starvation).
+  const arrivals = seen + (state.symbolIsNew ? 1 : 0);
+  const unseenByLearner = Math.max(0, expectedSymbols - seen) - (state.symbolIsNew ? 1 : 0);
+  const projectedUnseen = f != null && f > 0
+    ? Math.ceil((arrivals * (1 - f)) / f)
+    : unseenByLearner;
+  const unseen = Math.min(unseenByLearner, Math.max(0, projectedUnseen)) + (state.symbolIsNew ? 1 : 0);
   const headroom = Math.max(0, budget - banked - floorK * unseen);
 
   const presented = Math.max(0, Math.floor(state.presented));
   const expectedRows = Math.max(state.expectedRows, presented + n);
-  const remainingRows = Math.max(n, expectedRows - presented);
+  // TRA-5211: capped by the same projection on `f + one minute` — rows
+  // observed by a pass stamped at minute `m` arrived within `[0, m+1)`
+  // minutes, so the lead is the estimator's correct observation window at
+  // minute resolution, not a tuning constant. At `f == 0` there is no
+  // observation window at all and the learner governs alone (which is also
+  // what keeps `slotFractionElapsed: 0` byte-identical to the v3 formula).
+  // The learner max stays as the CEILING: the projection may only release
+  // expectation, never inflate it.
+  const learnerRemaining = expectedRows - presented;
+  const fShare = f != null && f > 0 ? Math.min(1, f + 1 / SLOT_MINUTES) : null;
+  const projectedRemaining = fShare != null
+    ? Math.ceil(((presented + n) * (1 - fShare)) / fShare)
+    : learnerRemaining;
+  const remainingRows = Math.max(n, Math.min(learnerRemaining, projectedRemaining));
   const share = Math.ceil((headroom * n) / remainingRows);
 
   // 🔴 MAX, not PLUS. The floor is a FLOOR UNDER the proportional share, not a
@@ -983,6 +1087,9 @@ export function beginOtmAdmissionPass(ctx: OtmAdmissionPassContext): OtmAdmissio
         expectedSymbols: demand.symbols,
         expectedRows: demand.rows,
         passRows: decisions.length,
+        // TRA-5211 — from the pass's own captured `now`, so the fraction and
+        // the slot index can never disagree about which cell this is.
+        slotFractionElapsed: otmAdmissionSlotFraction(now),
       });
       const shed = decisions.length - allow;
       /**
@@ -1450,7 +1557,7 @@ export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
       retainDays: Math.round(RETAIN_MS / (24 * 60 * 60 * 1000)),
       maxFileBytes: MAX_FILE_BYTES,
       sampling:
-        'v3 slot sampler: first ok pass per (book×symbol) per ET 30-min slot, selected by fnv1a(book|symbol|etDay|slot) % sampleMod — decided from identity and clock before the scan, independent of mark, spreadPct, scan order and time-of-day. Rule 3 (the per-(class×day×slot) row budget) THINS rather than starves since policy v3 (TRA-4954): every symbol that presents in a slot is reserved min(floorRowsPerSymbol, budget/expectedSymbols) >= 1 rows, and the discretionary remainder is split in PROPORTION to pass size, so the shed FRACTION does not depend on chain width. Which rows survive a truncation is fnv1a(occSymbol) rank — NEVER chain position, which correlates with strike and therefore with mark. v2 days (2026-09-19..2026-10-01) dropped whole passes first-come instead: on those days a slot is a first-come PREFIX of its demand and 54 (desk) / 985 (fixture) (slot×symbol) cells banked zero rows, biasing max_spread_pct binding upward — filter samplingPolicy === 3 for any per-symbol coverage readout; >= 2 remains correct for AC4 sessions and for mark/spread retention. Rows without samplingPolicy are v1 (open-biased) and excluded from sessionsWithAdmissions. Rule 2 is unchanged: a pass over maxRowsPerPass is still dropped WHOLE, never truncated. Every shed pass writes a durable kind:budgetdrop row carrying slot, underlying, rows (SHED), passRows (full size) and banked (survivors) — read days[].dropsBySlotEt, which is per-slot and survives a boot; counters.slotBudget* are only process totals. wholeDrops > 0 on a v3 day is NOT by itself the AC1 alarm: several BOOKS of one class can scan the same underlying in one slot, and the second such pass legitimately banks 0 once that symbol already holds its floor (measured 286/1665 fixture passes with AC1 clean). AC1 is (slot x SYMBOL) coverage and is read off the raw pull — no (slot, underlying) may hold a budgetdrop row and zero candidate rows; days[].symbolsPresentedBySlotEt is its denominator. On v2 days wholeDrops == passes by construction, which IS the defect, not a regression. budgetdrop rows are NOT sample: they are in no candidateRows/admitted/ranked/ordered/sessionsWithAdmissions count. kind:ranked links are deduped per (etDay, slot, accountClass, occSymbol) — information-preserving, since the candidate leg of the survivorship join is itself (etDay, slot)-granular; skips are counted as rankedDuplicatesSkipped, and pre-2026-09-25 days hold the un-deduped multiset. kind:ordered is UNCONDITIONAL — never deduped, never throttled, never budgeted (execution provenance).',
+        'v3 slot sampler: first ok pass per (book×symbol) per ET 30-min slot, selected by fnv1a(book|symbol|etDay|slot) % sampleMod — decided from identity and clock before the scan, independent of mark, spreadPct, scan order and time-of-day. Rule 3 (the per-(class×day×slot) row budget) THINS rather than starves since policy v3 (TRA-4954): every symbol that presents in a slot is reserved min(floorRowsPerSymbol, budget/expectedSymbols) >= 1 rows, and the discretionary remainder is split in PROPORTION to pass size, so the shed FRACTION does not depend on chain width. Since policy v4 (TRA-5211, 2026-10-06) the forward expectation DECAYS over the slot: the floor reserve and the share denominator are each capped by a uniform-rate projection from the arrivals actually observed (reserve on the raw elapsed fraction, with >=1 symbol floor held to the last minute; share on elapsed + one minute, the estimator observation window at minute resolution), so headroom the arrival process has falsified is released to rows that presented instead of expiring unused — v3 banked 57.0-61.5% of the slot budget while shedding ~4.4k desk rows/session against free headroom. Reproduce a live allowance with otmAdmissionSlotFraction(ts); budgets, floors, seeds and the hash-rank truncation are UNCHANGED from v3. Which rows survive a truncation is fnv1a(occSymbol) rank — NEVER chain position, which correlates with strike and therefore with mark. v2 days (2026-09-19..2026-10-01) dropped whole passes first-come instead: on those days a slot is a first-come PREFIX of its demand and 54 (desk) / 985 (fixture) (slot×symbol) cells banked zero rows, biasing max_spread_pct binding upward — filter samplingPolicy >= 3 for any per-symbol coverage readout, === 4 for within-slot density or utilisation (v3 days 2026-10-02..10-05 under-filled every slot); >= 2 remains correct for AC4 sessions and for mark/spread retention. Rows without samplingPolicy are v1 (open-biased) and excluded from sessionsWithAdmissions. Rule 2 is unchanged: a pass over maxRowsPerPass is still dropped WHOLE, never truncated. Every shed pass writes a durable kind:budgetdrop row carrying slot, underlying, rows (SHED), passRows (full size) and banked (survivors) — read days[].dropsBySlotEt, which is per-slot and survives a boot; counters.slotBudget* are only process totals. wholeDrops > 0 on a v3 day is NOT by itself the AC1 alarm: several BOOKS of one class can scan the same underlying in one slot, and the second such pass legitimately banks 0 once that symbol already holds its floor (measured 286/1665 fixture passes with AC1 clean). AC1 is (slot x SYMBOL) coverage and is read off the raw pull — no (slot, underlying) may hold a budgetdrop row and zero candidate rows; days[].symbolsPresentedBySlotEt is its denominator. On v2 days wholeDrops == passes by construction, which IS the defect, not a regression. budgetdrop rows are NOT sample: they are in no candidateRows/admitted/ranked/ordered/sessionsWithAdmissions count. kind:ranked links are deduped per (etDay, slot, accountClass, occSymbol) — information-preserving, since the candidate leg of the survivorship join is itself (etDay, slot)-granular; skips are counted as rankedDuplicatesSkipped, and pre-2026-09-25 days hold the un-deduped multiset. kind:ordered is UNCONDITIONAL — never deduped, never throttled, never budgeted (execution provenance).',
     },
     counters: {
       unsampledPasses,

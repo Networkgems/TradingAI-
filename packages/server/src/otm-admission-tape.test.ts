@@ -12,6 +12,7 @@ import {
   hydrateOtmAdmissionTapeFromDisk,
   otmAdmissionSlot,
   otmAdmissionSlotAllowance,
+  otmAdmissionSlotFraction,
   otmAdmissionSlotSelected,
   otmAdmissionTapePath,
   readOtmAdmissionTapeRows,
@@ -435,10 +436,13 @@ describe('TRA-4906 — the sample parameters are UNCHANGED by this ticket (AC5)'
     expect(policy.maxFileBytes).toBe(144 * 1024 * 1024);
     expect(policy.maxRowsPerPass).toBe(400);
     expect(policy.sampleModDesk).toBe(12);
-    // TRA-4954 bumped this to 3. The dedup (TRA-4906) was NOT a policy bump —
-    // no candidate row moved — but thinning IS one: a v3 slot is a per-symbol
-    // capped subsample of its demand where a v2 slot was a first-come prefix.
-    expect(policy.samplingPolicy).toBe(3);
+    // TRA-4954 bumped this to 3 (thinning: a v3 slot is a per-symbol capped
+    // subsample of its demand where a v2 slot was a first-come prefix), and
+    // TRA-5211 to 4 (the forward expectation decays over the slot's life, so
+    // the within-slot spending profile moved from 57-61% to ~full budget on a
+    // saturated slot). The dedup (TRA-4906) was NOT a bump — no candidate row
+    // moved.
+    expect(policy.samplingPolicy).toBe(4);
   });
 
   it('🔴 TRA-4954 did NOT raise the budget or the byte cap (AC2/AC4)', () => {
@@ -626,6 +630,143 @@ describe('TRA-4954 — the slot budget THINS wide-chain names instead of starvin
     const cell = live[`desk|${otmAdmissionSlot(NOW)}`]!;
     expect(cell.symbols).toBeGreaterThanOrEqual(20); // learned, floored at the seed
     expect(cell.rows).toBe(2100); // the SEED — today is not prior-day history
+  });
+});
+
+// ── TRA-5211 — the forward expectation DECAYS instead of expiring unused ────
+
+/**
+ * Replay a desk slot with passes ARRIVING ACROSS ITS LIFE (minute-resolution
+ * timestamps), the shape the single-instant {@link replaySlot} cannot express
+ * and the one the decay exists for. Read back off disk, never off a counter.
+ */
+function replaySlotTimed(
+  book: string,
+  sizes: { size: number; minute: number }[],
+): { banked: Map<string, number>; presented: number; bankedTotal: number } {
+  const slot = otmAdmissionSlot(NOW);
+  const etDay = new Date(NOW).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  const chosen: string[] = [];
+  for (let i = 0; chosen.length < sizes.length && i < 200_000; i += 1) {
+    const sym = `W${i}`;
+    if (otmAdmissionSlotSelected(book, sym, etDay, slot, 'desk')) chosen.push(sym);
+  }
+  chosen.forEach((sym, i) => {
+    const now = NOW + sizes[i]!.minute * 60_000 + i; // NOW is minute 0 of its slot
+    const p = beginOtmAdmissionPass({ symbol: sym, book, mode: 'live', now });
+    if (!p) throw new Error(`pass ${sym} was not selected — fix the fixture`);
+    for (let k = 0; k < sizes[i]!.size; k += 1) {
+      p.onAdmission(decision({ underlying: sym, occSymbol: `${sym}C${String(k).padStart(5, '0')}` }));
+    }
+    p.commit();
+  });
+  const rows = readFileSync(otmAdmissionTapePath(dir), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const banked = new Map<string, number>(chosen.map((s) => [s, 0]));
+  let bankedTotal = 0;
+  for (const r of rows) {
+    if (r.kind !== 'candidate') continue;
+    banked.set(r.underlying, (banked.get(r.underlying) ?? 0) + 1);
+    bankedTotal += 1;
+  }
+  return { banked, presented: sizes.reduce((a, b) => a + b.size, 0), bankedTotal };
+}
+
+describe('TRA-5211 — the floor reservation decays over the slot instead of expiring unused', () => {
+  const mid = {
+    budget: 1000, banked: 300, presented: 700, symbolsSeen: 20, symbolIsNew: true,
+    expectedSymbols: 48, expectedRows: 2100, passRows: 60,
+  };
+
+  it('an ABSENT or ZERO slotFractionElapsed computes the undecayed v3 allowance exactly', () => {
+    // The backward-compatibility contract: a slot's first minute has no
+    // observation window, so both projections stay off — which is also what
+    // keeps every single-instant TRA-4954 fixture above (NOW is minute 0 of
+    // its slot) grading the same policy it graded before this ticket.
+    for (const isNew of [true, false]) {
+      for (const n of [1, 40, 246]) {
+        const st = { ...mid, symbolIsNew: isNew, passRows: n };
+        const undecayed = otmAdmissionSlotAllowance(st);
+        expect(otmAdmissionSlotAllowance({ ...st, slotFractionElapsed: 0 })).toBe(undecayed);
+        expect(otmAdmissionSlotAllowance({ ...st, slotFractionElapsed: undefined })).toBe(undecayed);
+      }
+    }
+  });
+
+  it('the allowance is non-decreasing in slot age — decay only ever RELEASES headroom', () => {
+    let prev = 0;
+    for (let m = 0; m < 30; m += 1) {
+      const a = otmAdmissionSlotAllowance({ ...mid, slotFractionElapsed: m / 30 });
+      expect(a).toBeGreaterThanOrEqual(prev);
+      prev = a;
+    }
+    // …and a stalled expectation has measurably released by late slot: 20 of 48
+    // expected symbols arrived, 700 of 2100 expected rows presented, yet v3
+    // held the full reserve + denominator to the last minute.
+    expect(otmAdmissionSlotAllowance({ ...mid, slotFractionElapsed: 29 / 30 }))
+      .toBeGreaterThan(otmAdmissionSlotAllowance(mid));
+  });
+
+  it('AC2 and the per-arrival floor survive every decay state (swept over f)', () => {
+    for (const f of [0, 1 / 30, 0.25, 0.5, 0.75, 29 / 30, 1]) {
+      for (const banked of [0, 500, 998, 1000]) {
+        for (const isNew of [true, false]) {
+          for (const n of [1, 40, 400]) {
+            const got = otmAdmissionSlotAllowance({
+              budget: 1000, banked, presented: banked, symbolsSeen: 12, symbolIsNew: isNew,
+              expectedSymbols: 48, expectedRows: 2100, passRows: n, slotFractionElapsed: f,
+            });
+            expect(got).toBeGreaterThanOrEqual(0);
+            expect(got).toBeLessThanOrEqual(n);
+            expect(banked + got).toBeLessThanOrEqual(1000); // AC2, unconditionally
+            // A new symbol's floor does not depend on the decayed reserve.
+            if (isNew && 1000 - banked >= 2) expect(got).toBeGreaterThanOrEqual(Math.min(n, 2));
+          }
+        }
+      }
+    }
+  });
+
+  it('🔴 a straggler floor is held to the slot\'s LAST minute — decay is not deletion', () => {
+    // Share-driven spending can take the budget to (budget − floorK), never
+    // through it, while any symbol could still arrive: the reserve projection
+    // ceil()s to ≥ 1 symbol for every f < 1 once anything has arrived. This is
+    // the TRA-4954-regression guard the ticket's AC2 names.
+    for (const f of [0.5, 0.9, 29 / 30]) {
+      const allow = otmAdmissionSlotAllowance({
+        budget: 1000, banked: 900, presented: 2000, symbolsSeen: 30, symbolIsNew: false,
+        expectedSymbols: 48, expectedRows: 2100, passRows: 400, slotFractionElapsed: f,
+      });
+      expect(900 + allow).toBeLessThanOrEqual(1000 - 2);
+    }
+  });
+
+  it('AC1 — an under-demand slot banks ≥95% of presented rows (v3 shed 38% of them)', () => {
+    // 26 symbols × 35 rows = 910 presented into a 1,000-row budget, arriving
+    // uniformly across the slot — the measured live shape (presented below the
+    // 2,100-row learner max, every slot shedding against free headroom). The
+    // TRA-5211 AC1 bar is shed-while-budget-free ≤ 5% of presented.
+    const sizes = Array.from({ length: 26 }, (_, i) => ({ size: 35, minute: Math.floor((i * 30) / 26) }));
+    const { banked, presented, bankedTotal } = replaySlotTimed('deskbook', sizes);
+    const freeShed = Math.min(presented - bankedTotal, 1000 - bankedTotal);
+    expect(freeShed).toBeLessThanOrEqual(0.05 * presented);
+    expect([...banked.values()].filter((n) => n === 0)).toEqual([]); // AC2: no starvation
+  });
+
+  it('AC1 — an OVER-subscribed slot fills its budget, and the floor still holds', () => {
+    // 44 × 30 = 1,320 presented into 1,000: the shed is now genuine budget
+    // pressure, not free-headroom expiry. v3 banked 619 of this shape.
+    const sizes = Array.from({ length: 44 }, (_, i) => ({ size: 30, minute: Math.floor((i * 30) / 44) }));
+    const { banked, bankedTotal } = replaySlotTimed('deskbook', sizes);
+    expect(bankedTotal).toBeGreaterThanOrEqual(950);
+    expect(bankedTotal).toBeLessThanOrEqual(1000); // AC3: the budget is not raised
+    expect(Math.min(...banked.values())).toBeGreaterThanOrEqual(2); // TRA-4954 floor
+  });
+
+  it('the slot fraction is minute-resolution ET and agrees with the slot index', () => {
+    expect(otmAdmissionSlotFraction(NOW)).toBe(0); // 11:00 ET — a slot boundary
+    expect(otmAdmissionSlotFraction(NOW + 17 * 60_000)).toBeCloseTo(17 / 30, 12);
+    expect(otmAdmissionSlot(NOW + 29 * 60_000)).toBe(otmAdmissionSlot(NOW)); // same cell
+    expect(otmAdmissionSlotFraction(NOW + 30 * 60_000)).toBe(0); // next slot re-arms
   });
 });
 

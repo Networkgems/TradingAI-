@@ -163,7 +163,10 @@ function gradeClass(cls, day, candidates, shed, summaryDay) {
   }
   const policyList = [...policies.entries()].sort((a, b) => a[0] - b[0]);
   out.policies = policyList;
-  const v3Only = policyList.length === 1 && policyList[0][0] === 3;
+  // v4 (TRA-5211) is v3 thinning with a decaying forward expectation — same
+  // floors, same budgets, so every AC here grades identically on a pure-v4
+  // day. A day holding BOTH is still a mid-session deploy and still blended.
+  const v3Only = policyList.length === 1 && policyList[0][0] >= 3;
 
   // ── AC1: every symbol presenting in a slot banks >= 1 candidate row ───────
   const bankedCells = new Set();
