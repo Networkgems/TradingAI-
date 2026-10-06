@@ -50,6 +50,20 @@ try { state = JSON.parse(stext); } catch {
   process.exit(3);
 }
 const open = state?.options?.openOptions ?? state?.openOptions ?? [];
+// ⛔ WRONG-DENOMINATOR GUARD (2026-10-06). `/api/state` is viewMode-SCOPED:
+// it renders the DASHBOARD's book (`viewMode` override, else routing mode),
+// not "the open options". On 10-06 admin read `viewMode: "demo"` while the
+// engine routed LIVE — this script printed `open options 0` over a live book
+// holding a ratcheting row, a vacuous pass. `hiddenBookExposure` (TRA-4502)
+// names the other book's row count; a non-empty hidden book over an empty
+// shown book means the denominator is WRONG, not quiet. To read the hidden
+// book: PUT /api/account/view-mode {"viewMode":"live"}, GET, restore —
+// display-only (TRA-3910, routing untouched), restore in a finally.
+const hidden = state?.hiddenBookExposure;
+if (open.length === 0 && hidden != null && (hidden.openOptionRows ?? 0) > 0) {
+  console.error(`# WRONG DENOMINATOR — shown book (${hidden.shownBook}) is empty but hidden book (${hidden.book}) holds ${hidden.openOptionRows} open row(s). Flip viewMode and re-run; a 0-row read here is NOT a pass.`);
+  process.exit(2);
+}
 const trailRows = open.filter(o => o.chandelierStop !== undefined);
 console.log(`# open options ${open.length}, with chandelierStop ${trailRows.length}`);
 
