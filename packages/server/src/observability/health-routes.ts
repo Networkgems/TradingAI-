@@ -133,6 +133,8 @@ import { readIvStoreProvenanceSync } from '../iv-rank-store.js';
 import { readArchiveSeedCensusSync, summarizeSeedableUniverse } from '../iv-seed-census.js';
 // TRA-5176 — the durable, dated per-session candidate-arrival series.
 import { readShortPremiumArrivalHistorySync } from '../short-premium-arrival-ledger.js';
+// TRA-5241 — the read-only per-(symbol, day) retro set TRA-5173 item 3 grades.
+import { readShortPremiumRetroSync } from '../short-premium-retro.js';
 import { buildWheelPromotionGateSummary } from '../wheel-promotion-gate-store.js'; // TRA-2028
 import {
   summarizeConvictionDca,
@@ -5929,6 +5931,26 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // structure) per ET session, restart-durable, with absent-vs-zero
       // preserved. Observe-only like everything else on this route.
       arrivalHistory: readShortPremiumArrivalHistorySync(),
+    });
+  });
+
+  // TRA-5241 — unauthenticated, secrets-free RETROSPECTIVE short-premium floor
+  // readout (the TRA-4917 pattern): one row per (symbol, archive day) replayed
+  // from the recorded chain archive through the SAME pure functions the live
+  // paths use (`reconstructIvStatsAt`, `realizedVolFromDailyCloses`), so
+  // TRA-5173 item 3 can grade what the IVR>=50 floor would actually have
+  // selected without waiting for live store depth. Carries only derived
+  // statistics off recorded chains — no balances/PII — so it is unauthenticated
+  // (parity with /short-premium). READ-ONLY: a cached disk walk plus pure math;
+  // nothing here writes the store, flips a flag, gates a scan, or routes an
+  // order. Until the first background walk completes the route reads an honest
+  // `status: 'pending'`, never a fabricated empty row set.
+  app.get('/api/health/short-premium-retro', (_req, res) => {
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      ...readShortPremiumRetroSync(Date.now()),
     });
   });
 

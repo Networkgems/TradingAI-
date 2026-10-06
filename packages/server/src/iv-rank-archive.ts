@@ -1,6 +1,12 @@
 import type { ChainDay } from '@trading-app/backtest';
 import type { OptionChainRow } from '@trading-app/engine';
-import { atmIvFromRows, computeIvRank, MIN_IV_SAMPLES, type IvSample } from './iv-rank-store.js';
+import {
+  atmIvFromRows,
+  computeIvPercentile,
+  computeIvRank,
+  MIN_IV_SAMPLES,
+  type IvSample,
+} from './iv-rank-store.js';
 
 // TRA-2206 (TRA-1965) — reconstruct IV-RANK from the recorded option-chain archive.
 //
@@ -178,21 +184,58 @@ export function reconstructIvRankAt(
   onDate: string,
   opts: { maxStalenessDays?: number; trailingDays?: number } = {},
 ): ReconstructionResult {
+  const { ivRank, miss, windowSamples } = reconstructIvStatsAt(samples, onDate, opts);
+  return { ivRank, miss, windowSamples };
+}
+
+/**
+ * TRA-5241 — both trailing-IV statistics off ONE backward-only window. The rank
+ * and the percentile answer different robustness questions (TRA-2028), and the
+ * retro emitter must grade them side by side, so they are computed here against
+ * the SAME window and the SAME "current" sample — two windows built by two
+ * callers would let the statistics silently diverge in scope.
+ */
+export interface IvStatsReconstruction extends ReconstructionResult {
+  /**
+   * 0–100 percentile of the current IV in the same window `ivRank` was ranked
+   * against ({@link computeIvPercentile}), or null. NOTE: on a flat window the
+   * rank is null (`insufficient_history`) while the percentile is an honest 0 —
+   * "no session closed strictly below" is a true statement there, so the
+   * percentile is NOT forced null to match the rank.
+   */
+  ivPercentile: number | null;
+  /** The ranked "current" IV sample (newest at/before `onDate` within staleness), or null. */
+  currentIv: number | null;
+  /** The day the current sample was captured — ≤ `onDate` by construction. */
+  currentDay: string | null;
+}
+
+/** See {@link reconstructIvRankAt} — identical window/staleness semantics, both statistics. */
+export function reconstructIvStatsAt(
+  samples: readonly IvSample[],
+  onDate: string,
+  opts: { maxStalenessDays?: number; trailingDays?: number } = {},
+): IvStatsReconstruction {
   const maxStaleness = opts.maxStalenessDays ?? MAX_IV_STALENESS_DAYS;
   const trailingDays = opts.trailingDays ?? RECONSTRUCTION_TRAILING_DAYS;
 
-  if (samples.length === 0) return { ivRank: null, miss: 'no_archive_coverage', windowSamples: 0 };
+  const none = (miss: ReconstructionMiss, windowSamples: number): IvStatsReconstruction => ({
+    ivRank: null,
+    ivPercentile: null,
+    miss,
+    windowSamples,
+    currentIv: null,
+    currentDay: null,
+  });
+
+  if (samples.length === 0) return none('no_archive_coverage', 0);
 
   // Backward-only: everything downstream of this line sees no day after `onDate`.
   const backward = samples.filter((s) => s.day <= onDate);
-  if (backward.length === 0) {
-    return { ivRank: null, miss: 'no_sample_at_or_before', windowSamples: 0 };
-  }
+  if (backward.length === 0) return none('no_sample_at_or_before', 0);
 
   const current = backward[backward.length - 1] as IvSample;
-  if (daysBetweenDates(current.day, onDate) > maxStaleness) {
-    return { ivRank: null, miss: 'stale_iv', windowSamples: 0 };
-  }
+  if (daysBetweenDates(current.day, onDate) > maxStaleness) return none('stale_iv', 0);
 
   // Trailing window ends at the current sample's day, not at `onDate`, so the
   // window and the ranked value share one reference frame.
@@ -201,8 +244,13 @@ export function reconstructIvRankAt(
   const window = backward.filter((s) => s.day >= cutoff);
 
   const rank = computeIvRank(window, current.iv);
-  if (rank == null) {
-    return { ivRank: null, miss: 'insufficient_history', windowSamples: window.length };
-  }
-  return { ivRank: rank, miss: null, windowSamples: window.length };
+  const percentile = computeIvPercentile(window, current.iv);
+  return {
+    ivRank: rank,
+    ivPercentile: percentile,
+    miss: rank == null ? 'insufficient_history' : null,
+    windowSamples: window.length,
+    currentIv: current.iv,
+    currentDay: current.day,
+  };
 }
