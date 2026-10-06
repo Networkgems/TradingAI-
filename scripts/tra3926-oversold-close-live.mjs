@@ -97,7 +97,18 @@ const fee = await get('/api/health/live-options-fee-slippage');
 if (!fee) blind('fee/slippage route unreadable');
 const records = Array.isArray(fee.records) ? fee.records : null;
 if (!records) blind('`records[]` absent — no tape to re-derive from');
-if (records.length === 0) blind('`records[]` is EMPTY — the ledger is cold, every verdict below would be vacuous');
+// TRA-5190 (2026-10-06) — the cold gate, NARROWED, never deleted. An empty
+// `records[]` still blinds every TAPE-DERIVED criterion (the order-free fold,
+// G*, the R anchors, the grant/residual accounting): an empty tape and a broken
+// tape serve the same bytes, so those verdicts stay vacuous. But the durable
+// surfaces (the D* field-presence checks, the Rd pins, the bound carrier
+// D9/D9b) were BUILT to outlive the tape, and the old full-stop here blinded
+// them with the tape's own death — measured 2026-10-05: 22+ dark sessions made
+// every branch below unreachable in exactly the terminal state the carriers
+// were designed for. Cold still never PASSes; a durable-surface FAIL still
+// FAILs (it is graded off a durable store, so it is not vacuous).
+const tapeCold = records.length === 0;
+if (tapeCold) console.log('# COLD TAPE — `records[]` is EMPTY. Durable surfaces are graded below; every tape-derived criterion is BLIND, not skipped-as-pass.');
 
 // ── D — deployed bytes, by FIELD PRESENCE on both halves ───────────────────
 // A deploy order's commit is a lower bound on content, never an expected
@@ -244,6 +255,13 @@ check('D8  the route publishes `judgedOversoldDurable` (judgement-carrier bytes;
     ? `lines ${judged.lines} / closes ${judged.closes} / ephemeral ${judged.ephemeral} / appendErrors ${judged.capture?.appendErrors}`
     : 'ABSENT — this build predates the carrier; every R-pin below evaporates with its evidence (~09-19 for XLF)');
 
+const findings = Array.isArray(census.findings) ? census.findings : [];
+const blinds = Array.isArray(census.blindCloses) ? census.blindCloses : [];
+
+// Everything from here to the residual notes is TAPE-DERIVED: on a cold tape
+// it is BLIND by construction (TRA-5190), so it is skipped — not graded, not
+// passed. The durable Rd section below runs regardless.
+if (!tapeCold) {
 // ── the ORDER-FREE re-derivation ───────────────────────────────────────────
 // Deliberately not the shipped walk: per-OCC totals, no sort, no interleaving.
 const agg = new Map();
@@ -286,8 +304,6 @@ for (const [s, a] of agg) {
 const derivedExcessTotal = [...derivedExcess.values()].reduce((x, y) => x + y, 0);
 const setEq = (a, b) => a.size === b.size && [...a].every(k => b.has(k));
 
-const findings = Array.isArray(census.findings) ? census.findings : [];
-const blinds = Array.isArray(census.blindCloses) ? census.blindCloses : [];
 const publishedExcess = new Map(findings.map(f => [f.optionSymbol, f.excessContracts]));
 const _publishedImportOnly = new Set(blinds.filter(b => b.reason === 'import_only').map(b => b.optionSymbol));
 const _publishedNoOpen = new Set(blinds.filter(b => b.reason === 'no_open_record').map(b => b.optionSymbol));
@@ -549,6 +565,7 @@ for (const k of KNOWN_GRANTED) {
     g ? `sold ${g.soldContracts} ours ${g.engineOpenContracts} basis ${g.basis} grant ${g.grant} via ${g.grantSource}${accused ? ' AND ACCUSED' : ''}`
       : (accused ? 'ACCUSED — served as a finding' : 'NOT REPORTED'));
 }
+} // end !tapeCold — tape-derived criteria
 
 // ── Rd — the DURABLE pins. These are the ones that outlive the tape. ───────
 // Graded only where D8 has the key. After a pinned close ages off the tape the
@@ -586,7 +603,9 @@ if (!judgedPresent) {
 
 // ── the grants, always printed — a withheld accusation is a decision, and a
 // `closed_row` grant is one this grader cannot verify from the tape ─────────
-if (grantedKeysPresent) {
+// (tape-derived accounting: on a cold tape these totals are vacuous, so cold
+// skips them rather than printing a zero that reads as calm — TRA-5190)
+if (!tapeCold && grantedKeysPresent) {
   notes.push(`GRANTED  ${granted.length} excess close(s) / ${grantedContracts} contract(s) sold under a grant, NOT accused — `
     + (granted.map(g => `${g.optionSymbol}(${g.orderId},${g.excessContracts},${g.grant}/${g.grantSource})`).join(' ') || 'none'));
   const unverifiable = granted.filter(g => g.grantSource === 'closed_row');
@@ -601,12 +620,14 @@ if (grantedKeysPresent) {
   }
 }
 
-// ── the residual fail-open, always printed ─────────────────────────────────
-const blindContracts = blinds.reduce((n, b) => n + (b.soldContracts ?? 0), 0);
-notes.push(`RESIDUAL  ${blinds.length} blind close(s) / ${blindContracts} contract(s) the detector could not judge — `
-  + `${blinds.map(b => `${b.optionSymbol}(${b.soldContracts},${b.reason})`).join(' ')}`);
-notes.push('RESIDUAL  a blind close is an UNANSWERED QUESTION, not a clean one. These bytes cannot separate '
-  + 'the desk\'s contract from an engine fill our chokepoint missed; only the broker\'s order history can.');
+// ── the residual fail-open, always printed on a live tape ──────────────────
+if (!tapeCold) {
+  const blindContracts = blinds.reduce((n, b) => n + (b.soldContracts ?? 0), 0);
+  notes.push(`RESIDUAL  ${blinds.length} blind close(s) / ${blindContracts} contract(s) the detector could not judge — `
+    + `${blinds.map(b => `${b.optionSymbol}(${b.soldContracts},${b.reason})`).join(' ')}`);
+  notes.push('RESIDUAL  a blind close is an UNANSWERED QUESTION, not a clean one. These bytes cannot separate '
+    + 'the desk\'s contract from an engine fill our chokepoint missed; only the broker\'s order history can.');
+}
 
 // ── pin AFTER — a move INVALIDATES rather than degrades ────────────────────
 const after = pinOf(await get('/api/health/options-live'));
@@ -648,6 +669,38 @@ if (failed.length > 0) {
   console.error(`\nFAIL — ${failed.length}/${rows.length}: ${failed.map(r => r.id).join(' | ')}`);
   process.exit(1);
 }
+const boundEverExercised = boundDurablePresent && boundDurable.everExercised === true;
+// TRA-5190 (2026-10-06) — the narrowed cold-tape verdict. Reaching here cold
+// means every graded row above was a durable surface and ALL passed (a durable
+// FAIL took exit 1 above — it is graded off a durable store, never vacuous).
+// Cold still never PASSes: the detector had no subject, so the blind below
+// covers the tape-derived criteria ONLY, and the carrier's testimony is the
+// reading instead of a casualty of the gate.
+if (tapeCold) {
+  console.error(`\nBLIND (tape-derived criteria only) — \`records[]\` is EMPTY, so the detector has no subject and `
+    + `G/R were never graded; the ${rows.length} durable-surface check(s) above ALL PASSED.`
+    + (boundDurablePresent
+      ? (boundEverExercised
+        ? `\n        The bound carrier HOLDS EXERCISE: everExercised true / ${boundDurable.rows} row(s) — `
+          + `bounded ${boundDurable.verdicts.bounded} / suppressed ${boundDurable.verdicts.suppressed} / `
+          + `blind ${boundDurable.verdicts.blind} / clean ${boundDurable.verdicts.clean}, `
+          + `${boundDurable.refusedContracts} contract(s) refused. Per TRA-5190's disposition rule, grade `
+          + `AC1 on the wire against the carrier rows (refusals must bound to engineContracts).`
+        : `\n        The bound carrier is HEALTHY and holds NO exercise — a measured never since `
+          + `${boundDurable.armedAt ? new Date(boundDurable.armedAt).toISOString() : 'an UNKNOWN instant (no arming stamp)'}`
+          + `${boundDurable.armedAt ? ` (${Math.floor((Date.now() - boundDurable.armedAt) / 86400000)}d of carriage)` : ''}, `
+          + `a dated zero, not a counter that forgot.`)
+      : '\n        ⚠ And this build carries NO durable bound carrier, so nothing above outlives a restart.')
+    + (unauthorizedAdopted > 0
+      ? `\n        Population held UPSTREAM: ${unauthorizedAdopted} adopted row(s) \`adopted_not_authorized\` `
+        + `(ruling B's gate, consulted before the bound).`
+      : '')
+    + (outstandingRows > 0
+      ? `\n        ⚠ NOT a quiet bound: ${outstandingLine} — OUTSTANDING refusal stamps on open rows from a `
+        + `previous boot; those contracts are still open at the broker with the engine declining to sell them.`
+      : ''));
+  process.exit(3);
+}
 // TRA-3926 (2026-09-27) — the boot-scoped `checked` is no longer the only way
 // to reach a verdict here. A bound that bit on a PREVIOUS boot is still a bound
 // that has been exercised on this box's real tape, and before the carrier
@@ -655,7 +708,6 @@ if (failed.length > 0) {
 // evidence it had merely forgotten. Graded only where D9 has the key: on an
 // older build `boundEverExercised` is false because the byte is absent, which
 // must not be reported as a measured never.
-const boundEverExercised = boundDurablePresent && boundDurable.everExercised === true;
 if (!boundExercised && boundEverExercised) {
   console.log(`\nPASS (DURABLE) — ${rows.length}/${rows.length}; the bound is UNEXERCISED on this boot `
     + `(checked ${bound?.checked}, uptime ${before.uptimeSec}s) but its carrier holds ${boundDurable.rows} row(s) `
