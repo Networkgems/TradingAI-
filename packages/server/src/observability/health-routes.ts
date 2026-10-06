@@ -146,6 +146,7 @@ import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
 // control 2). Published on the same route as the gate it exempts so "armed and
 // quiet" and "never armed" can never render identically.
 import { summarizeExplorationAllowance } from '../directional-exploration-allowance.js';
+import { summarizeLiveLearningBudget } from '../live-learning-budget.js';
 // TRA-2048 — the live gate census; TRA-4879 — the counter PROVENANCE beside it.
 import {
   summarizeLiveEnforceGate,
@@ -7753,6 +7754,8 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // trade pass reads. Counters are `null` (never 0) when the durable state
       // is unreadable — absent ⇒ UNREAD.
       explorationAllowance: summarizeExplorationAllowance(env, etDay),
+      // TRA-LIVE-LEARNING-BUDGET — the LIVE directional learning budget (process env, never demo-flags).
+      liveLearningBudget: summarizeLiveLearningBudget(process.env, etDay),
       ...summarizeCostAwareGate(etDay),
     });
   });

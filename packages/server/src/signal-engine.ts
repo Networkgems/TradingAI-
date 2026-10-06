@@ -433,6 +433,13 @@ import {
 import { recordLiveEnforceDecision, type LiveEnforceNominator } from './live-enforce-gate-ledger.js';
 import { resolveCanaryCeiling, gradeCanaryCeiling } from './canary-ceiling.js';
 import { gradeSleeveStandDown } from './sleeve-stand-down.js'; // TRA-4752
+// TRA-LIVE-LEARNING-BUDGET — owner-approved capped live path for the directional sleeve.
+import {
+  isLiveLearningBudgetFlagOn,
+  consultLiveLearningBudget,
+  takeLiveLearningGrant,
+  commitLiveLearningOpen,
+} from './live-learning-budget.js';
 import { admitOrderThroughHardControls } from './hard-controls.js'; // TRA-4650 (choke point: TRA-4655)
 // TRA-4657 — paper-trading tees at the alert-emitter seams (observe-only; the
 // recorders swallow their own throws and are inert while the flag is off).
@@ -8005,7 +8012,8 @@ export class SignalEngine {
     if (
       this.mode === 'demo'
       && isStockMarketOpen()
-      && isOptionShortPremiumScannerEnabled()
+      // TRA-WHEEL-DEMO-FLAG — demo-flags overlay (file over env); demo-only branch.
+      && isOptionShortPremiumScannerEnabled(this.resolveDemoFlagEnv())
       && !!this.rvScanner
     ) {
       // TRA-2262 — budgeted + cursored. Σ-leader of the tape (34.7%) and a fully
@@ -14684,7 +14692,12 @@ export class SignalEngine {
      * TRA-374 mid→ask walk and no ledger row (the RV/directional legacy behaviour is
      * preserved only when no sleeve is passed).
      */
-    opts?: { sleeve?: LiveFillSleeve; walk?: MakerWalkConfig },
+    opts?: {
+      sleeve?: LiveFillSleeve;
+      walk?: MakerWalkConfig;
+      /** TRA-LIVE-LEARNING-BUDGET — this open holds a live-learning-budget grant (directional only). */
+      learningBudgetGrant?: boolean;
+    },
   ): Promise<boolean> {
     // TRA-332 — surface the void reason on the dashboard so the user sees why no
     // trade opened, not just a silent log line.
@@ -14941,7 +14954,7 @@ export class SignalEngine {
     //
     // ⚠️ OPENS ONLY — this seam does not carry closes, so standing a sleeve down
     // can never strand a position that is already open.
-    const standDown = gradeSleeveStandDown(opts?.sleeve);
+    const standDown = gradeSleeveStandDown(opts?.sleeve, { learningBudgetGrant: opts?.learningBudgetGrant === true });
     recordLiveEnforceDecision(
       'sleeve_stand_down',
       standDown.scope,
@@ -18248,7 +18261,35 @@ export class SignalEngine {
         // its sizing is clamped to the $150 per-open at-risk cap below and the
         // committed open spends one of the 25 budgeted rows.
         const explorationGrant = takeExplorationGrant();
-        if (dirCostReject) {
+        // TRA-LIVE-LEARNING-BUDGET — on the LIVE book, when the owner has armed
+        // the learning budget, the budget IS the admission gate for this sleeve:
+        // a grant bypasses the cost bar (and, at the broker seam, the TRA-4750
+        // directional stand-down entry); no grant ⇒ no open. Flag off ⇒ this block
+        // is inert and the path is byte-identical (cost bar + stand-down refuse).
+        let learningGrant: { etDay: string; ts: number } | null = null;
+        let learningPerOpenUsd: number | undefined;
+        if (liveOn && isLiveLearningBudgetFlagOn(process.env)) {
+          const oneContractUsd =
+            (typeof best.row.ask === 'number' && Number.isFinite(best.row.ask) && best.row.ask > 0
+              ? best.row.ask
+              : best.mark) * 100;
+          const consult = consultLiveLearningBudget(process.env, etDateString(new Date()), oneContractUsd);
+          learningGrant = takeLiveLearningGrant();
+          if (!learningGrant) {
+            log.info('live directional refused by learning budget', {
+              symbol: sym, refusal: consult.refusal, oneContractUsd,
+            });
+            scanRun.reject(`learning_budget:${consult.refusal ?? 'unknown'}`);
+            continue;
+          }
+          learningPerOpenUsd = consult.caps.perOpenAtRiskUsd;
+          if (dirCostReject) {
+            log.info('live directional cost bar BYPASSED by learning budget grant', {
+              symbol: sym, barBlockedReason: dirCostReject,
+            });
+          }
+        }
+        if (dirCostReject && !learningGrant) {
           log.info('demo directional rejected by cost-aware fire bar (TRA-1602)', {
             symbol: sym, reason: dirCostReject,
           });
@@ -18388,7 +18429,7 @@ export class SignalEngine {
           // TRA-4378 — exploration opens are clamped to the board's $150
           // per-open at-risk cap (contracts × premium × 100); non-exploration
           // opens pass undefined and size exactly as before.
-          explorationGrant ? EXPLORATION_CAPS.perOpenAtRiskCapUsd : undefined,
+          explorationGrant ? EXPLORATION_CAPS.perOpenAtRiskCapUsd : learningPerOpenUsd,
         );
         if (!opened) continue;
         // TRA-4378 — the granted open actually happened: spend one exploration
@@ -18430,8 +18471,21 @@ export class SignalEngine {
           // TRA-2245 — tag the live-fill fee/slippage ledger with the renamed
           // directional sleeve so open and close rows share one label and neither
           // is confused with the True RV sleeve.
-          const mirrored = await this.mirrorLiveOptionOpen(opened, surfaceLiveSkip, { sleeve: 'single_leg_directional' });
+          const mirrored = await this.mirrorLiveOptionOpen(opened, surfaceLiveSkip, {
+            sleeve: 'single_leg_directional',
+            learningBudgetGrant: learningGrant !== null,
+          });
           if (!mirrored) continue;
+          // TRA-LIVE-LEARNING-BUDGET — spend the row only once the broker open is FINAL.
+          if (learningGrant) {
+            commitLiveLearningOpen({
+              id: opened.id,
+              occ: opened.optionSymbol ?? null,
+              atRiskUsd: opened.contracts * opened.premiumPaid * 100,
+              etDay: learningGrant.etDay,
+              book: this.alertUsername ?? null,
+            });
+          }
         }
 
         // TRA-2193 — counted only once the open is FINAL. A failed broker mirror
@@ -18599,7 +18653,7 @@ export class SignalEngine {
    * flag off. Live promotion stays gated on TRA-382 regardless.
    */
   private async evaluateShortPremiumScan(symbols: string[]): Promise<SweepPass | null> {
-    if (!isOptionShortPremiumScannerEnabled() || this.mode !== 'demo' || !this.rvScanner) {
+    if (!isOptionShortPremiumScannerEnabled(this.resolveDemoFlagEnv()) || this.mode !== 'demo' || !this.rvScanner) {
       this.pendingWheelScans.clear();
       return null;
     }
@@ -18620,7 +18674,12 @@ export class SignalEngine {
     // truncated map does not fail loudly — it silently defers expiry settlement
     // and the tail guards on assigned lots, and it would run the ENTRY pass ~10×
     // more often than today off a fraction of the candidates.
-    const routeWheel = isOptionWheelRoutingEnabled();
+    // TRA-WHEEL-DEMO-FLAG — read through the demo-flags overlay (file over env),
+    // the same way the IV entry filter's health route already does, so premium-
+    // selling PAPER trading can be armed at runtime via POST /api/admin/demo-flags
+    // without a Render env write. This pass is demo-only (early return above), so
+    // the overlay can never reach a live book.
+    const routeWheel = isOptionWheelRoutingEnabled(this.resolveDemoFlagEnv());
     const wheelScans = this.pendingWheelScans;
 
     const pass = await runBudgetedSweep({

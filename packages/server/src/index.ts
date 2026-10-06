@@ -179,6 +179,7 @@ import {
   hydrateExplorationAllowanceFromDisk,
   handleExplorationJournalClose,
 } from './directional-exploration-allowance.js';
+import { hydrateLiveLearningBudgetFromDisk, handleLiveLearningClose } from './live-learning-budget.js';
 import { resolveAverageDownConfig, AVERAGE_DOWN_SHADOW_REASONS } from './option-average-down-shadow.js';
 // TRA-2819 — the money-side sibling of the repair below. That one decides
 // whether a stale OPEN row is a trade at all; this one takes rows that are
@@ -4941,6 +4942,17 @@ async function runLiveRealizedCalendarBackfill(): Promise<void> {
   }
   onOptionTradeClose((id, close) => {
     handleExplorationJournalClose(id, { realizedPnlUsd: close.realizedPnlUsd }, etDateString(new Date()));
+  });
+}
+
+// TRA-LIVE-LEARNING-BUDGET — rebuild the live learning-budget ledger (caps are
+// enforced off it, so it must survive reboots; ephemeral/unreadable ⇒ every
+// grant refuses) and settle each committed row's realized P&L on close.
+{
+  const h = hydrateLiveLearningBudgetFromDisk(DATA_DIR);
+  log.info('live learning budget hydrated', { ...h });
+  onOptionTradeClose((id, close) => {
+    handleLiveLearningClose(id, close.realizedPnlUsd, etDateString(new Date()));
   });
 }
 

@@ -95,7 +95,18 @@ export interface SleeveStandDownVerdict {
   reason?: string;
   /** The ticket that stood this sleeve down; present only on `sleeve_stood_down`. */
   ruling?: string;
+  /**
+   * TRA-LIVE-LEARNING-BUDGET — set when a stood-down sleeve was ALLOWED because
+   * this specific open carries a live-learning-budget grant. Absent otherwise.
+   */
+  exemptedBy?: 'live_learning_budget';
 }
+
+/**
+ * Sleeves a live-learning-budget grant may carry past the roster. Only the
+ * directional sleeve: the budget module is consulted on that path alone.
+ */
+const LEARNING_BUDGET_EXEMPTIBLE = new Set(['single_leg_directional', 'directional']);
 
 /** A sleeve label that names no sleeve — cannot be proven to be off the roster. */
 function isUnattributable(sleeve: string | null | undefined): boolean {
@@ -120,7 +131,15 @@ function isUnattributable(sleeve: string | null | undefined): boolean {
  * hypothetical: `hard-controls-wiring.test.ts` was calling the seam with no
  * sleeve at all, and this branch caught it.
  */
-export function gradeSleeveStandDown(sleeve: string | null | undefined): SleeveStandDownVerdict {
+export function gradeSleeveStandDown(
+  sleeve: string | null | undefined,
+  /**
+   * TRA-LIVE-LEARNING-BUDGET — the caller holds a live-learning-budget grant for
+   * THIS open. Exempts only the directional roster entries; an unattributable
+   * sleeve still refuses, and any other stood-down sleeve still refuses.
+   */
+  opts: { learningBudgetGrant?: boolean } = {},
+): SleeveStandDownVerdict {
   if (isUnattributable(sleeve)) {
     return {
       allowed: false,
@@ -133,6 +152,9 @@ export function gradeSleeveStandDown(sleeve: string | null | undefined): SleeveS
   }
   const scope = sleeve!.trim();
   const ruling = STOOD_DOWN_SLEEVES[scope];
+  if (ruling !== undefined && opts.learningBudgetGrant === true && LEARNING_BUDGET_EXEMPTIBLE.has(scope)) {
+    return { allowed: true, scope, ruling, exemptedBy: 'live_learning_budget' };
+  }
   if (ruling !== undefined) {
     return {
       allowed: false,
