@@ -8,13 +8,63 @@
 //
 // Exit: 0 all controls hold · 1 a control landed on the wrong exit code.
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const CHECKER = join(import.meta.dirname, 'check-env-intent.mjs');
 const dir = mkdtempSync(join(tmpdir(), 'env-intent-controls-'));
+
+// ── TRA-5213: a local fixture SERVER for the env-list arm's pagination ───────
+// The `--stored-fixture` path hands the checker a ready-made list, so it can
+// never exercise the cursor loop — and the loop is exactly where the TRA-5213
+// hole lived (one `?limit=100` request, no continuation, bqb1 at 105 keys: the
+// five keys past the window read as absent ⇒ 'off' ⇒ matches). These controls
+// point the checker's `RENDER_API_BASE` test seam at a child-process HTTP
+// server (a child because spawnSync blocks this process's event loop) that
+// serves cursor-paginated pages keyed on the service id in the URL.
+const SERVER_SRC = [
+  "import { createServer } from 'node:http';",
+  'const mk = (n, graded) => {',
+  '  const rows = Object.entries(graded).map(([k, v]) => ({ envVar: { key: k, value: v } }));',
+  '  for (let i = rows.length; i < n; i++) {',
+  "    rows.push({ envVar: { key: 'FILLER_' + String(i).padStart(3, '0'), value: 'x' } });",
+  '  }',
+  '  return rows;',
+  '};',
+  "const GRADED = { DURABILITY_POLICY: 'refuse', ENABLE_OPTION_LIVE_OTM: 'false' };",
+  'const DATA = {',
+  '  paged105: { rows: mk(105, GRADED), cursors: true },',
+  '  exact100: { rows: mk(100, GRADED), cursors: true },',
+  '  truncated: { rows: mk(150, GRADED), cursors: false },',
+  '};',
+  'const srv = createServer((req, res) => {',
+  "  const u = new URL(req.url, 'http://local');",
+  '  const m = u.pathname.match(/^\\/v1\\/services\\/([^/]+)\\/env-vars$/);',
+  '  const d = m ? DATA[m[1]] : undefined;',
+  '  if (!d) { res.writeHead(404); res.end(\'[]\'); return; }',
+  "  const limit = Number(u.searchParams.get('limit') ?? '20');",
+  "  const start = Number(u.searchParams.get('cursor') ?? '0');",
+  '  const page = d.rows.slice(start, start + limit).map((r, i) => (d.cursors ? { ...r, cursor: String(start + i + 1) } : r));',
+  "  res.writeHead(200, { 'content-type': 'application/json' });",
+  '  res.end(JSON.stringify(page));',
+  '});',
+  "srv.listen(0, '127.0.0.1', () => console.log('PORT ' + srv.address().port));",
+].join('\n');
+const serverScript = join(dir, 'env-pages-server.mjs');
+writeFileSync(serverScript, SERVER_SRC);
+const pagesServer = spawn(process.execPath, [serverScript], { stdio: ['ignore', 'pipe', 'inherit'] });
+const API_BASE = await new Promise((resolve, reject) => {
+  let buf = '';
+  pagesServer.stdout.on('data', (d) => {
+    buf += d;
+    const m = buf.match(/PORT (\d+)/);
+    if (m) resolve(`http://127.0.0.1:${m[1]}`);
+  });
+  pagesServer.on('exit', (code) => reject(new Error(`pagination control server exited ${code} before printing its port`)));
+  setTimeout(() => reject(new Error('pagination control server did not start within 10s')), 10_000).unref();
+});
 
 // TRA-4862 — the declared leg is ALWAYS ON and fails closed, so every control
 // below must feed it a declaration too; otherwise each one would be graded
@@ -210,6 +260,33 @@ const cases = [
     wants: ['note DURABILITY_POLICY:', 'the fix is STAGED'],
     // A staged FIX is not a staged breach — it must not be reported as one.
     wantsNot: ['DURABILITY_POLICY: STAGED ('],
+  },
+  // ── TRA-5213: the pagination controls (served by the local fixture server;
+  // `liveArm` names the service id the child server keys its dataset on) ──────
+  {
+    name: 'TRA-5213 pagination — 105 stored keys across a cursor boundary ⇒ ALL enumerated, count printed',
+    body: GOOD,
+    liveArm: 'paged105',
+    want: 0,
+    // The count line is the acceptance surface: 105, not 100 — and the page
+    // count proves the continuation actually ran rather than one lucky request.
+    wants: ['105 stored keys read', '2 page(s)', 'EFFECTIVE and STORED'],
+  },
+  {
+    name: 'TRA-5213 pagination — exactly 100 keys: the FULL page is continued, the empty page terminates ⇒ 0',
+    body: GOOD,
+    liveArm: 'exact100',
+    want: 0,
+    wants: ['100 stored keys read', '2 page(s)'],
+  },
+  {
+    name: 'TRA-5213 truncation — a FULL page with no cursor to continue ⇒ BLIND, a partial set is never graded',
+    body: GOOD,
+    liveArm: 'truncated',
+    want: 3,
+    wants: ['INCOMPLETE', 'silent-green direction'],
+    // The pre-fix behaviour: grade the first 100 and call it a day.
+    wantsNot: ['stored keys read', 'EFFECTIVE and STORED'],
   },
   {
     name: 'BLIND — the manifest grew a lever this checker cannot resolve',
@@ -441,11 +518,17 @@ for (const [i, c] of cases.entries()) {
   const df = join(dir, `c${i}-declared.json`);
   writeFileSync(df, c.declaredRaw ?? JSON.stringify(c.declared ?? declaredFromBody(c.body)));
   args.push(`--declared-fixture=${df}`);
+  // TRA-5213 — a `liveArm` case arms the env-list leg against the LOCAL fixture
+  // server (keyed on the service id), to exercise the pagination branch a stored
+  // fixture can never reach.
+  if (c.liveArm) args.push(`--render-service=${c.liveArm}`);
   const r = spawnSync(process.execPath, args, {
     encoding: 'utf8',
     // The env-list arm must never reach the REAL service from a control: a real
-    // key here would grade the live env against a fixture's lever list.
-    env: { ...process.env, RENDER_API_KEY: '' },
+    // key here would grade the live env against a fixture's lever list — so the
+    // key is blanked unless the case arms the LOCAL server, and the API base is
+    // ALWAYS re-pointed at that server as a second fence.
+    env: { ...process.env, RENDER_API_KEY: c.liveArm ? 'control-paging-key' : '', RENDER_API_BASE: API_BASE },
   });
   const got = r.status;
   const out = r.stdout + r.stderr;
@@ -467,6 +550,7 @@ for (const [i, c] of cases.entries()) {
   console.log(`[controls] ${ok ? 'PASS' : 'FAIL'} — usage: unrecognized flag: want exit 2, got ${r.status}`);
 }
 
+pagesServer.kill();
 rmSync(dir, { recursive: true, force: true });
 if (failed > 0) {
   console.error(`[controls] ${failed} control(s) FAILED — the checker cannot be trusted until they hold.`);

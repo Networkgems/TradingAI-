@@ -19,8 +19,14 @@ const RULED_PROD_ENV: NodeJS.ProcessEnv = {
   // the bqb1 write (absence would match too — the flag defaults off).
   ENABLE_OPTION_LIVE_OTM: 'false',
   ENABLE_OPTION_MAKER_TELEMETRY: 'true',
-  // ENABLE_ORDER_QUOTE_GUARD / ENABLE_OPTION_LIVE_RV_LONG / _DIRECTIONAL absent:
-  // their intent is `off` and their code default is off — absence MATCHES.
+  // Board card ca66df94 on TRA-5207 (human answer, 2026-10-06T03:03:52Z) armed
+  // the LIVE directional learning budget ($800 loss cap / $150 per-open / 40
+  // opens / 40-session box) — both keys written to bqb1 by single-key PUTs and
+  // applied by a same-SHA env-apply (TRA-5213). The two rows move together.
+  ENABLE_OPTION_LIVE_DIRECTIONAL: '1',
+  ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET: '1',
+  // ENABLE_ORDER_QUOTE_GUARD / ENABLE_OPTION_LIVE_RV_LONG absent: their intent
+  // is `off` and their code default is off — absence MATCHES.
 };
 
 /** TRA-5014 — the overlay-backed lever's key. Armed via DATA_DIR/demo-flags.json. */
@@ -63,9 +69,11 @@ describe('summarizeEnvIntent (TRA-4474)', () => {
   });
 
   it('a lever intended OFF found ON is a mismatch (the TRA-4442 direction)', () => {
-    const s = graded({ ...RULED_PROD_ENV, ENABLE_OPTION_LIVE_DIRECTIONAL: 'true' });
+    // RV_LONG carries this case now: the directional lever's intent moved to
+    // 'on' under card ca66df94 (TRA-5213) and has its own describe block below.
+    const s = graded({ ...RULED_PROD_ENV, ENABLE_OPTION_LIVE_RV_LONG: 'true' });
     expect(s.ok).toBe(false);
-    expect(s.mismatches).toEqual(['ENABLE_OPTION_LIVE_DIRECTIONAL']);
+    expect(s.mismatches).toEqual(['ENABLE_OPTION_LIVE_RV_LONG']);
   });
 
   // This assertion has now run THREE ways. Until 2026-09-22 it graded a wipe of
@@ -297,11 +305,79 @@ describe('overlay-backed levers (TRA-5014)', () => {
       // overlay must be as inert for a loosening as it was for a disarm.
       ENABLE_OPTION_LIVE_OTM: 'true',
       ENABLE_OPTION_MAKER_TELEMETRY: 'false',
-      ENABLE_OPTION_LIVE_DIRECTIONAL: 'true',
+      // And a DISARM attempt on the ca66df94-armed pair (TRA-5213): an overlay
+      // write must not be able to kill the live budget either.
+      ENABLE_OPTION_LIVE_DIRECTIONAL: 'false',
+      ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET: '0',
     };
     const s = summarizeEnvIntent(RULED_PROD_ENV, hostileOverlay);
     expect(s.ok).toBe(true);
     expect(s.mismatches).toEqual([]);
+  });
+
+  // ── TRA-5213: the ca66df94 live directional arm ────────────────────────────
+  // Card ca66df94 on TRA-5207 is the "separate gated approval" the TRA-1490 row
+  // always named; the authorisation is scoped to the learning budget, so the two
+  // rows grade as a PAIR and either half moving alone is the event to catch.
+  describe('the ca66df94 live directional arm (TRA-5213)', () => {
+    const DIR = 'ENABLE_OPTION_LIVE_DIRECTIONAL';
+    const BUDGET = 'ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET';
+
+    it('armed-as-ruled reads ok: lever and budget both on', () => {
+      const s = graded(RULED_PROD_ENV);
+      expect(s.ok).toBe(true);
+      for (const key of [DIR, BUDGET]) {
+        expect(s.levers.find((l) => l.key === key), key).toMatchObject({
+          intended: 'on',
+          effective: 'on',
+          present: true,
+          matches: true,
+        });
+      }
+    });
+
+    it('THE KILL SWITCH: budget off while the directional lever is still on is a named mismatch', () => {
+      const s = graded({ ...RULED_PROD_ENV, [BUDGET]: '0' });
+      expect(s.ok).toBe(false);
+      expect(s.mismatches).toEqual([BUDGET]);
+    });
+
+    it('a WIPE of the budget key grades like the kill switch — absence is never a quiet pass', () => {
+      const { [BUDGET]: _gone, ...wiped } = RULED_PROD_ENV;
+      const s = graded(wiped);
+      expect(s.ok).toBe(false);
+      expect(s.mismatches).toEqual([BUDGET]);
+      expect(s.levers.find((l) => l.key === BUDGET)).toMatchObject({
+        present: false,
+        effective: 'off',
+        intended: 'on',
+        matches: false,
+      });
+    });
+
+    it('the directional lever wiped while the budget stays armed is a named mismatch (the arm did not survive)', () => {
+      const { [DIR]: _gone, ...wiped } = RULED_PROD_ENV;
+      const s = graded(wiped);
+      expect(s.ok).toBe(false);
+      expect(s.mismatches).toEqual([DIR]);
+    });
+
+    it('both rows state the ruling: the card and the disarm/expiry condition, not just the value', () => {
+      for (const key of [DIR, BUDGET]) {
+        const p = PRODUCTION_ENV_INTENT.find((l) => l.key === key)!.provenance;
+        expect(p, key).toContain('ca66df94');
+        // The runtime self-disarm (loss/open/session caps) is invisible in env,
+        // so the provenance must point a reader at the budget's own disarm term.
+        expect(p, key).toContain('disarm');
+        expect(p, key).toContain('liveLearningBudget.disarmed');
+      }
+    });
+
+    it('acceptance guard (TRA-5213): OTM and RV_LONG stay intended off — dark by authorisation', () => {
+      for (const key of ['ENABLE_OPTION_LIVE_OTM', 'ENABLE_OPTION_LIVE_RV_LONG']) {
+        expect(PRODUCTION_ENV_INTENT.find((l) => l.key === key)!.intended, key).toBe('off');
+      }
+    });
   });
 
   // ── TRA-5172: the two IVR-gated flags ─────────────────────────────────────

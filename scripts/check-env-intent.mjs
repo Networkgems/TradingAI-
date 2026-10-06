@@ -244,6 +244,23 @@ const STORED_RESOLVERS = {
     reads: ['ENABLE_OPTION_LIVE_DIRECTIONAL'],
     resolve: (env) => (flagOn(env['ENABLE_OPTION_LIVE_DIRECTIONAL']) ? 'on' : 'off'),
   },
+  // live-learning-budget.ts:83 (isLiveLearningBudgetFlagOn) — same truthy list
+  // as flagOn. TRA-5213: the env-level bound on the ca66df94 live directional
+  // arm; the manifest row maps it on/off (env-intent.ts).
+  ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET: {
+    reads: ['ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET'],
+    resolve: (env) => (flagOn(env['ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET']) ? 'on' : 'off'),
+  },
+  // options-ideas-expectancy-gate.ts:314 (resolveExpectancyGateConfig) — the
+  // config is null unless the master flag is truthy (same list as flagOn,
+  // trimmed+lowercased); the manifest row maps config==null to 'off'
+  // (env-intent.ts, TRA-5172). The cap keys (EXPECTANCY_GATE_* bounds) only
+  // shape an already-enabled config — they cannot decide on/off, so they are
+  // deliberately not read here.
+  ENABLE_OPTIONS_IDEA_EXPECTANCY_GATE: {
+    reads: ['ENABLE_OPTIONS_IDEA_EXPECTANCY_GATE'],
+    resolve: (env) => (flagOn(env['ENABLE_OPTIONS_IDEA_EXPECTANCY_GATE']) ? 'on' : 'off'),
+  },
   // option-maker-fill-ledger.ts:31 (isOptionMakerTelemetryEnabled) — same
   // truthy list as flagOn, trimmed+lowercased; mapped on/off by the manifest
   // row (TRA-4814 rider, armed by the TRA-3401 re-arm).
@@ -332,18 +349,65 @@ async function readStoredEnv() {
     console.log('[env-intent]   until the next boot bakes it in.');
     return { armed: false };
   }
-  const url = `https://api.render.com/v1/services/${SERVICE_ID}/env-vars?limit=100`;
-  let res;
-  try {
-    res = await fetch(url, {
-      headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
-  } catch (e) {
-    blind(`env-list arm was ON but ${url} unreachable: ${e.message} (fail closed, TRA-2387 shape)`);
+  // TRA-5213 — Render's /env-vars is CURSOR-PAGINATED and bqb1 crossed 100
+  // stored keys on 2026-10-06. The single `?limit=100` request this used to make
+  // silently dropped every key past the window; the resolvers read an absent key
+  // as 'off', and the three `intended:'off'` rows are precisely the real-money
+  // stand-down levers — so a truncated read grades an ARMED sleeve as "dark, as
+  // intended". Page until a SHORT page proves the enumeration complete, and fail
+  // closed (BLIND) when completeness cannot be proven: `unreadable` and
+  // `matching` must never share an exit code.
+  //
+  // `RENDER_API_BASE` is a test seam for check-env-intent-controls.mjs, which
+  // points it at a local fixture server — the pagination branch is otherwise
+  // unreachable from a fixture, and an untestable guard is not a guard.
+  const base = (process.env.RENDER_API_BASE ?? 'https://api.render.com').replace(/\/+$/, '');
+  const PAGE_LIMIT = 100;
+  const rows = [];
+  let cursor;
+  let pages = 0;
+  for (;;) {
+    pages += 1;
+    if (pages > 25) {
+      blind(`env-list arm was ON but pagination did not terminate after ${pages - 1} full pages (fail closed — an unbounded cursor loop is not an enumeration)`);
+    }
+    const url =
+      `${base}/v1/services/${SERVICE_ID}/env-vars?limit=${PAGE_LIMIT}` +
+      (cursor !== undefined ? `&cursor=${encodeURIComponent(cursor)}` : '');
+    let res;
+    try {
+      res = await fetch(url, {
+        headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+    } catch (e) {
+      blind(`env-list arm was ON but ${url} unreachable: ${e.message} (fail closed, TRA-2387 shape)`);
+    }
+    if (!res.ok) blind(`env-list arm was ON but env-var list page ${pages} returned HTTP ${res.status} (fail closed)`);
+    let batch;
+    try {
+      batch = await res.json();
+    } catch (e) {
+      blind(`env-list arm was ON but env-var list page ${pages} is not JSON: ${e.message} (fail closed)`);
+    }
+    if (!Array.isArray(batch)) blind(`env-list arm was ON but env-var list page ${pages} is not an array (fail closed)`);
+    rows.push(...batch);
+    // A SHORT page is the only proof of completeness. A FULL page MUST be
+    // continued — even at exactly N*PAGE_LIMIT keys, where the next page simply
+    // comes back empty. Costing one extra request there is the cheap direction.
+    if (batch.length < PAGE_LIMIT) break;
+    const next = batch[batch.length - 1]?.cursor;
+    if (typeof next !== 'string' || next === '') {
+      blind(
+        `env-list arm was ON but page ${pages} came back FULL (${batch.length} rows) with no cursor to ` +
+          'continue — the enumeration is INCOMPLETE and the stored set was NOT graded. Every key outside ' +
+          "the read window would resolve as ABSENT, and for the intended:'off' real-money stand-down " +
+          "levers absent grades 'off' ⇒ matches — the silent-green direction (TRA-5213).",
+      );
+    }
+    cursor = next;
   }
-  if (!res.ok) blind(`env-list arm was ON but env-var list returned HTTP ${res.status} (fail closed)`);
-  return { armed: true, rows: await res.json(), from: SERVICE_ID };
+  return { armed: true, rows, from: SERVICE_ID, pages };
 }
 
 async function gradeStoredEnv(levers) {
@@ -355,7 +419,13 @@ async function gradeStoredEnv(levers) {
     if (typeof k === 'string') storedEnv[k] = r?.envVar?.value ?? r?.value;
   }
   if (!STORED_FIXTURE) {
-    console.log(`[env-intent] env-list arm: ON (${Object.keys(storedEnv).length} stored keys read from ${read.from})`);
+    // The count is part of the contract: a reader (and the TRA-5213 acceptance)
+    // asserts the printed total against the service's real key count, so a
+    // truncation that somehow survived the fail-closed loop above is still
+    // visible here as a wrong number, never as silence.
+    console.log(
+      `[env-intent] env-list arm: ON (${Object.keys(storedEnv).length} stored keys read from ${read.from} across ${read.pages} page(s))`,
+    );
   }
 
   const mismatches = [];

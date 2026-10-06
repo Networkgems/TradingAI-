@@ -281,10 +281,54 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
   },
   {
     key: 'ENABLE_OPTION_LIVE_DIRECTIONAL',
-    intended: 'off',
+    intended: 'on',
     provenance:
-      'TRA-1490: board authorized BUILDING the live path, explicitly did NOT arm it; arming is a separate gated approval',
+      'TRA-1490 authorized BUILDING the live path, explicitly dark; arming was a separate gated ' +
+      'approval — and board card ca66df94 on TRA-5207 (ask_user_questions, human_only, answered ' +
+      '2026-10-06T03:03:52Z) IS that approval: option B armed the LIVE directional learning budget ' +
+      'at $800 loss cap / $150 per-open / 40 opens / 40-session box, executed 2026-10-06 by five ' +
+      'single-key PUT /env-vars writes + the same-SHA env-apply dep-db26gcui0phs73dg4hm0 ' +
+      '(TRA-5213). THE AUTHORISATION IS SCOPED TO THAT BUDGET, not open-ended: it stands only ' +
+      'while ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET is on (the row below — the two rows move ' +
+      'together) AND the budget has not self-disarmed. The budget disarms itself at the loss cap, ' +
+      'the open cap, or the session box (live-learning-budget.ts), writing a durable disarm event ' +
+      'WITHOUT touching any env var — so this row alone cannot see expiry: once ' +
+      '/api/health/durability reports liveLearningBudget.disarmed != null, an `on` reading here ' +
+      'is ONCE AGAIN an unauthorised re-arm of the TRA-4750-stood-down directional sleeve ' +
+      '(STOOD_DOWN_SLEEVES still names it) — stand it down and return BOTH rows to intended ' +
+      "'off' in the same change, per the two-acts rule above. Kill switch: " +
+      'ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET=0 + same-SHA redeploy.',
     resolve: (env) => (isOptionLiveDirectionalEnabled(env) ? 'on' : 'off'),
+  },
+  {
+    // TRA-5213 — the expiry term for the row above, machine-readable. Without
+    // this row the ca66df94 authorisation's env-level bound (the kill switch)
+    // would live only in prose: a wipe or kill of the budget flag that left
+    // ENABLE_OPTION_LIVE_DIRECTIONAL=1 standing would grade clean while the
+    // directional arm ran unbudgeted on the money host.
+    key: 'ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET',
+    intended: 'on',
+    provenance:
+      'Armed by board card ca66df94 on TRA-5207 (2026-10-06): $800 loss cap / $150 per-open / ' +
+      '40 opens / 40-session box. This flag is the env-level bound on the live directional arm: ' +
+      'an `off`/absent reading here while ENABLE_OPTION_LIVE_DIRECTIONAL is still on means the ' +
+      'kill switch was thrown (or the key wiped) without the paired manifest edit — the ' +
+      'directional lever is then armed WITHOUT its budget: escalate; never edit this row alone ' +
+      'to clear it. The runtime self-disarm (loss/open/session caps) is NOT visible in env: ' +
+      'grade liveLearningBudget.disarmed on the same /api/health/durability payload. When the ' +
+      "budget ends either way, BOTH rows return to intended 'off' in the same change.",
+    // Resolve the way the consumer does — a faithful inline of
+    // `isLiveLearningBudgetFlagOn` (live-learning-budget.ts:83; the same truthy
+    // list as option-exec-flag's `flagOn`). Inlined rather than imported because
+    // that module pulls the scheduler/logger graph in at module scope, and the
+    // check-env-intent.mjs declared leg imports this file's compiled artifact —
+    // an import failure there would read BLIND on every run of the instrument.
+    resolve: (env) => {
+      const raw = env['ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET'];
+      return typeof raw === 'string' && ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase())
+        ? 'on'
+        : 'off';
+    },
   },
   {
     key: 'TRADIER_ENV',
