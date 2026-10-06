@@ -360,8 +360,11 @@ services:
         value: "0.50"
       - key: TRADING_AGENTS_COMPANY_DAILY_USD_CAP
         value: "0.50"
+      # TRA-5199: RATIFIED at 50 (CFO answer on TRA-3478, staged in the Render store and
+      # serving since 2026-08-13 deploy dep-d9uis2e417fc738at2j0). The "5" here was the
+      # TRA-1202 value and is superseded; record kept in step with the store.
       - key: OPTIONS_IDEAS_MONTHLY_USD_CAP
-        value: "5"
+        value: "50"
       - key: LLM_MODEL_STRONG
         value: claude-haiku-4-5
       # ───────────────────────────────────────────────────────────────────────
