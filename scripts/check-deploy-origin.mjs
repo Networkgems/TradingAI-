@@ -720,7 +720,7 @@ export async function fetchPaged({ route, serviceId, key, stopBeforeMs, transpor
 // and `--commit <sha>` read as "no commit given" and shipped the branch tip to the money
 // host, exit 0. Anything not on this list is exit 2 naming the offender.
 const FLAGS = new Set(['--selftest', '--json', '--no-acks', '--verbose', '--help', '-h']);
-const VALUED = new Set(['--days', '--since', '--service', '--live', '--host', '--acks', '--acks-from']);
+const VALUED = new Set(['--days', '--since', '--minutes', '--service', '--live', '--host', '--acks', '--acks-from']);
 
 export function parseArgs(argv) {
   const out = { flags: new Set(), values: {} };
@@ -745,7 +745,7 @@ export function parseArgs(argv) {
 const USAGE = `check-deploy-origin.mjs — TRA-4789
 
   node scripts/check-deploy-origin.mjs [--days=30 | --since=<iso>] [--service=srv-…]
-                                       [--live=<sha>] [--host=https://…]
+                                       [--minutes=<n>] [--live=<sha>] [--host=https://…]
                                        [--acks-from=origin|worktree] [--acks=<path>]
                                        [--no-acks] [--verbose] [--json] [--selftest]
 
@@ -834,7 +834,17 @@ async function main() {
         : 'origin';
 
   let sinceMs;
-  if (parsed.values['--since']) {
+  // TRA-5239: `--minutes=N` is the WATCH window — the shape a 5-minute scheduler wants. A
+  // dashboard deploy is only worth paging on while it is NEW; the 30-day default re-alarms an
+  // already-adjudicated row forever. Pick N >= 2x the cadence so one missed fire leaves no gap.
+  if (parsed.values['--minutes'] !== undefined) {
+    const m = Number(parsed.values['--minutes']);
+    if (!Number.isFinite(m) || m <= 0 || parsed.values['--since'] || parsed.values['--days']) {
+      console.error(`[deploy-origin] USAGE: --minutes=${parsed.values['--minutes']} must be a positive number and cannot be combined with --since/--days`);
+      process.exit(EXIT.USAGE);
+    }
+    sinceMs = nowMs - m * 60_000;
+  } else if (parsed.values['--since']) {
     sinceMs = Date.parse(parsed.values['--since']);
     if (!Number.isFinite(sinceMs)) {
       console.error(`[deploy-origin] USAGE: --since=${parsed.values['--since']} did not parse as a date`);
@@ -1006,6 +1016,7 @@ async function main() {
   }
 
   if (state.verdict === 'BYPASS') {
+    console.error('[deploy-origin] PAGE: GATE-FREE DEPLOY ON bqb1 (a Render-labelled non-REST deploy; see rows above).');
     console.error(`[deploy-origin] BYPASS — ${state.counts.unacked} deploy(s) above reached this host by a path that`);
     console.error('[deploy-origin] ran NONE of render-redeploy.mjs\'s gates: the deploy hold, the argument guard,');
     console.error('[deploy-origin] the RTH freeze, the dated embargo, the commit hold, the live AUTH_SECRET check,');

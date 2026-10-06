@@ -529,6 +529,42 @@ function runCallSite() {
     assert.equal(r.code, EXIT.BYPASS, r.out.slice(-800));
   });
 
+  // TRA-5239 — the 2026-10-06 table, replayed through the SHIPPED main(). 3 of 8 deploys were
+  // trigger=manual; the 14:31:10Z one landed inside the 13:25-20:00Z freeze.
+  const d1006 = (id, createdAt, sha, trigger) => ({ deploy: { id, commit: { id: sha }, status: 'deactivated', trigger, createdAt }, cursor: null });
+  const live1006 = { deploy: { id: 'dep-1006-live', commit: { id: LIVE }, status: 'live', trigger: 'api', createdAt: '2026-10-06T14:50:00Z' }, cursor: null };
+  const t1006 = [
+    live1006,
+    d1006('dep-1006-c3a2d337', '2026-10-06T14:31:10Z', 'c3a2d337aaaa', 'manual'),
+    d1006('dep-1006-c3f1cead', '2026-10-06T12:51:59Z', 'c3f1ceadaaaa', 'api'),
+    d1006('dep-1006-19287586', '2026-10-06T12:45:47Z', '19287586aaaa', 'manual'),
+    d1006('dep-1006-52d74583', '2026-10-06T01:23:03Z', '52d74583aaaa', 'manual'),
+  ];
+  check('TRA-5239 ARM A — the 2026-10-06 manual rows (incl. the mid-RTH 14:31Z one) ⇒ BYPASS, all three named, PAGE printed', () => {
+    const r = spawnArm({ stub: { deploys: t1006, events: [], health }, args: ['--since=2026-10-06T00:00:00Z', NOACKS] });
+    assert.equal(r.code, EXIT.BYPASS, r.out.slice(-1200));
+    for (const id of ['dep-1006-c3a2d337', 'dep-1006-19287586', 'dep-1006-52d74583']) assert.ok(r.out.includes(id), `must NAME ${id}`);
+    assert.match(r.out, /PAGE: GATE-FREE DEPLOY/);
+  });
+  check('TRA-5239 ARM B — same bytes, the three manual rows flipped to api ⇒ CLEAN (one-variable partner)', () => {
+    const flipped = t1006.map((e) => ({ ...e, deploy: { ...e.deploy, trigger: 'api' } }));
+    const r = spawnArm({ stub: { deploys: flipped, events: [], health }, args: ['--since=2026-10-06T00:00:00Z', NOACKS] });
+    assert.equal(r.code, EXIT.CLEAN, r.out.slice(-800));
+  });
+  check('TRA-5239 ARM C — --minutes watch window: a manual row 3 min old ⇒ BYPASS; same row, --minutes=1 ⇒ no page', () => {
+    const ago = (m) => new Date(Date.now() - m * 60_000).toISOString();
+    const fresh = [{ deploy: { id: 'dep-fresh-manual', commit: { id: LIVE }, status: 'live', trigger: 'manual', createdAt: ago(3) }, cursor: null }];
+    const hit = spawnArm({ stub: { deploys: fresh, events: [], health }, args: ['--minutes=10', NOACKS] });
+    assert.equal(hit.code, EXIT.BYPASS, hit.out.slice(-800));
+    assert.ok(hit.out.includes('dep-fresh-manual'));
+    const miss = spawnArm({ stub: { deploys: fresh, events: [], health }, args: ['--minutes=1', NOACKS] });
+    assert.notEqual(miss.code, EXIT.BYPASS, 'a row older than the watch window must not page');
+  });
+  check('TRA-5239 ARM D — --minutes combined with --days ⇒ USAGE, never a silent pick', () => {
+    const r = spawnArm({ stub: { deploys: [synthLive], events: [], health }, args: ['--minutes=10', '--days=3', NOACKS] });
+    assert.equal(r.code, EXIT.USAGE, r.out.slice(-400));
+  });
+
   check('call site — an all-REST history ⇒ CLEAN, and the report PRINTS the "api ≠ the script ran" caveat', () => {
     const r = spawnArm({ stub: { deploys: [synthLive], events: [], health }, args: [...WIN, NOACKS] });
     assert.equal(r.code, EXIT.CLEAN, r.out.slice(-800));

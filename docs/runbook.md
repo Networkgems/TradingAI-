@@ -289,6 +289,13 @@ actor (true of the deploy object, false of the event). Adjudicated bypasses go i
 `ops/deploy-origin-acks.json` **by deploy id, never by class**; an acked deploy is still
 printed in full on every fire.
 
+**Which surface is gated (TRA-5239).** Only the REST path (`render-redeploy.mjs`) is gated; the dashboard
+button is not, is in routine use (3 of 8 deploys on 2026-10-06, one mid-RTH), and **cannot be closed
+from our side** (one ADMIN member, no seat to restrict). An operator who must deploy uses the script.
+A dashboard deploy is detected, not prevented: `pnpm check:deploy-origin -- --minutes=15` (exit 1 +
+`PAGE:` line). Write-up, scheduler options and the real-money env-key blind-set census:
+`docs/tra5239-two-deploy-surfaces.md`.
+
 ##### Drift on a SAFETY path is a decision, not a number (TRA-3991)
 
 Drift answers *how far behind*. It does not say whether anything behind matters. On
