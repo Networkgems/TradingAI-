@@ -110,7 +110,7 @@ export type LiveLearningTerminalReason = 'open_cap' | 'loss_cap' | 'box_expiry';
 type LedgerEvent =
   | { kind: 'arm'; etDay: string; ts: number }
   | { kind: 'open'; id: string; occ: string | null; atRiskUsd: number; etDay: string; ts: number; book: string | null }
-  | { kind: 'close'; id: string; realizedPnlUsd: number; etDay: string; ts: number }
+  | { kind: 'close'; id: string; realizedPnlUsd: number; unmeasured?: true; etDay: string; ts: number }
   | { kind: 'disarm'; reason: LiveLearningTerminalReason; etDay: string; ts: number };
 
 interface OpenRow {
@@ -129,6 +129,7 @@ const opens = new Map<string, OpenRow>();
 let disarm: { reason: LiveLearningTerminalReason; etDay: string } | null = null;
 let pending: { etDay: string; ts: number } | null = null;
 let appendErrors = 0;
+let unmeasuredCloses = 0;
 const tallies = { consults: 0, grants: 0, refusals: {} as Record<string, number> };
 
 export function clearLiveLearningBudgetForTests(): void {
@@ -140,6 +141,7 @@ export function clearLiveLearningBudgetForTests(): void {
   disarm = null;
   pending = null;
   appendErrors = 0;
+  unmeasuredCloses = 0;
   tallies.consults = 0;
   tallies.grants = 0;
   tallies.refusals = {};
@@ -153,7 +155,11 @@ function apply(ev: LedgerEvent): void {
   }
   if (ev.kind === 'close') {
     const o = opens.get(ev.id);
-    if (o && !o.closed) { o.closed = true; o.realizedPnlUsd = ev.realizedPnlUsd; }
+    if (o && !o.closed) {
+      o.closed = true;
+      o.realizedPnlUsd = ev.realizedPnlUsd;
+      if (ev.unmeasured) unmeasuredCloses += 1;
+    }
     return;
   }
   if (disarm == null) disarm = { reason: ev.reason, etDay: ev.etDay };
@@ -335,7 +341,20 @@ export function commitLiveLearningOpen(args: {
 export function handleLiveLearningClose(id: string, realizedPnlUsd: number | null | undefined, etDay: string, nowMs = Date.now()): void {
   const o = opens.get(id);
   if (!o || o.closed) return;
-  append({ kind: 'close', id, realizedPnlUsd: typeof realizedPnlUsd === 'number' && Number.isFinite(realizedPnlUsd) ? realizedPnlUsd : 0, etDay, ts: nowMs });
+  if (typeof realizedPnlUsd === 'number' && Number.isFinite(realizedPnlUsd)) {
+    append({ kind: 'close', id, realizedPnlUsd, etDay, ts: nowMs });
+    return;
+  }
+  // TRA-5234: an UNMEASURED close (null/non-finite P&L — e.g. a TRA-4857
+  // broker_reconcile close with no brokerOrderId) books the row's FULL at-risk
+  // as the realized loss, never $0. On close the row also leaves openAtRisk(),
+  // so a $0 booking would vanish from BOTH terms of worstCase and hand the
+  // loss cap headroom the book cannot prove — on the exact close where a real
+  // broker fill could not be reconciled. Fail toward the cap; the count is
+  // surfaced as `unmeasuredCloses` in the summary. The READ path's fail-closed
+  // null (realizedPnlUsd when unreadable) is separate and stays as is.
+  const atRisk = Number.isFinite(o.atRiskUsd) ? Math.abs(o.atRiskUsd) : LIVE_LEARNING_CEILINGS.perOpenAtRiskUsd;
+  append({ kind: 'close', id, realizedPnlUsd: -atRisk, unmeasured: true, etDay, ts: nowMs });
 }
 
 export function summarizeLiveLearningBudget(env: NodeJS.ProcessEnv = process.env, todayEtDay?: string) {
@@ -351,6 +370,9 @@ export function summarizeLiveLearningBudget(env: NodeJS.ProcessEnv = process.env
     opensUsed: readable ? opens.size : null,
     openPositions: readable ? [...opens.values()].filter((o) => !o.closed).length : null,
     realizedPnlUsd: readable ? Math.round(realizedPnl() * 100) / 100 : null,
+    // TRA-5234: closes booked at the conservative -atRiskUsd bound because the
+    // journal could not measure them. null = UNREADABLE, never 0.
+    unmeasuredCloses: readable ? unmeasuredCloses : null,
     openAtRiskUsd: readable ? Math.round(openAtRisk() * 100) / 100 : null,
     lossHeadroomUsd: readable ? Math.round((caps.maxLossUsd + realizedPnl() - openAtRisk()) * 100) / 100 : null,
     disarmed: disarm,

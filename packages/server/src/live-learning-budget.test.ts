@@ -152,6 +152,65 @@ describe('durability', () => {
   });
 });
 
+describe('unmeasured close (TRA-5234) — a null P&L books the full at-risk, never $0', () => {
+  beforeEach(() => {
+    clearLiveLearningBudgetForTests();
+    hydrate(freshDir());
+  });
+
+  it('a null-P&L close TIGHTENS the cap by the row\'s own at-risk, and the next consult refuses', () => {
+    const env = { ...ON, LIVE_LEARNING_BUDGET_MAX_LOSS_USD: '150' };
+    const id = openOne(MON, 90);
+    handleLiveLearningClose(id, null, MON);
+    const s = summarizeLiveLearningBudget(env, MON);
+    expect(s.realizedPnlUsd).toBe(-90);
+    expect(s.lossHeadroomUsd).toBe(60); // NOT 150 — a $0 booking would read the full cap here
+    expect(s.unmeasuredCloses).toBe(1);
+    // headroom 60 < 90 ⇒ the consult must refuse rather than grant against phantom headroom
+    expect(consultLiveLearningBudget(env, TUE, 90).refusal).toBe('loss_cap');
+  });
+
+  it('NaN/undefined are unmeasured too; a measured close books itself and counts nothing', () => {
+    const a = openOne(MON, 50);
+    handleLiveLearningClose(a, Number.NaN, MON);
+    const b = openOne(MON, 40);
+    handleLiveLearningClose(b, -10, TUE);
+    const s = summarizeLiveLearningBudget(ON, TUE);
+    expect(s.realizedPnlUsd).toBe(-60); // -50 unmeasured + -10 measured
+    expect(s.unmeasuredCloses).toBe(1);
+  });
+
+  it('unmeasured closes accumulate to a terminal loss_cap disarm', () => {
+    const env = { ...ON, LIVE_LEARNING_BUDGET_MAX_LOSS_USD: '150' };
+    const a = openOne(MON, 90);
+    handleLiveLearningClose(a, null, MON);
+    const b = openOne(MON, 90);
+    handleLiveLearningClose(b, undefined, MON);
+    // booked -180 breaches the 150 cap ⇒ terminal disarm, exactly as a measured -180 would
+    expect(consultLiveLearningBudget(env, TUE, 10).refusal).toBe('loss_cap');
+    expect(summarizeLiveLearningBudget(env, TUE).disarmed?.reason).toBe('loss_cap');
+  });
+
+  it('the booked loss and the unmeasured count survive a reboot', () => {
+    const dir = freshDir();
+    clearLiveLearningBudgetForTests();
+    hydrate(dir);
+    const id = openOne(MON, 80);
+    handleLiveLearningClose(id, null, MON);
+    hydrate(dir);
+    const s = summarizeLiveLearningBudget(ON, MON);
+    expect(s.realizedPnlUsd).toBe(-80);
+    expect(s.unmeasuredCloses).toBe(1);
+  });
+
+  it('an unreadable ledger reads unmeasuredCloses as null, never 0', () => {
+    const dir = freshDir();
+    writeFileSync(join(dir, LIVE_LEARNING_BUDGET_LOG_FILENAME), '{not json\n');
+    hydrate(dir);
+    expect(summarizeLiveLearningBudget(ON, MON).unmeasuredCloses).toBeNull();
+  });
+});
+
 describe('stand-down exemption', () => {
   it('directional stays stood down without a grant', () => {
     expect(gradeSleeveStandDown('single_leg_directional').allowed).toBe(false);
