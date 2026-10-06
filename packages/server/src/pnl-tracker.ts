@@ -1007,6 +1007,22 @@ export class PnlTracker {
     const monthStart = `${today.slice(0, 7)}-01`;
     const yearStart = `${today.slice(0, 4)}-01-01`;
 
+    // TRA-5215 (Option C, CFO-signed on TRA-5214) — NON-SESSION ROWS LEAVE
+    // EVERY PUBLISHED TOTAL AT READ TIME, with zero ledger writes. The TRA-3848
+    // writer gate stopped NEW non-session rows at the 21:00 ET archive; the
+    // banked ones (the TRA-3849 23-row census) stay in the ledger and in
+    // `GET /api/snapshots` on purpose (TRA-2886/2888 — no banked row is deleted
+    // or restated) and are excluded HERE, where the totals are derived. The
+    // calendar is the injected `isMarketDay` — `isMarketDayIso` in production
+    // (`user-context.ts`), the SAME predicate the writer gate and
+    // `close-ledger.ts` grade with, so reader and writer cannot drift onto two
+    // calendars. `null` (no calendar supplied: tests, the former crypto
+    // tracker) keeps every row — byte-for-byte the pre-TRA-5215 totals.
+    const isSessionDay = this.isMarketDay;
+    const sessionRows = isSessionDay === null
+      ? this.snapshots
+      : this.snapshots.filter(s => isSessionDay(s.date));
+
     // TRA-1633 BUG 2 — sum DAY-ONLY realized (stock `dailyPnl` + day-only
     // `optionsDailyPnl`) over each window, NOT the per-snapshot `combinedPnl`.
     // `combinedPnl` carried the mode's ALL-TIME cumulative options total
@@ -1016,7 +1032,7 @@ export class PnlTracker {
     // `allTimePnl`. `optionsDailyPnl` is absent on legacy rows (→ 0), so they
     // contribute stock-only rather than a phantom.
     const bookedFrom = (from: string) =>
-      this.snapshots
+      sessionRows
         .filter(s => s.date >= from)
         .reduce((acc, s) => acc + s.dailyPnl + (s.optionsDailyPnl ?? 0), 0);
 
@@ -1024,10 +1040,16 @@ export class PnlTracker {
     // dropped, not coerced. `Math.max(..., null)` is 0, which would not merely
     // be wrong here — it would silently CAP `peakEquity` at 0 and turn every
     // drawdown reading on the book into a fiction.
+    //
+    // TRA-5215 — the SPREAD is session-rows-only; the `initialEquity` /
+    // `currentEquity` floors are NOT row-derived and stay unconditionally, per
+    // the TRA-5214 sign-off. Filtering them too would hand an all-non-session
+    // (or empty) book an empty `Math.max()` = -Infinity — the same class of
+    // fiction the TRA-2829 null-coercion guard above exists to block.
     const peakEquity = Math.max(
       this.initialEquity,
       currentEquity,
-      ...this.snapshots
+      ...sessionRows
         .map(s => s.closingEquity)
         .filter((v): v is number => v !== null && Number.isFinite(v)),
     );
@@ -1062,7 +1084,10 @@ export class PnlTracker {
     // property as before: with every day booked and credits absorbed, the sum
     // collapses to `currentEquity - initialEquity`. Legacy rows without
     // `optionsDailyPnl` contribute stock-only (absent → 0), matching the windows.
-    const bookedPnl = this.snapshots.reduce(
+    // TRA-5215 — `sessionRows`, the same filtered basis as the windows above,
+    // so all-time keeps telescoping against them (`allTimePnl − yearlyPnl` is
+    // still exactly the booked pre-Jan-1 session sum).
+    const bookedPnl = sessionRows.reduce(
       (acc, s) => acc + s.dailyPnl + (s.optionsDailyPnl ?? 0), 0);
     const todayRunning = currentEquity - this.state.openingEquity;
     const allTimePnl = bookedPnl + todayRunning;

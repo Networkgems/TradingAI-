@@ -34,6 +34,9 @@
 
 import type { AlertPreferences, ReportCadence } from '@trading-app/shared';
 import type { DailySnapshot } from './pnl-tracker.js';
+// TRA-5215 — the exchange calendar for the read-time non-session exclusion in
+// `mergeByDate`. The same predicate the TRA-3848 writer gate grades with.
+import { isMarketDayIso } from './scheduler.js';
 import {
   emitAlert,
   type ReportAlertEvent,
@@ -157,6 +160,18 @@ interface MergedDay {
  * Merge snapshots (possibly from BOTH the stocks and crypto trackers, which can
  * each carry a row for the same date) into one row per date, summing P&L / trades
  * / equity across trackers. Rows outside `[start, end]` are dropped.
+ *
+ * TRA-5215 (Option C, CFO-signed on TRA-5214) — NON-SESSION rows are dropped
+ * too, at read time, with zero ledger writes. The TRA-3848 writer gate stopped
+ * new non-session rows at the 21:00 ET archive; the banked ones (the TRA-3849
+ * 23-row census) stay in the ledger on purpose (TRA-2886/2888) and leave the
+ * report TOTALS here — the one merge point both the scheduled 21:00 ET reports
+ * and the on-demand path inherit through `aggregatePeriod`. The predicate is
+ * `isMarketDayIso`, the SAME calendar the writer gate and `close-ledger.ts`
+ * grade with — never a second calendar. Corollaries that are correct, not
+ * regressions: `tradingDays` no longer counts a non-session Sunday, and a
+ * window whose ONLY row was non-session (ISO-week 2026-W18 on `enock|demo`)
+ * now reads as empty and emits no report at all.
  */
 function mergeByDate(
   snapshots: readonly DailySnapshot[],
@@ -167,6 +182,7 @@ function mergeByDate(
   for (const s of snapshots) {
     if (!s || !DATE_RE.test(s.date)) continue;
     if (s.date < start || s.date > end) continue;
+    if (!isMarketDayIso(s.date)) continue; // TRA-5215 — see doc comment above
     const cur = byDate.get(s.date) ?? {
       date: s.date,
       pnl: 0,

@@ -1125,3 +1125,136 @@ describe('TRA-4003 — the anchor survives a weekend with more than one boot', (
     expect(t2.getOpeningEquity()).toBeCloseTo(TRADE_PATH_CACHE, 6);
   });
 });
+
+// TRA-5215 (Option C, CFO-signed on TRA-5214, off the TRA-5135 impact
+// analysis) — NON-SESSION ROWS LEAVE EVERY PUBLISHED TOTAL AT READ TIME, with
+// zero ledger writes. The TRA-3848 writer gate stopped new non-session rows at
+// the 21:00 ET archive; the banked ones (the TRA-3849 23-row census) stay in
+// the ledger and in `GET /api/snapshots` on purpose (TRA-2886/2888) and are
+// excluded in `getCumulativeStats`, keyed on the injected `isMarketDay` — the
+// production wiring hands it `isMarketDayIso` (user-context.ts), the same
+// predicate the writer gate grades with. The live dollar shape these pin:
+// exactly ONE of the 23 in-census rows carries snapshot-leg money
+// (`enock|demo` 2026-05-03, stockDaily +19.49); every other row is $0.00 on
+// both legs, so every other book must move $0.00 on every total.
+describe('TRA-5215 — getCumulativeStats excludes non-session rows at read time', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'pnl-tracker-5215-'));
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // Weekend-only calendar, the TRA-4003 pattern: the test names its own
+  // sessions instead of depending on the production holiday table. Sundays
+  // (dow 0) are exactly the class every one of the 23 live census rows is in.
+  const isMarketDay = (iso: string): boolean => {
+    const [y, m, d] = iso.split('-').map(Number);
+    const dow = new Date(Date.UTC(y as number, (m as number) - 1, d as number)).getUTCDay();
+    return dow !== 0 && dow !== 6;
+  };
+  // 15:00Z = 11:00 ET on every date used here, safely inside the ET day.
+  const bootOn = (iso: string): void => {
+    vi.setSystemTime(new Date(iso + 'T15:00:00.000Z'));
+  };
+  const row = (date: string, openingEquity: number, closingEquity: number): DailySnapshot => ({
+    date,
+    openingEquity,
+    closingEquity,
+    dailyPnl: closingEquity - openingEquity,
+    optionsPnl: 0,
+    optionsDailyPnl: 0,
+    combinedPnl: closingEquity - openingEquity,
+    trades: 1,
+  });
+
+  it('the enock|demo 2026-05-03 shape: the Sunday +19.49 leaves all-time / yearly / monthly', () => {
+    bootOn('2026-05-04'); // Monday after the W18 Sunday row
+    const t = new PnlTracker(dir, 25_000, { isMarketDay });
+    t.saveEquity(25_100, 0);
+    t.saveSnapshot(row('2026-05-01', 25_000, 25_100));          // Friday, +100 — session
+    t.saveSnapshot(row('2026-05-03', 25_100, 25_119.49));       // Sunday, +19.49 — non-session
+    const stats = t.getCumulativeStats(25_119.49);              // openingEquity rebased to 25,119.49 → todayRunning 0
+    // Pre-fix every one of these read 119.49: the −19.49 is the ONLY published
+    // dollar movement Option C produces, and it is exactly the Sunday leg.
+    expect(stats.allTimePnl).toBeCloseTo(100, 6);
+    expect(stats.yearlyPnl).toBeCloseTo(100, 6);
+    expect(stats.monthlyPnl).toBeCloseTo(100, 6);
+  });
+
+  it('the W18 shape: a rolling week whose ONLY row is the non-session Sunday reads 0', () => {
+    bootOn('2026-05-03'); // the Sunday itself — weekStart is Monday 04-27
+    const t = new PnlTracker(dir, 25_000, { isMarketDay });
+    t.saveEquity(25_119.49, 0);
+    t.saveSnapshot(row('2026-05-03', 25_100, 25_119.49));
+    expect(t.getCumulativeStats(25_119.49).weeklyPnl).toBeCloseTo(0, 6); // pre-fix: 19.49
+  });
+
+  it('an inert non-session row (both legs $0.00 — 22 of the 23 census rows) moves every total $0.00', () => {
+    bootOn('2026-05-08');
+    const withInert = new PnlTracker(dir, 25_000, { isMarketDay });
+    withInert.saveEquity(25_100, 0);
+    // The inert Sunday FIRST: `saveSnapshot` rebases `openingEquity` to the
+    // row it just wrote, and this comparison needs both trackers anchored on
+    // the same last SESSION close so `todayRunning` is identical by design.
+    withInert.saveSnapshot({ ...row('2026-05-03', 25_000, 25_000), trades: 0 }); // inert Sunday
+    withInert.saveSnapshot(row('2026-05-04', 25_000, 25_100)); // Monday, +100
+    withInert.saveSnapshot(row('2026-05-05', 25_100, 25_100)); // Tuesday, flat
+
+    const ctrlDir = mkdtempSync(join(tmpdir(), 'pnl-tracker-5215-ctrl-'));
+    try {
+      const control = new PnlTracker(ctrlDir, 25_000, { isMarketDay });
+      control.saveEquity(25_100, 0);
+      control.saveSnapshot(row('2026-05-04', 25_000, 25_100));
+      control.saveSnapshot(row('2026-05-05', 25_100, 25_100));
+      expect(withInert.getCumulativeStats(25_100)).toEqual(control.getCumulativeStats(25_100));
+    } finally {
+      rmSync(ctrlDir, { recursive: true, force: true });
+    }
+  });
+
+  it('peakEquity: the closingEquity SPREAD is session-rows-only…', () => {
+    bootOn('2026-05-08');
+    const t = new PnlTracker(dir, 25_000, { isMarketDay });
+    t.saveEquity(25_500, 0);
+    t.saveSnapshot(row('2026-05-04', 25_000, 25_500));   // session peak 25,500
+    t.saveSnapshot(row('2026-05-03', 25_000, 30_000));   // Sunday close 30,000 — excluded
+    expect(t.getCumulativeStats(25_200).peakEquity).toBeCloseTo(25_500, 6);
+  });
+
+  it('…and when a book peaked on a SESSION row (all four live books), peakEquity is unchanged', () => {
+    bootOn('2026-05-08');
+    const t = new PnlTracker(dir, 25_000, { isMarketDay });
+    t.saveEquity(26_000, 0);
+    t.saveSnapshot(row('2026-05-04', 25_000, 26_000));   // session peak
+    t.saveSnapshot({ ...row('2026-05-03', 25_000, 25_000), trades: 0 }); // inert Sunday
+    expect(t.getCumulativeStats(25_400).peakEquity).toBeCloseTo(26_000, 6);
+  });
+
+  it('peakEquity: the initialEquity/currentEquity FLOORS are not row-derived and survive an all-filtered spread', () => {
+    // The TRA-5214 binding condition: filter the SPREAD only. A book whose
+    // every row is non-session (plus a TRA-2829 null close) must fall back to
+    // the floors — never to `Math.max()` of an empty spread (−Infinity) and
+    // never to a null coerced to 0.
+    bootOn('2026-05-08');
+    const t = new PnlTracker(dir, 25_000, { isMarketDay });
+    t.saveSnapshot(row('2026-05-03', 25_000, 30_000));                       // Sunday — filtered
+    t.saveSnapshot({ ...row('2026-05-04', 25_000, 25_000), closingEquity: null }); // session, unmeasured close
+    expect(t.getCumulativeStats(24_500).peakEquity).toBeCloseTo(25_000, 6);  // initialEquity floor
+    expect(t.getCumulativeStats(26_300).peakEquity).toBeCloseTo(26_300, 6);  // currentEquity floor
+  });
+
+  it('CONTROL — no calendar supplied (the former crypto tracker, legacy tests): every row still counts', () => {
+    bootOn('2026-05-04');
+    const t = new PnlTracker(dir, 25_000); // isMarketDay null → pre-TRA-5215 totals, byte-for-byte
+    t.saveEquity(25_119.49, 0);
+    t.saveSnapshot(row('2026-05-01', 25_000, 25_100));
+    t.saveSnapshot(row('2026-05-03', 25_100, 25_119.49)); // Sunday — NOT filtered here
+    const stats = t.getCumulativeStats(25_119.49);
+    expect(stats.allTimePnl).toBeCloseTo(119.49, 6);
+    expect(stats.monthlyPnl).toBeCloseTo(119.49, 6);
+  });
+});

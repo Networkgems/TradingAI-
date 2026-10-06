@@ -170,9 +170,13 @@ describe('runScheduledReports', () => {
   });
 
   it('prove-it-fires: the SAME weekly user fires once the boundary (Sunday) is reached', () => {
+    // TRA-5215 — the second row used to sit on Sunday 2026-07-26 itself, which
+    // the non-session read-time exclusion now (correctly) drops from the
+    // totals. The subject of THIS test is the boundary firing, so the row
+    // moved to Thursday; the Sunday-row behaviour has its own block below.
     const carol: ReportUser = {
       username: 'weekly-carol',
-      snapshots: [snap('2026-07-20', 10, 1), snap('2026-07-26', 5, 1)],
+      snapshots: [snap('2026-07-20', 10, 1), snap('2026-07-23', 5, 1)],
       prefs: prefsWith('weekly'),
     };
     expect(collect([carol], '2026-07-24')).toHaveLength(0); // Friday — nothing
@@ -195,5 +199,59 @@ describe('runScheduledReports', () => {
     const ok: ReportUser = { username: 'ok', snapshots: [snap('2026-07-24', 5, 1)], prefs: prefsWith('daily') };
     const emitted = collect([boom, ok], '2026-07-24');
     expect(emitted.map((e) => e.username)).toEqual(['ok']);
+  });
+});
+
+// ── TRA-5215 — read-time non-session exclusion (Option C, CFO-signed TRA-5214) ──
+//
+// `mergeByDate` drops rows whose date fails `isMarketDayIso` — the REAL
+// production calendar, deliberately not a stub, because the binding condition
+// is "one predicate, never a second calendar" (the TRA-3848 writer gate and
+// `close-ledger.ts` grade with the same one). `aggregatePeriod` delegates to
+// `mergeByDate`, so both the 21:00 ET scheduled reports and the on-demand path
+// inherit the filter — that inheritance is what these pin. Dates used:
+// 2026-05-01 is a Friday session; 2026-05-03 is the Sunday that carries the
+// ONLY snapshot-leg money among the 23 live census rows (`enock|demo`,
+// stockDaily +19.49).
+describe('TRA-5215 — aggregatePeriod inherits the non-session exclusion through mergeByDate', () => {
+  it('the measured split: −19.49 on the window holding the money Sunday, and the Sunday trade/day leave the counts', () => {
+    const snaps = [
+      snap('2026-05-01', 100, 2), // Friday — session
+      snap('2026-05-03', 19.49, 1), // Sunday — the enock|demo money row
+    ];
+    const may = aggregatePeriod(snaps, '2026-05-01', '2026-05-31');
+    expect(may).not.toBeNull();
+    expect(may!.totalPnl).toBeCloseTo(100, 6); // pre-fix: 119.49
+    expect(may!.stockPnl).toBeCloseTo(100, 6);
+    expect(may!.totalTrades).toBe(2);
+    expect(may!.tradingDays).toBe(1); // a Sunday is not a trading day
+    expect(may!.bestDay).toEqual({ date: '2026-05-01', pnl: 100, trades: 2 });
+  });
+
+  it('ISO-week 2026-W18 ceases to exist: a window whose ONLY row is non-session aggregates to null', () => {
+    const w18 = aggregatePeriod([snap('2026-05-03', 19.49, 1)], '2026-04-27', '2026-05-03');
+    expect(w18).toBeNull(); // the report is not emitted at all, rather than re-totalling
+    // …and through the real weekly event build (2026-05-03 IS the Sunday boundary):
+    expect(buildPeriodReport('enock', 'weekly', [snap('2026-05-03', 19.49, 1)], '2026-05-03', 1)).toBeNull();
+  });
+
+  it('inert non-session rows (both legs $0.00 — 22 of the 23 census rows) move every published cell $0.00', () => {
+    const sessions = [snap('2026-05-01', 100, 2), snap('2026-04-30', -40, 1)];
+    const withInert = [
+      ...sessions,
+      // Inert Sunday CLOSING the window: pre-fix it supplied `endEquity` and a
+      // `tradingDays` count; post-fix the stats must read as if it never existed.
+      snap('2026-05-03', 0, 0),
+      snap('2026-04-26', 0, 0), // inert Sunday ahead of the window's first session
+    ];
+    expect(aggregatePeriod(withInert, '2026-04-26', '2026-05-03'))
+      .toEqual(aggregatePeriod(sessions, '2026-04-26', '2026-05-03'));
+  });
+
+  it('CONTROL — a session-day row at the window edge still counts (the filter is the calendar, not the boundary)', () => {
+    const friday = aggregatePeriod([snap('2026-05-01', 100, 2)], '2026-05-01', '2026-05-01');
+    expect(friday).not.toBeNull();
+    expect(friday!.totalPnl).toBeCloseTo(100, 6);
+    expect(friday!.tradingDays).toBe(1);
   });
 });
