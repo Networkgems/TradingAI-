@@ -163,15 +163,19 @@ voice).
 `overlayManaged` (TRA-5222) lists compared keys the **demo-flags.json overlay**
 currently governs. The overlay is a legitimate, documented, runtime-writable
 layer (TRA-1008/TRA-1481 — the daemon-free operator flip; the TRA-5207 pre-bell
-runbook depends on it), so a divergence it explains is a **dated operator
+runbook depends on it), so a divergence it explains is an **authorized operator
 action, not an unauthorized flip**, and does not count into `driftCount`. Before
 TRA-5222 those divergences burned the alarm: the route rested at `ok: false`
 with 5 benign drifts, so the next *unauthorized* live-flag flip would have
 arrived as `driftCount: 6` on a surface everyone had learned to ignore. A
 running value that contradicts **both** the blueprint **and** the overlay still
 lands in the drift buckets. `agreesWithDeclared: false` on an entry means the
-overlay is overriding the declared steady state — expected while a dated
-runbook action is in force, worth a look if it persists.
+overlay is overriding the declared steady state — which may be a dated runbook
+action **or a live, owned campaign arm**. Grade the provenance on the key's
+render.yaml row before calling it stale: `ENABLE_OPTION_COST_AWARE_GATE: "0"`
+is the TRA-5207 §1 paper-row campaign (owner QuantTrader, TRA-5188), which
+supersedes the `427b57ee` steady-state `"1"` for the campaign's duration —
+re-arming it is the owner's (or the board's) call, not a consistency fix.
 
 `sync: false` keys are skipped (dashboard-managed, legitimately absent from the
 blueprint), as are `generateValue`/`fromService` keys.

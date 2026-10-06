@@ -457,6 +457,24 @@ services:
       # self-heal (demo-flags.ts) delivers the value. Daemon-free DISARM: write
       # `{"ENABLE_OPTION_COST_AWARE_GATE":"0"}` via `/api/admin/demo-flags` — the file
       # layers OVER env and wins. Accepts 1/true/yes/on.
+      #
+      # OVERLAY-OFF PROVENANCE (TRA-5222/TRA-5188, recorded 2026-10-06): the
+      # demo-flags.json overlay currently holds this key at "0" — the TRA-5207 §1
+      # paper-row campaign (paper directional/OTM/wheel opens). That write
+      # SUPERSEDES the 427b57ee steady-state "1" for the duration of the campaign;
+      # it is a live, OWNED campaign arm, not a stale runbook leftover. Re-arming
+      # the bar darkens the paper directional sleeve: measured 7-day admit rate
+      # 0.0074% (admitted 5, all 5 via the TRA-5188 carve-out bypass, 0 on merit,
+      # rejected 67,645). Owner: QuantTrader (TRA-5188) — re-arm is theirs via
+      # `/api/admin/demo-flags` (write "1"; a `null` removal stays OFF until the
+      # next boot because the boot seed skipped the file-held key), or a board
+      # call; never a unilateral "consistency" fix of this declaration.
+      # env-drift reports the state as overlayManaged[] (source: overlay),
+      # excluded from driftCount, with /api/health/cost-aware-gate still reading
+      # `armed: false` loudly. LIVE reach: none BY CONSTRUCTION — the live branch
+      # reads the SEPARATE flag ENABLE_OPTION_COST_GATE_LIVE_ENFORCE from
+      # process.env only (option-exec-flag.ts: "never sourced from the demo-flags
+      # file override"), so this overlay key cannot gate or admit a live order.
       - key: ENABLE_OPTION_COST_AWARE_GATE
         value: "1"
       # TRA-1662 (TRA-1600 A2) — arm the observe-only MAKER-CHASE SHADOW measurement

@@ -130,10 +130,12 @@ export interface EnvDriftEntry {
  * TRA-5222 AC1 — a compared key whose running value is supplied by the
  * `demo-flags.json` overlay, a legitimate, documented, runtime-writable layer
  * (TRA-1008/TRA-1481; the TRA-5207 pre-bell runbook depends on it). An
- * overlay-sourced difference from the blueprint is NOT drift: the overlay is a
- * dated operator action layered over a declaration that still states the
- * intended steady state. It is surfaced here so the divergence stays VISIBLE
- * without burning the alarm (the wolf-crier failure this ticket closes).
+ * overlay-sourced difference from the blueprint is NOT drift: the overlay is an
+ * authorized operator action — a dated runbook write or a live, owned campaign
+ * arm (grade the provenance on the key's render.yaml row) — layered over a
+ * declaration that still states the intended steady state. It is surfaced here
+ * so the divergence stays VISIBLE without burning the alarm (the wolf-crier
+ * failure this ticket closes).
  */
 export interface OverlayManagedEntry {
   key: string;
@@ -214,9 +216,10 @@ export interface EnvDriftReport {
   /**
    * TRA-5222 AC1 — compared keys the demo-flags.json overlay currently governs.
    * NOT drift and NOT counted into `driftCount`: the overlay is a documented,
-   * runtime-writable layer, so a divergence it explains is a dated operator
-   * action, not an unauthorized flip. A running value that contradicts BOTH the
-   * blueprint AND the overlay still lands in the drift buckets above.
+   * runtime-writable layer, so a divergence it explains is an authorized
+   * operator action (dated runbook write or live campaign arm), not an
+   * unauthorized flip. A running value that contradicts BOTH the blueprint AND
+   * the overlay still lands in the drift buckets above.
    */
   overlayManaged: OverlayManagedEntry[];
   /**
