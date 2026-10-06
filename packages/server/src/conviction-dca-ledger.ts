@@ -485,6 +485,26 @@ export type ConvictionDcaGuardPassState =
   | 'no_pass_candidate';
 
 /**
+ * TRA-5204 — the AGGREGATE pass-state vocabulary: the per-leg values plus one the
+ * pooled fold alone can never derive. The pooled counters read `pass_observed` on
+ * the strength of one busy leg (1,048 option passes) while the other leg had never
+ * once been offered a candidate it was obliged to admit — so a reader of the
+ * aggregate was told "validated" about a brake whose equity limb is unvalidatable
+ * from the sample. The aggregate must refuse that reading itself; a sibling field
+ * (`passStateByClass`) demonstrably does not get consulted (the TRA-5192 fire read
+ * the `byClass` table and never saw it).
+ */
+export type ConvictionDcaGuardAggregatePassState =
+  | ConvictionDcaGuardPassState
+  /**
+   * A pass WAS observed on at least one leg, but some other leg that evaluated
+   * candidates is `no_pass_candidate` — its halt count is not evidence it can
+   * admit. Deliberately NOT `pass_observed`: coverage is per leg, and a pooled
+   * pass must not overstate it. `vacuousClassLegs` names the legs.
+   */
+  | 'pass_unproven_vacuous_leg';
+
+/**
  * The named verdict a bare zero could not express. Derived, never stored — so it can
  * never disagree with the counters beside it.
  */
@@ -623,14 +643,32 @@ export interface ConvictionDcaGuardSummary extends ConvictionDcaGuardBucket {
   /** The named verdict — what the counters above MEAN. */
   state: ConvictionDcaGuardState;
   /**
-   * TRA-4462 — whether a PASS is reachable at all, pooled. Read this beside
-   * {@link passStateByClass}: a pooled `pass_observed` carried entirely by one leg
-   * is exactly how the equity leg's zero stayed invisible for three months.
+   * TRA-4462 — whether a PASS is reachable at all, pooled. TRA-5204 — no longer a
+   * bare pooled fold: while any class leg with evaluated candidates is
+   * `no_pass_candidate`, this reads `pass_unproven_vacuous_leg`, never
+   * `pass_observed` — a pooled pass carried entirely by one leg is exactly how the
+   * equity leg's zero stayed invisible for three months, and then got re-read as a
+   * validated brake by the 2026-10-05 review fire.
    */
-  passState: ConvictionDcaGuardPassState;
+  passState: ConvictionDcaGuardAggregatePassState;
+  /**
+   * TRA-5204 — the class legs this aggregate is NOT entitled to claim a pass for:
+   * every leg whose own pass state is `no_pass_candidate`. Empty when the
+   * aggregate `passState` speaks for all evaluated legs.
+   */
+  vacuousClassLegs: ConvictionDcaClassKey[];
   /** Same counts per book, and per asset-class leg. */
   byAccount: Record<string, ConvictionDcaGuardBucket>;
-  byClass: Record<ConvictionDcaClassKey, ConvictionDcaGuardBucket>;
+  /**
+   * TRA-5204 — each leg row carries its own `passState` INLINE. The verdict existed
+   * before (`passStateByClass`) but lived in a sibling map, and the reader who
+   * tabulated `byClass` never saw it — proximity is part of the contract on a
+   * surface whose whole point is refusing a wrong default reading.
+   */
+  byClass: Record<
+    ConvictionDcaClassKey,
+    ConvictionDcaGuardBucket & { passState: ConvictionDcaGuardPassState }
+  >;
   /** Per-book named verdicts, so one dark book cannot hide behind a busy one. */
   stateByAccount: Record<string, ConvictionDcaGuardState>;
   /**
@@ -694,12 +732,30 @@ export function summarizeConvictionDcaGuard(
     option: convictionDcaGuardPassStateOf(byCls.option),
     unknown: convictionDcaGuardPassStateOf(byCls.unknown),
   } satisfies Record<ConvictionDcaClassKey, ConvictionDcaGuardPassState>;
+  // TRA-5204 — a leg that evaluated candidates but was never offered one it was
+  // obliged to admit (`no_pass_candidate`) caps the aggregate: the pooled fold may
+  // not claim `pass_observed` for a population one of its legs cannot speak for.
+  // `failing_closed` and the non-pass pooled verdicts are untouched — the demotion
+  // only refuses the overstated pass, it never upgrades or masks a failure.
+  const vacuousClassLegs = (
+    Object.keys(passStateByClass) as ConvictionDcaClassKey[]
+  ).filter((cls) => passStateByClass[cls] === 'no_pass_candidate');
+  const pooledPassState = convictionDcaGuardPassStateOf(pooled);
+  const passState: ConvictionDcaGuardAggregatePassState =
+    pooledPassState === 'pass_observed' && vacuousClassLegs.length > 0
+      ? 'pass_unproven_vacuous_leg'
+      : pooledPassState;
   return {
     ...pooled,
     state: guardStateOf(pooled),
-    passState: convictionDcaGuardPassStateOf(pooled),
+    passState,
+    vacuousClassLegs,
     byAccount: byAcct,
-    byClass: byCls,
+    byClass: {
+      equity: { ...byCls.equity, passState: passStateByClass.equity },
+      option: { ...byCls.option, passState: passStateByClass.option },
+      unknown: { ...byCls.unknown, passState: passStateByClass.unknown },
+    },
     stateByAccount,
     passStateByClass,
     passStateByAccount,
@@ -712,8 +768,11 @@ export function summarizeConvictionDcaGuard(
       + `netEtDay >= ${NET_POSITIVE_USD}). no_pass_candidate = zero passes and zero such `
       + 'candidates ever arrived ⇒ the halt count is NOT evidence the brake works. '
       + 'failing_closed = one arrived and was halted anyway ⇒ a bug, not a statistic. '
-      + 'Grade per LEG (`passStateByClass`), never pooled: the equity and option legs are '
-      + 'different predicates over different populations behind one field name.',
+      + 'Grade per LEG (each `byClass` row carries its own `passState`), never pooled: the '
+      + 'equity and option legs are different predicates over different populations behind '
+      + 'one field name. TRA-5204 — the aggregate enforces this itself: while any evaluated '
+      + 'leg is no_pass_candidate it reads pass_unproven_vacuous_leg, never pass_observed, '
+      + 'and `vacuousClassLegs` names the legs it cannot vouch for.',
     accountCount: Object.values(byAcct).filter((b) => b.addsPresented > 0).length,
     retainedEventCount: guardEvents.length,
     droppedEventCount: droppedGuardEvents,

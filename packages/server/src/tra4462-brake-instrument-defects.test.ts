@@ -271,11 +271,13 @@ describe('TRA-4462 defect 2 — the DCA guard now says whether a PASS was ever r
 
   it('grades per LEG — a busy option leg cannot carry a dead equity leg', () => {
     // The live shape: the option leg has ~1,031 passes, the equity leg has zero.
-    // Pooled, that reads `pass_observed` and the finding disappears.
+    // Pooled, that used to read `pass_observed` and the finding disappeared —
+    // TRA-5204 made the aggregate itself refuse that reading (see the dedicated
+    // describe below); the per-leg verdicts are unchanged.
     ev({ assetClass: 'option', symbol: 'IONQ', netEtDay: 41.2, halted: false });
     for (const net of [-29.62, -34.12]) ev({ netEtDay: net, halted: true });
     const g = summarizeConvictionDcaGuard();
-    expect(g.passState).toBe('pass_observed');
+    expect(g.passState).toBe('pass_unproven_vacuous_leg');
     expect(g.passStateByClass.option).toBe('pass_observed');
     expect(g.passStateByClass.equity).toBe('no_pass_candidate');
   });
@@ -291,6 +293,94 @@ describe('TRA-4462 defect 2 — the DCA guard now says whether a PASS was ever r
       expect(b.addsPassed + b.addsHalted).toBe(b.addsEvaluated);
       expect(convictionDcaGuardPassStateOf(b)).toBe('pass_observed');
     }
+  });
+});
+
+// TRA-5204 — the 2026-10-05 review fire read the live `byClass` table (equity
+// 384/384 halted, presentedAtPositiveNet 0) and the aggregate
+// `passState: "pass_observed"`, and nothing on that reading path said the equity
+// leg was vacuous: the per-leg verdict existed but only in the sibling
+// `passStateByClass` map, and the aggregate overstated coverage on the strength of
+// the option leg alone. Fix: each `byClass` row carries its own `passState`
+// inline, and the aggregate refuses `pass_observed` while any evaluated leg is
+// `no_pass_candidate`, naming the legs in `vacuousClassLegs`.
+describe('TRA-5204 — a vacuous leg is self-announcing, per row AND in aggregate', () => {
+  beforeEach(() => {
+    clearConvictionDcaLedger();
+  });
+
+  const ev = (o: Partial<ConvictionDcaGuardEvent> & { netEtDay: number | null }): void => {
+    recordConvictionDcaGuardEvaluation({
+      ts: 1_788_960_000_000,
+      mode: 'demo',
+      assetClass: 'equity',
+      symbol: 'ORCL',
+      positionId: 'p1',
+      guardEnabled: true,
+      halted: true,
+      ...o,
+    } as ConvictionDcaGuardEvent);
+  };
+
+  it('each byClass row carries its own passState inline', () => {
+    ev({ assetClass: 'option', symbol: 'IONQ', netEtDay: 41.2, halted: false });
+    for (const net of [-29.62, -34.12]) ev({ netEtDay: net, halted: true });
+    const g = summarizeConvictionDcaGuard();
+    expect(g.byClass.option.passState).toBe('pass_observed');
+    expect(g.byClass.equity.passState).toBe('no_pass_candidate');
+    expect(g.byClass.unknown.passState).toBe('no_candidates');
+  });
+
+  it('CONTROL PAIR — all-halt WITHOUT a positive-net presentation vs all-halt WITH one read differently', () => {
+    // The ticket's ask 3: if one fixture cannot distinguish these two arms, the
+    // field is not doing its job.
+    // Arm 1 — vacuous: every candidate net-negative, all halted.
+    for (const net of [-29.62, -34.12, -36.75]) ev({ netEtDay: net, halted: true });
+    expect(summarizeConvictionDcaGuard().byClass.equity.passState).toBe('no_pass_candidate');
+    // Arm 2 — real failure: STILL 100% halted, but one candidate was owed an admit.
+    ev({ netEtDay: 12.75, halted: true });
+    const g = summarizeConvictionDcaGuard();
+    expect(g.byClass.equity.addsHalted).toBe(g.byClass.equity.addsEvaluated);
+    expect(g.byClass.equity.passState).toBe('failing_closed');
+  });
+
+  it('the aggregate refuses pass_observed while a leg is vacuous, and names the leg', () => {
+    // The exact live shape: option leg carrying real passes, equity leg 100%
+    // halted with no positive-net candidate ever presented.
+    ev({ assetClass: 'option', symbol: 'IONQ', netEtDay: 41.2, halted: false });
+    for (const net of [-29.62, -34.12]) ev({ netEtDay: net, halted: true });
+    const g = summarizeConvictionDcaGuard();
+    expect(g.passState).toBe('pass_unproven_vacuous_leg');
+    expect(g.vacuousClassLegs).toEqual(['equity']);
+  });
+
+  it('MUTATION — one equity pass clears the demotion', () => {
+    ev({ assetClass: 'option', symbol: 'IONQ', netEtDay: 41.2, halted: false });
+    ev({ netEtDay: 12.75, halted: false });
+    const g = summarizeConvictionDcaGuard();
+    expect(g.passState).toBe('pass_observed');
+    expect(g.vacuousClassLegs).toEqual([]);
+  });
+
+  it('the demotion never masks a failure — failing_closed still wins the aggregate', () => {
+    // Option leg vacuous, equity leg halting a candidate it was obliged to admit:
+    // the aggregate must read the BUG, with the coverage gap named beside it.
+    ev({ assetClass: 'option', symbol: 'IONQ', netEtDay: -10, halted: true });
+    ev({ netEtDay: 12.75, halted: true });
+    const g = summarizeConvictionDcaGuard();
+    expect(g.passState).toBe('failing_closed');
+    expect(g.vacuousClassLegs).toEqual(['option']);
+  });
+
+  it('a leg that never ran is absent, not vacuous — no_candidates does not demote', () => {
+    // The live `unknown` leg is zero everywhere; it must not cost the aggregate a
+    // legitimately observed pass.
+    ev({ assetClass: 'option', symbol: 'IONQ', netEtDay: 41.2, halted: false });
+    ev({ netEtDay: 12.75, halted: false });
+    const g = summarizeConvictionDcaGuard();
+    expect(g.byClass.unknown.passState).toBe('no_candidates');
+    expect(g.passState).toBe('pass_observed');
+    expect(g.vacuousClassLegs).toEqual([]);
   });
 });
 
