@@ -899,8 +899,39 @@ export interface LiveEquityAcceptanceReport {
   liveEngineCount: number;
   /** Engines configured against Tradier `production`. */
   productionEngineCount: number;
-  /** Any engine has a live Tradier equity client wired. */
+  /**
+   * TRA-5203 — EVERY engine that should have a live Tradier equity client
+   * (mode `live` + mirroring toggle on) has one, AND at least one such engine
+   * exists. This field was an `.some()` until 2026-10-06, which the operator's
+   * engine pinned `true` permanently — engine-2 gated 2,452/2,452 passes on
+   * `live_equity_client_missing` for a full session while this read healthy
+   * (the same OR-pinning live-arm-census.ts documents for the options client,
+   * TRA-3117). An AND over ALL engines would be just as useless the other way
+   * (demo engines never carry a client), so the population is the engines the
+   * client is EXPECTED on; empty population reads false, never a vacuous green.
+   */
   liveEquityClientConfigured: boolean;
+  /** TRA-5203 — the retired OR, explicitly labeled. NEVER a health verdict. */
+  anyEngineClientConfigured: boolean;
+  /** TRA-5203 — engines where a client is expected (live mode + toggle on). */
+  clientExpectedEngineCount: number;
+  /** TRA-5203 — engines (any mode) whose client is actually wired. */
+  clientConfiguredEngineCount: number;
+  /**
+   * TRA-5203 — the rows the scalars reduce over. No aggregate may stand in for
+   * the rows (live-arm-census rule 1): a dark engine is published HERE, with
+   * its funnel-joinable `engineId` and the cause. Redacted — synthetic engine
+   * ids, modes, env labels, booleans, and a fixed gap vocabulary; never a
+   * username, token, or account id.
+   */
+  byEngine: Array<{
+    engineId: string;
+    mode: 'demo' | 'live';
+    tradierEnv: LiveEquityAcceptance['tradierEnv'];
+    clientConfigured: boolean;
+    tradingEnabled: boolean;
+    clientGap: LiveEquityAcceptance['liveEquityClientGap'];
+  }>;
   /** Any engine opted into live equity mirroring. */
   liveEquityTradingEnabled: boolean;
   /**
@@ -973,6 +1004,10 @@ export function aggregateLiveEquityAcceptance(
   const present = (key: string): boolean => (env[key] ?? '').trim().length > 0;
   const sum = (pick: (s: LiveEquityAcceptance) => number): number =>
     snapshots.reduce((acc, s) => acc + pick(s), 0);
+  // TRA-5203 — the engines a live equity client is EXPECTED on. A live engine
+  // with the toggle deliberately off expects none; counting it would make an
+  // opt-out read as an outage.
+  const clientExpected = snapshots.filter(s => s.mode === 'live' && s.liveEquityTradingEnabled);
   let lastFillMs = 0;
   const liveSkipReasonBreakdown = emptyLiveSkipBreakdown();
   for (const s of snapshots) {
@@ -990,7 +1025,21 @@ export function aggregateLiveEquityAcceptance(
     engineCount: snapshots.length,
     liveEngineCount: snapshots.filter(s => s.mode === 'live').length,
     productionEngineCount: snapshots.filter(s => s.tradierEnv === 'production').length,
-    liveEquityClientConfigured: snapshots.some(s => s.liveEquityClientConfigured),
+    // TRA-5203 — AND over the client-expected population (see the interface
+    // comment for why neither `.some(all)` nor `.every(all)` can discriminate).
+    liveEquityClientConfigured:
+      clientExpected.length > 0 && clientExpected.every(s => s.liveEquityClientConfigured),
+    anyEngineClientConfigured: snapshots.some(s => s.liveEquityClientConfigured),
+    clientExpectedEngineCount: clientExpected.length,
+    clientConfiguredEngineCount: snapshots.filter(s => s.liveEquityClientConfigured).length,
+    byEngine: snapshots.map(s => ({
+      engineId: s.engineId,
+      mode: s.mode,
+      tradierEnv: s.tradierEnv,
+      clientConfigured: s.liveEquityClientConfigured,
+      tradingEnabled: s.liveEquityTradingEnabled,
+      clientGap: s.liveEquityClientGap,
+    })),
     liveEquityTradingEnabled: snapshots.some(s => s.liveEquityTradingEnabled),
     firstLiveEquityFillConfirmed: snapshots.some(s => s.firstLiveEquityFillConfirmed),
     totals: {

@@ -334,9 +334,11 @@ describe('registerLiveHealthRoutes', () => {
 describe('TRA-580 live-equity acceptance probe', () => {
   function snap(over: Partial<LiveEquityAcceptance> = {}): LiveEquityAcceptance {
     return {
+      engineId: 'engine-1',
       mode: 'live',
       tradierEnv: 'production',
       liveEquityClientConfigured: true,
+      liveEquityClientGap: null,
       liveEquityTradingEnabled: true,
       liveSignalCount: 0,
       liveEquityPositionCount: 0,
@@ -391,7 +393,11 @@ describe('TRA-580 live-equity acceptance probe', () => {
     // Redaction guard: only the documented redacted keys are present.
     expect(Object.keys(report).sort()).toEqual(
       [
+        'anyEngineClientConfigured',
         'build',
+        'byEngine',
+        'clientConfiguredEngineCount',
+        'clientExpectedEngineCount',
         'engineCount',
         'firstLiveEquityFillConfirmed',
         'lastLiveEquityFillAt',
@@ -406,6 +412,12 @@ describe('TRA-580 live-equity acceptance probe', () => {
         'time',
         'totals',
       ].sort(),
+    );
+    // TRA-5203 redaction guard — byEngine rows carry ONLY the documented
+    // synthetic/boolean/enum keys, never a username, token, or account id.
+    expect(report.byEngine).toHaveLength(1);
+    expect(Object.keys(report.byEngine[0]).sort()).toEqual(
+      ['clientConfigured', 'clientGap', 'engineId', 'mode', 'tradierEnv', 'tradingEnabled'].sort(),
     );
     // serviceEnv carries booleans only — never a credential value.
     expect(Object.values(report.serviceEnv).every(v => typeof v === 'boolean')).toBe(true);
@@ -504,6 +516,71 @@ describe('TRA-580 live-equity acceptance probe', () => {
     // No credential VALUE ever surfaces in the redacted report.
     expect(JSON.stringify(armed)).not.toContain('tok-redacted');
     expect(JSON.stringify(armed)).not.toContain('acct-redacted');
+  });
+
+  // TRA-5203 — the incident fixture: engine-2 (live, toggle on, creds
+  // unresolved) dark among two configured live engines. The 2026-10-05 session
+  // gated 2,452/2,452 of its passes while the old `.some()` scalar read true.
+  it('TRA-5203 — one dark engine among configured ones reads NOT-ok and is published byEngine', () => {
+    const report = aggregateLiveEquityAcceptance(
+      [
+        snap({ engineId: 'engine-1' }),
+        snap({
+          engineId: 'engine-2',
+          tradierEnv: 'sandbox',
+          liveEquityClientConfigured: false,
+          liveEquityClientGap: 'creds_unresolved',
+        }),
+        snap({ engineId: 'engine-3', mode: 'demo', liveEquityClientConfigured: false, liveEquityClientGap: 'mode_not_live' }),
+        snap({ engineId: 'engine-4' }),
+      ],
+      NOW,
+    );
+    // The headline scalar must go false — the failure state and the pass state
+    // may never render identically (the whole point of this ticket).
+    expect(report.liveEquityClientConfigured).toBe(false);
+    // The retired OR is pinned true by the operator's engine in this exact
+    // fixture — proof the old instrument could not see the incident.
+    expect(report.anyEngineClientConfigured).toBe(true);
+    expect(report.clientExpectedEngineCount).toBe(3);
+    expect(report.clientConfiguredEngineCount).toBe(2);
+    // The dark engine is a ROW, never an omission, and names its cause.
+    const dark = report.byEngine.find(e => !e.clientConfigured && e.mode === 'live');
+    expect(dark).toEqual({
+      engineId: 'engine-2',
+      mode: 'live',
+      tradierEnv: 'sandbox',
+      clientConfigured: false,
+      tradingEnabled: true,
+      clientGap: 'creds_unresolved',
+    });
+  });
+
+  it('TRA-5203 — every expected engine wired reads ok; a deliberate opt-out does not redden it', () => {
+    const report = aggregateLiveEquityAcceptance(
+      [
+        snap({ engineId: 'engine-1' }),
+        // Live engine that opted OUT of equity mirroring: no client expected.
+        snap({
+          engineId: 'engine-2',
+          liveEquityTradingEnabled: false,
+          liveEquityClientConfigured: false,
+          liveEquityClientGap: 'live_equity_toggle_off',
+        }),
+      ],
+      NOW,
+    );
+    expect(report.liveEquityClientConfigured).toBe(true);
+    expect(report.clientExpectedEngineCount).toBe(1);
+  });
+
+  it('TRA-5203 — an empty client-expected population reads false, never a vacuous green', () => {
+    const report = aggregateLiveEquityAcceptance(
+      [snap({ engineId: 'engine-1', mode: 'demo', liveEquityClientConfigured: false, liveEquityClientGap: 'mode_not_live' })],
+      NOW,
+    );
+    expect(report.liveEquityClientConfigured).toBe(false);
+    expect(report.clientExpectedEngineCount).toBe(0);
   });
 
   it('mounts GET /api/health/live-equity (unauthenticated) only when the dep is provided', () => {

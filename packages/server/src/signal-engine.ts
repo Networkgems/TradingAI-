@@ -1425,12 +1425,28 @@ export function emptyLiveSkipBreakdown(): Record<LiveSkipCategory, number> {
 }
 
 export interface LiveEquityAcceptance {
+  /**
+   * TRA-5203 — this engine's funnel key (`feedContextKey`, `engine-N`), the SAME
+   * id `/api/health/equity-entry-funnel` publishes in `byEngine`, so a dark
+   * engine on one surface is directly joinable to its rows on the other.
+   * Synthetic and per-boot — never a username.
+   */
+  engineId: string;
   /** Active engine mode at read time. */
   mode: 'demo' | 'live';
   /** Tradier env this engine is configured against. */
   tradierEnv: TradierEnv;
   /** True when a live Tradier equity client is wired (creds + toggle + live mode). */
   liveEquityClientConfigured: boolean;
+  /**
+   * TRA-5203 — WHY the client is absent, or null when it is wired. The three
+   * causes are opposite verdicts (not-live is structural, `live_equity_toggle_off`
+   * is a deliberate opt-out, `creds_unresolved` is the TRA-857 posture: a
+   * non-operator live book with no saved creds gets NO env fallback — engine-2 /
+   * the 2026-10-05 2452-gated session). Same vocabulary as the funnel's
+   * `gatedByDetail` where they overlap.
+   */
+  liveEquityClientGap: 'mode_not_live' | 'live_equity_toggle_off' | 'creds_unresolved' | null;
   /** True when the user opted into live equity mirroring (`liveTradeEquitiesTradier`). */
   liveEquityTradingEnabled: boolean;
   /** Count of recent signals stamped `mode:live` (acceptance line 1). */
@@ -24693,10 +24709,22 @@ export class SignalEngine {
     }
     let lastOpenedAt = 0;
     for (const p of mirrors) if (p.openedAt > lastOpenedAt) lastOpenedAt = p.openedAt;
+    const clientConfigured = this.tradierLiveEquityClient !== null;
     return {
+      engineId: this.feedContextKey, // TRA-5203 — joins to the funnel's byEngine rows
       mode: this.mode,
       tradierEnv: this.tradierEnv,
-      liveEquityClientConfigured: this.tradierLiveEquityClient !== null,
+      liveEquityClientConfigured: clientConfigured,
+      // TRA-5203 — name the cause, mirroring buildTradierLiveEquityClient's
+      // null paths in order. `creds_unresolved` is the residual: live mode,
+      // toggle on, and still no client — only cred resolution can do that.
+      liveEquityClientGap: clientConfigured
+        ? null
+        : this.mode !== 'live'
+          ? 'mode_not_live'
+          : !this.liveTradeEquitiesTradier
+            ? 'live_equity_toggle_off'
+            : 'creds_unresolved',
       liveEquityTradingEnabled: this.liveTradeEquitiesTradier,
       liveSignalCount: liveSignals.length,
       liveEquityPositionCount: mirrors.length,
