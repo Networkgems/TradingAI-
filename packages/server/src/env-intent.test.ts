@@ -370,6 +370,13 @@ describe('overlay-backed levers (TRA-5014)', () => {
         // so the provenance must point a reader at the budget's own disarm term.
         expect(p, key).toContain('disarm');
         expect(p, key).toContain('liveLearningBudget.disarmed');
+        // TRA-5216 — the term's home route, by name. The rows shipped naming
+        // /api/health/durability, which did not carry the block, and
+        // `?.disarmed != null` against an absent block grades the permissive
+        // "not disarmed" branch — so the predicate must also be stated
+        // fail-closed: an absent/unreadable block is UNREAD, never a pass.
+        expect(p, key).toContain('/api/health/cost-aware-gate');
+        expect(p, key).toContain('UNREAD');
       }
     });
 

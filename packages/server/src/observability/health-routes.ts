@@ -6255,6 +6255,13 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // lever (the paper sleeve's only admission path) would come back blind,
       // and `ok` would correctly refuse to go green.
       envIntent: summarizeEnvIntent(process.env, resolveDemoFlagEnvFromEnv()),
+      // TRA-5216 — mirror of the /api/health/cost-aware-gate block, beside the
+      // envIntent manifest whose two live-directional rows name it as their
+      // expiry term. Before this mirror the rows' provenance pointed graders at
+      // THIS route, where the block was absent — and an absent block under
+      // `?.disarmed != null` grades as the permissive "not disarmed" branch.
+      // Absent/unreadable ⇒ UNREAD, never a pass.
+      liveLearningBudget: summarizeLiveLearningBudget(process.env, etDay),
       note: durabilityNote(report),
     });
   });

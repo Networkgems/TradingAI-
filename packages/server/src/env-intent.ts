@@ -293,7 +293,12 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
       'together) AND the budget has not self-disarmed. The budget disarms itself at the loss cap, ' +
       'the open cap, or the session box (live-learning-budget.ts), writing a durable disarm event ' +
       'WITHOUT touching any env var — so this row alone cannot see expiry: once ' +
-      '/api/health/durability reports liveLearningBudget.disarmed != null, an `on` reading here ' +
+      '/api/health/cost-aware-gate reports liveLearningBudget.disarmed != null (that route ' +
+      'carries the block; this manifest is served on /api/health/durability, which mirrors the ' +
+      'block since TRA-5216 — it did NOT before, and a `?.disarmed != null` read against a ' +
+      'payload missing the block is the permissive branch: an absent or unreadable ' +
+      'liveLearningBudget block is UNREAD, assert it is present before reading .disarmed), ' +
+      'an `on` reading here ' +
       'is ONCE AGAIN an unauthorised re-arm of the TRA-4750-stood-down directional sleeve ' +
       '(STOOD_DOWN_SLEEVES still names it) — stand it down and return BOTH rows to intended ' +
       "'off' in the same change, per the two-acts rule above. Kill switch: " +
@@ -315,7 +320,11 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
       'kill switch was thrown (or the key wiped) without the paired manifest edit — the ' +
       'directional lever is then armed WITHOUT its budget: escalate; never edit this row alone ' +
       'to clear it. The runtime self-disarm (loss/open/session caps) is NOT visible in env: ' +
-      'grade liveLearningBudget.disarmed on the same /api/health/durability payload. When the ' +
+      'grade liveLearningBudget.disarmed on /api/health/cost-aware-gate (mirrored beside this ' +
+      'manifest on /api/health/durability since TRA-5216). FAIL CLOSED: treat an absent or ' +
+      'unreadable liveLearningBudget block as UNREAD and escalate — never as "not disarmed". ' +
+      'Assert the block is present before reading .disarmed; `?.disarmed != null` on a payload ' +
+      'without the block silently grades the permissive branch (TRA-5216). When the ' +
       "budget ends either way, BOTH rows return to intended 'off' in the same change.",
     // Resolve the way the consumer does — a faithful inline of
     // `isLiveLearningBudgetFlagOn` (live-learning-budget.ts:83; the same truthy
