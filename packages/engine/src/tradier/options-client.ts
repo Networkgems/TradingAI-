@@ -109,6 +109,55 @@ interface TradierRawGreeks {
   mid_iv?: number;
   ask_iv?: number;
   smv_vol?: number;
+  /**
+   * When ORATS last recomputed this row's greeks/IV, e.g. `"2026-10-06 14:59:08"`.
+   * Tradier documents greeks as refreshed hourly; the string carries no zone.
+   */
+  updated_at?: string;
+}
+
+/**
+ * Zone the vendor's naive `greeks.updated_at` string is read in. Tradier
+ * publishes no zone for it; the default is US/Eastern (exchange time). Override
+ * with `TRADIER_GREEKS_UPDATED_AT_TZ=UTC` if the observed ages on
+ * `/api/health/greeks-freshness` read ~4–5h too young or negative.
+ */
+export function resolveGreeksUpdatedAtZone(env: Record<string, string | undefined> = process.env): string {
+  const raw = (env['TRADIER_GREEKS_UPDATED_AT_TZ'] ?? '').trim();
+  return raw || 'America/New_York';
+}
+
+/** Offset (ms) of `timeZone` from UTC at instant `utcMs` — positive east of UTC. */
+function zoneOffsetMs(utcMs: number, timeZone: string): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).formatToParts(new Date(utcMs));
+  const get = (t: string) => Number(parts.find((p) => p.type === t)?.value);
+  const asUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'));
+  return asUtc - Math.floor(utcMs / 1000) * 1000;
+}
+
+/**
+ * Parse Tradier's naive `"YYYY-MM-DD HH:MM:SS"` greeks stamp in `timeZone`.
+ * Returns `undefined` for anything unparseable — an unreadable stamp must read
+ * as UNKNOWN freshness, never as "fresh".
+ */
+export function parseGreeksUpdatedAt(raw: unknown, timeZone = 'America/New_York'): number | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/.exec(raw.trim());
+  if (!m) return undefined;
+  const naiveUtc = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  if (!Number.isFinite(naiveUtc)) return undefined;
+  if (timeZone === 'UTC') return naiveUtc;
+  try {
+    // Two-pass so a stamp near a DST switch resolves to the right offset.
+    let guess = naiveUtc - zoneOffsetMs(naiveUtc, timeZone);
+    guess = naiveUtc - zoneOffsetMs(guess, timeZone);
+    return guess;
+  } catch {
+    return undefined;
+  }
 }
 
 interface TradierRawQuote {
@@ -828,6 +877,7 @@ export class TradierOptionsClient extends TradierOrderClient {
     if (!data || typeof data.options !== 'object' || data.options == null) {
       return { ok: true, httpStatus: r.httpStatus, value: [] };
     }
+    const greeksZone = resolveGreeksUpdatedAtZone();
     const value: OptionChainRow[] = asArray(data.options.option).map((o) => ({
       optionSymbol: o.symbol,
       underlying: o.underlying,
@@ -848,6 +898,9 @@ export class TradierOptionsClient extends TradierOrderClient {
           : undefined,
       midIv: o.greeks?.mid_iv && o.greeks.mid_iv > 0 ? o.greeks.mid_iv : undefined,
       smvVol: o.greeks?.smv_vol && o.greeks.smv_vol > 0 ? o.greeks.smv_vol : undefined,
+      // Vendor greeks clock. Hourly in production, absent in sandbox. Read by the
+      // OTM theo so an hour-old smv_vol is never priced against a live quote.
+      greeksUpdatedMs: parseGreeksUpdatedAt(o.greeks?.updated_at, greeksZone),
     }));
     return { ok: true, httpStatus: r.httpStatus, value };
   }

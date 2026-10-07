@@ -240,7 +240,7 @@ import {
 import { recordWheelBookSnapshot } from './wheel-promotion-gate-store.js';
 import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
 import { buildProfitFloorLadder, resolveOtmProfitSchedule } from './otm-profit-schedule.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isProfitFloorTrailEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, resolveOtmMispricingModelOpts, entryDeltaCeilingVerdict, resolveSwingTimeStopTradingDays, resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule, resolveChandelierAtrTimeframe, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isProfitFloorTrailEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, resolveOtmMispricingModelOpts, resolveOtmTheoFreshnessOpts, entryDeltaCeilingVerdict, resolveSwingTimeStopTradingDays, resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule, resolveChandelierAtrTimeframe, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
 // TRA-4436 — the RV exit re-tune param set, extracted so the shipped demo/live
 // construction is testable and its demo-effective ma20 gate publishable.
 import { buildRvExitParams } from './rv-exit-params.js';
@@ -15591,7 +15591,12 @@ export class SignalEngine {
     // demo-flags (same containment as the delta floor above): parity-implied
     // carry (removes the q=0 cheap-call / expensive-put bias) and the
     // executable (ask/bid vs theo) classification basis. Both default OFF.
-    const mispricingOpts = this.mode === 'demo' ? resolveOtmMispricingModelOpts(demoEnv) : {};
+    // Greeks freshness applies to BOTH books (see `resolveOtmTheoFreshnessOpts`):
+    // it changes which σ prices theo, never which gate admits a row.
+    const mispricingOpts = {
+      ...resolveOtmTheoFreshnessOpts(this.mode === 'demo' ? demoEnv : process.env),
+      ...(this.mode === 'demo' ? resolveOtmMispricingModelOpts(demoEnv) : {}),
+    };
     const otmScanOpts =
       this.mode === 'demo' && isOtmDeltaFloorEnabled(demoEnv)
         ? { ...mispricingOpts, minAbsDelta: resolveOtmDeltaFloor(demoEnv) }
