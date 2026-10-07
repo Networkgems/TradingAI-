@@ -262,6 +262,7 @@ import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { hydrateChurnBrakeGuardFromDisk, churnBrakeGuardSharedTapeSpec } from './churn-brake-ledger.js';
 import { hydrateEquityEntryFunnelFromDisk } from './equity-entry-funnel-ledger.js';
+import { hydrateExpiredExitLedgerFromDisk, readExpiredExitLedger, summarizeExpiredExitCounts } from './expired-exit-ledger.js';
 import { hydrateRvScanCensusFromDisk } from './rv-scan-census-ledger.js'; // TRA-4350
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 // TRA-4343 — the durable entry-site census + the since-boot vacuity disclosure.
@@ -4794,6 +4795,14 @@ async function runLiveRealizedCalendarBackfill(): Promise<void> {
 // bit. Rebuilding the current-ET-day counts from disk lets the cap survive a
 // mid-session reboot. Best-effort; the ledger is compacted to a short retention
 // window on read so it stays tiny.
+// TRA-5269 — hydrate the DURABLE expired-exit record and append this boot's marker.
+// `expiredExits` below is since-boot and `liveExitErrors` dies with the row; this is the
+// append-only history. The boot marker is the in-band writability/durability probe.
+{
+  const h = hydrateExpiredExitLedgerFromDisk(DATA_DIR);
+  log.info('expired-exit ledger hydrated (TRA-5269)', { events: h.events, priorBootMarkers: h.bootMarkers });
+}
+
 // TRA-4335 — hydrate the DURABLE churn-brake open-cap guard ledger and remember
 // DATA_DIR for subsequent appends. The since-boot reject counters on
 // `/api/health/churn-brake` zero on every reboot, so the daily journal review's
@@ -7393,6 +7402,13 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
 // TRA-406 — observability surface. Returns the recent in-memory alerts and the
 // 15-minute captured-error count so QA / ops can see incident state without
 // shelling into the box. Gated by auth — alert detail can carry path/host info.
+// TRA-5269 — authenticated operator read of the durable expired-exit record (carries OCC
+// symbols, hence the gate; the no-auth route publishes counts only).
+app.get('/api/health/expired-exits', requireAuth, (req, res) => {
+  const limit = Number(req.query.limit);
+  res.json({ ...readExpiredExitLedger(Number.isFinite(limit) && limit > 0 ? limit : undefined), time: new Date().toISOString() });
+});
+
 app.get('/api/health/alerts', requireAuth, (_req, res) => {
   res.json({
     alerts: getRecentAlerts(),
@@ -13658,6 +13674,9 @@ app.get('/api/health/options-live', async (_req, res) => {
         },
         { expired: 0, expiredLive: 0, escalated: 0, lastExpiredAt: null as number | null },
       ),
+      // TRA-5269 — the DURABLE twin of the since-boot block above (counts only, TRA-2163).
+      // Read `.state` first: `total: 0` means "nothing expired" only when it is `durable`.
+      expiredExitsDurable: summarizeExpiredExitCounts(),
       // TRA-2984 — live open rows whose LAST exit attempt failed and was never
       // resolved. `exitErrorReason` is a free-text string on the authenticated
       // `/api/state`; nothing polled it, so the only reader it ever had was a

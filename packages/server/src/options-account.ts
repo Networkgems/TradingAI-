@@ -1,3 +1,4 @@
+import { recordExpiredExit } from './expired-exit-ledger.js';
 import { randomUUID } from 'crypto';
 import type { TradierOpenOptionPosition, ExitState, ExitParams, ExposurePositionRisk, MultiLegExitParams } from '@trading-app/engine';
 import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, maxLossCapUsd, evaluateExit, DEFAULT_EXIT_PARAMS, chandelierStop, chandelierExitTriggered, profitLockDecision, takeProfitEarlyDecision, evaluateMultiLegExit, buildOccSymbol, blackScholesPrice, daysToExpiration } from '@trading-app/engine';
@@ -13852,6 +13853,9 @@ export class PaperOptionsAccount {
     if (!opt || !opt.pendingExit) return false;
     const expiredKind = opt.pendingExit.kind;
     const expiredQty = opt.pendingExit.qty;
+    // TRA-5269 — captured BEFORE the delete: the durable expired-exit record needs the
+    // lapsed order's id / limit / pricing, and the intent is gone on the next line.
+    const expiredIntent = opt.pendingExit;
     delete opt.pendingExit;
     if (reason) opt.exitErrorReason = reason;
     // TRA-4224 — resolved AFTER the `pendingExit` delete on purpose: the notice
@@ -13884,6 +13888,22 @@ export class PaperOptionsAccount {
       this.expiredExits += 1;
       if ((opt.mode ?? 'demo') === 'live') this.expiredExitsLive += 1;
       this.lastExpiredExitAt = Date.now();
+      // TRA-5269 — one durable row per event. The counters above are since-boot and
+      // `liveExitErrors` dies with the row; this survives both a restart and the close.
+      recordExpiredExit({
+        ts: this.lastExpiredExitAt,
+        mode: (opt.mode ?? 'demo') === 'live' ? 'live' : 'demo',
+        tradierEnv: this.tradierEnv,
+        optionId,
+        optionSymbol: opt.optionSymbol ?? '',
+        kind: expiredKind,
+        qty: expiredQty,
+        limitPrice: Number.isFinite(expiredIntent.limitPrice) ? expiredIntent.limitPrice : null,
+        pricing: expiredIntent.pricing ?? null,
+        orderId: String(expiredIntent.tradierOrderId ?? ''),
+        consecutiveExpiries: opt.exitExpiredCount,
+        nextAttempt: opt.exitExpiredCount >= MAX_CONSECUTIVE_EXIT_EXPIRIES ? 'staging_stopped' : 'market_escalation',
+      });
       if (opt.exitExpiredCount >= MAX_CONSECUTIVE_EXIT_EXPIRIES) {
         // Same shape as the rejection breaker below: once the engine stops
         // trying, the row must SAY that it stopped, because "expired" alone
