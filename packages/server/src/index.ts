@@ -460,13 +460,12 @@ import {
 } from './reports/options-alert-engine.js';
 import { buildOptionsAlertsBody, dashboardBookViewFor } from './options-alerts-book.js';
 import {
-  aggregateCashFlowByDate,
   aggregateRealizedOptionsPnl,
   computeBalanceDailyPnl,
   equitySymbolsInvalidatedByCorporateActions,
   findPreviousBalanceSnapshot,
   liveBackfillWriteWindow,
-  mergeCashEventsIntoRecord,
+  mergeLiveCashEvents,
   planTradierReconcile,
   realizedPnlByCloseDate,
   resolveCashFlowNetByDate,
@@ -3887,23 +3886,17 @@ async function reconcileTradierLiveCalendar(
       const startMs = today.getTime() - TRADIER_CASH_FLOW_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
       const start = new Date(startMs).toISOString().slice(0, 10);
       const cashEvents = await client.listAccountCashEvents({ start, end, limit: 1000 });
-      // TRA-2906 — the merge follows the shape the file is ALREADY in, and never
-      // converts between them. Appending typed events to a v1 file would strand
-      // every pre-existing deposit outside the derived total (the record would
-      // then claim capital that moved never moved), so the v1→v2 migration is
-      // owned exclusively by the one-time rebuild, which fetches a COMPLETE
-      // history rather than this rolling 14-day window.
-      if (cashFlowState.schema === 'v2-typed') {
-        cashFlowState.events = mergeCashEventsIntoRecord(cashFlowState.events, cashEvents);
+      // TRA-5148 — typed merge only. A v1-aggregate record is REFUSED (no
+      // write): the old untyped fold minted fees indistinguishable from
+      // deposits. Migration to v2 is owned by the TRA-2906 rebuild one-shot.
+      if (mergeLiveCashEvents(cashFlowState, cashEvents).merged) {
+        await saveTradierCashFlow(ctx, env, cashFlowState);
       } else {
-        const knownIds = new Set(cashFlowState.seenIds);
-        const totals = aggregateCashFlowByDate(cashEvents, knownIds);
-        for (const [date, net] of totals.netByDate) {
-          cashFlowState.netByDate[date] = (cashFlowState.netByDate[date] ?? 0) + net;
-        }
-        for (const id of totals.seenTransactionIds) cashFlowState.seenIds.push(id);
+        log.error('TRA-5148 cash-flow record is v1-aggregate — live merge REFUSED, run the TRA-2906 rebuild', {
+          username: ctx.username,
+          env,
+        });
       }
-      await saveTradierCashFlow(ctx, env, cashFlowState);
     } catch (err) {
       log.warn('tradier-live-calendar cash event fetch failed', {
         username: ctx.username,

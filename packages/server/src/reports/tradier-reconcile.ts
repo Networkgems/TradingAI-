@@ -677,6 +677,24 @@ export function mergeCashEventsIntoRecord(
 }
 
 /**
+ * TRA-5148 — fold freshly fetched typed events into a cash-flow record, or
+ * REFUSE. A `v1-aggregate` record is never written to: the old fold collapsed
+ * each typed event into an untyped per-date net, so a fee became permanently
+ * indistinguishable from a deposit. Every live book was migrated to v2
+ * (TRA-5144 admin, TRA-5262 v0nni); a v1 file now is an anomaly to alert on,
+ * not a shape to keep growing. Returns `merged: false` (record untouched) so the
+ * caller can skip the save and log, keeping the calendar readable.
+ */
+export function mergeLiveCashEvents(
+  record: TradierCashFlowRecord,
+  incoming: readonly TradierCashEvent[],
+): { merged: boolean } {
+  if (record.schema !== 'v2-typed') return { merged: false };
+  record.events = mergeCashEventsIntoRecord(record.events, incoming);
+  return { merged: true };
+}
+
+/**
  * TRA-1192 — compute the rolling write/fetch window for the historical
  * Live-calendar realized-P&L backfill. The write window spans the first of the
  * month `monthsBack` months before `today` up to (but excluding) `today` —

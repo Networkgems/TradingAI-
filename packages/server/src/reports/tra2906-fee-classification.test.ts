@@ -188,3 +188,20 @@ describe('TRA-2906 record shapes — the half-migrated file is unrepresentable',
     expect(deriveNetByDateFromEvents(merged)['2026-07-07']).toBeUndefined();
   });
 });
+
+describe('TRA-5148 mergeLiveCashEvents — the v1 fold is unreachable', () => {
+  it('refuses a v1 record: a typed fee never lands as an untyped netByDate increment', async () => {
+    const { mergeLiveCashEvents } = await import('./tradier-reconcile.js');
+    const record = { schema: 'v1-aggregate' as const, netByDate: { '2026-08-05': 100 }, seenIds: ['a'] };
+    const res = mergeLiveCashEvents(record, [ev('fee', -10, '2026-10-01')]);
+    expect(res.merged).toBe(false);
+    expect(record).toEqual({ schema: 'v1-aggregate', netByDate: { '2026-08-05': 100 }, seenIds: ['a'] });
+  });
+
+  it('merges typed events into a v2 record, preserving the type', async () => {
+    const { mergeLiveCashEvents } = await import('./tradier-reconcile.js');
+    const record = { schema: 'v2-typed' as const, events: [] as TradierCashEvent[] };
+    expect(mergeLiveCashEvents(record, [ev('fee', -10, '2026-10-01')]).merged).toBe(true);
+    expect(record.events.map((e) => e.type)).toEqual(['fee']);
+  });
+});
