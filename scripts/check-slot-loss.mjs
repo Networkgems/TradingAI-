@@ -651,6 +651,8 @@ function gradeTrigger({ routine, trigger, runs, now, windowStartMs, graceMs, max
     suppressedCount: suppressed,
     lost: lostSlots.length,
     lostSlotMs: lostSlots.slice(),
+    /** Every slot DUE in the window (TRA-5289) — the darkness arm's "was anything due" evidence. */
+    dueSlotMs: slots.slice(),
     clampedBy,
     firstLostCensored,
     firstLostAt: lostSlots.length ? new Date(lostSlots[0]).toISOString() : null,
@@ -865,21 +867,32 @@ export function splitGapByHostEvents(win, events) {
 }
 
 /** Grade the darkness arm: windows + splits -> verdict + rows. */
-export function gradeDarkness(tape, events, { fromMs, toMs, darkGapMs }) {
+export function gradeDarkness(tape, events, { fromMs, toMs, darkGapMs, dueMs = null }) {
   const derived = deriveDarkWindows(tape, { fromMs, toMs, darkGapMs });
   if (derived.state === 'BLIND') {
     return { verdict: 'BLIND', reason: derived.reason, windows: [], unobservedMs: null };
   }
-  const windows = derived.windows.map((w) => ({
+  // TRA-5289 — a gap in heartbeat_runs is a gap in RUNS. With nothing due inside
+  // it, no run is the correct state: QUIET, not DARK. `dueMs == null` means the
+  // due-item evidence was not measured, so the legacy tape-only reading stands
+  // and is labelled NOT MEASURED rather than passed off as confirmed darkness.
+  const due = Array.isArray(dueMs) ? dueMs : null;
+  const dueIn = (w) => (due ? due.filter((t) => t > w.startMs && t <= w.endMs).length : null);
+  const all = derived.windows.map((w) => ({
     ...w,
+    dueInside: dueIn(w),
+    dueGate: due ? 'MEASURED' : 'NOT_MEASURED',
     ...splitGapByHostEvents(w, events),
     start: new Date(w.startMs).toISOString(),
     end: new Date(w.endMs).toISOString(),
     gapHours: +(w.gapMs / HOUR).toFixed(2),
   }));
+  const windows = all.filter((w) => w.dueInside !== 0);
+  const quietWindows = all.filter((w) => w.dueInside === 0);
   return {
     verdict: windows.length ? 'DARK_WINDOW' : 'CLEAN',
     windows,
+    quietWindows,
     darkGapMin: darkGapMs / MIN,
     tapeStart: new Date(derived.tapeStartMs).toISOString(),
     tapeEnd: new Date(derived.tapeEndMs).toISOString(),
@@ -937,13 +950,19 @@ function renderDarkReport(dark, { fromMs, days }, findings = []) {
   if (!dark.hostEventsRead) {
     out.push('    ⚠ host event log unreadable — every split below is NOT MEASURED, the gaps stand');
   }
+  for (const w of dark.quietWindows || []) {
+    out.push(`    QUIET ${w.gapHours}h  ${w.start} -> ${w.end}  (0 routine slots due inside - no run dispatched is expected, not darkness)`);
+  }
   for (const w of dark.windows) {
     const split =
       w.hostDownMs == null
         ? 'split NOT MEASURED'
         : `host DOWN ${h(w.hostDownMs)} (${w.boots} boot(s)) · host UP server dark ${h(w.hostUpDarkMs)}` +
           (w.confidence === 'partial' ? ' · ⚠ crash boot inside — down-start unknown, split partial' : '');
-    out.push(`    DARK ${w.gapHours}h  ${w.start} -> ${w.end}${w.ongoing ? '  ⚠ ONGOING' : ''}`);
+    out.push(
+      `    DARK ${w.gapHours}h  ${w.start} -> ${w.end}${w.ongoing ? '  ⚠ ONGOING' : ''}  ` +
+        (w.dueInside == null ? 'due-gate NOT MEASURED' : `${w.dueInside} slot(s) due inside`),
+    );
     out.push(`        ${split}`);
   }
   if (dark.windows.length) {
@@ -1543,6 +1562,20 @@ const DARK_CONTROLS = [
     },
   },
   {
+    name: 'TRA-5289 — a hole with NOTHING due inside is QUIET; the same hole with a slot due is DARK; no due evidence reads NOT MEASURED',
+    run: () => {
+      const hole = [['2026-09-24T01:00:00Z', '2026-09-24T18:06:00Z']];
+      const opts = { fromMs: D_FROM, toMs: D_NOW, darkGapMs: DARK_GAP };
+      const quiet = gradeDarkness(tapeWithHoles(hole), [], { ...opts, dueMs: [] });
+      if (quiet.verdict !== 'CLEAN' || quiet.quietWindows.length !== 1) return `empty due set must be QUIET/CLEAN (got ${quiet.verdict})`;
+      const dark = gradeDarkness(tapeWithHoles(hole), [], { ...opts, dueMs: [Date.parse('2026-09-24T09:00:00Z')] });
+      if (dark.verdict !== 'DARK_WINDOW' || dark.windows[0].dueInside !== 1) return 'a due slot inside must keep DARK_WINDOW';
+      const unm = gradeDarkness(tapeWithHoles(hole), [], opts);
+      if (unm.verdict !== 'DARK_WINDOW' || unm.windows[0].dueGate !== 'NOT_MEASURED') return 'unmeasured due set must stay DARK, labelled NOT_MEASURED';
+      return true;
+    },
+  },
+  {
     name: 'bar placement — 17.1h (the smallest REAL occurrence, TRA-4141) IS a window',
     run: () => {
       const d = gradeDarkness(
@@ -1893,7 +1926,8 @@ async function main() {
         '  --json          machine-readable',
         '  --selftest      run the controls',
         '',
-        '  0 CLEAN · 1 SLOT_LOSS · 2 usage · 3 BLIND · 4 LATE_DISPATCH · 5 DARK_WINDOW;',
+        '  0 CLEAN · 1 SLOT_LOSS · 2 usage · 3 BLIND · 4 LATE_DISPATCH · 5 DARK_WINDOW',
+        '    (5 = liveness-tape hole with a routine slot DUE inside it; a gap with nothing due reads QUIET);',
         '  BLIND > DARK_WINDOW > SLOT_LOSS > LATE_DISPATCH > CLEAN',
       ].join('\n'),
     );
@@ -1932,7 +1966,10 @@ async function main() {
     // The split's event query starts 8d before the window so a down interval
     // that opened before the lookback still brackets.
     const events = argv.includes('--no-host-split') ? null : await readHostEvents(fromMs - 8 * DAY);
-    dark = gradeDarkness(tape, events, { fromMs, toMs: now, darkGapMs });
+    const dueMs = (result.rows || []).some((r) => r.state === 'BLIND')
+      ? null // a BLIND trigger may have had slots due: the due set is incomplete, so unmeasured
+      : (result.rows || []).flatMap((r) => r.dueSlotMs || []);
+    dark = gradeDarkness(tape, events, { fromMs, toMs: now, darkGapMs, dueMs });
     dark.apiTickCount = apiTicks.length;
     dark.apiTapeTruncated = apiTicks.length >= HEARTBEAT_LIMIT;
     dark.ndjsonArm = ndjson.readable ? `${ndjson.ticks.length} tick(s) from ${logDir}` : `UNREADABLE: ${logDir}`;
