@@ -23,6 +23,7 @@
 // It never darks a book (TRA-3879 AC4).
 
 import type { LiveOtmFleetCapitalRow } from './option-exec-flag.js';
+import { HARD_MAX_OPEN_POSITIONS, resolveFleetOpenPositionCount } from './hard-controls.js';
 
 export type { LiveOtmFleetCapitalRow };
 
@@ -61,4 +62,91 @@ export function readLiveOtmFleetCapitalRows(): readonly LiveOtmFleetCapitalRow[]
   } catch {
     return null;
   }
+}
+
+/** One book's raw count terms, as served on the health surface (TRA-5284). */
+export interface FleetOpenPositionsBookRow {
+  book: string | null;
+  liveEntryGateOpen: boolean;
+  openLiveOptionRows: number;
+  openEquityPositions: number;
+}
+
+/**
+ * TRA-5284 — the FLEET open-position count the hard-controls 3-position cap
+ * grades on (TRA-5283), published so "armed" is distinguishable from
+ * "in force" without reading code. Three states, three distinct shapes:
+ *
+ *   • readable:  `resolvedCount` is the number the cap compares against
+ *     `capMaxOpenPositions`;
+ *   • unreadable (`fleet_rows_unreadable`): the read is WIRED but the resolve
+ *     yields NaN — the state the seam refuses as `open_positions_unreadable`.
+ *     Served as `resolvedCount: null` + the reason, never as NaN (JSON folds
+ *     NaN to null silently; the reason key is what keeps it attributable);
+ *   • unwired (`fleet_read_unwired`): the ONE non-refusing degrade — every
+ *     order site falls back to its own per-book count. `fleetReadWired: false`
+ *     is the byte that keeps that degrade from being invisible in a context
+ *     that has a fleet (production wires the provider at boot in `index.ts`).
+ */
+export interface FleetOpenPositionsHealth {
+  /** The resolved fleet-wide count, or `null` when it cannot be proven. */
+  resolvedCount: number | null;
+  /** Non-null exactly when `resolvedCount` is null. */
+  unreadableReason: 'fleet_read_unwired' | 'fleet_rows_unreadable' | null;
+  /** The cap `resolvedCount` is graded against (refuse at `>=`). */
+  capMaxOpenPositions: number;
+  capLabel: 'HARD_MAX_OPEN_POSITIONS';
+  fleetReadWired: boolean;
+  /**
+   * Raw per-book count terms, gate-CLOSED rows included (their counts are
+   * deliberately excluded from `resolvedCount` — TRA-5283's TRA-3445 note —
+   * and a reader must be able to see what was excluded). `null` when the read
+   * is unwired or returned null, never `[]` (a claim of "no books").
+   */
+  books: FleetOpenPositionsBookRow[] | null;
+}
+
+/**
+ * TRA-5284 — fold the SAME provider read the order seam resolves on
+ * (`readLiveOtmFleetCapitalRows` + `resolveFleetOpenPositionCount`, the exact
+ * pair signal-engine's live buy_to_open seam calls) into the health block
+ * above. Lives here, not in the route, so the route cannot re-derive the
+ * count and drift from the seam — the TRA-5283 defect shape one layer up.
+ *
+ * The seam substitutes the CALLER's own live figure for its own row (the row
+ * being graded is already in the book pre-mirror); this surface has no caller,
+ * so the self term is zero with a `null` book no row can match — every
+ * gate-open row in the read is counted exactly once. At any instant with no
+ * order in flight the two folds agree, which is what the discriminator test
+ * asserts. Raw counts only: nothing here feeds a budget, and the row's
+ * no-`capUsd` recursion guard is untouched.
+ */
+export function summarizeFleetOpenPositions(): FleetOpenPositionsHealth {
+  const fleetReadWired = isLiveOtmFleetCapitalProviderWired();
+  const base = {
+    capMaxOpenPositions: HARD_MAX_OPEN_POSITIONS,
+    capLabel: 'HARD_MAX_OPEN_POSITIONS' as const,
+    fleetReadWired,
+  };
+  if (!fleetReadWired) {
+    return { ...base, resolvedCount: null, unreadableReason: 'fleet_read_unwired', books: null };
+  }
+  const rows = readLiveOtmFleetCapitalRows();
+  const resolved = resolveFleetOpenPositionCount(
+    rows,
+    { book: null, openPositionCount: 0 },
+    fleetReadWired,
+  );
+  const books =
+    rows === null
+      ? null
+      : rows.map((r) => ({
+          book: r.book,
+          liveEntryGateOpen: r.liveEntryGateOpen,
+          openLiveOptionRows: r.openLiveOptionRows,
+          openEquityPositions: r.openEquityPositions,
+        }));
+  return Number.isFinite(resolved)
+    ? { ...base, resolvedCount: resolved, unreadableReason: null, books }
+    : { ...base, resolvedCount: null, unreadableReason: 'fleet_rows_unreadable', books };
 }

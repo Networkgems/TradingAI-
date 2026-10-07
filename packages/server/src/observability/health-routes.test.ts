@@ -75,6 +75,17 @@ import {
   OPTION_SHORT_PREMIUM_SCANNER_FLAG,
   WHEEL_IV_FILTER_FLAG,
 } from '../option-exec-flag.js';
+// TRA-5284 — the fleet open-position publication is graded against the SAME
+// provider + resolver pair the order seam calls, imported as symbols so the
+// discriminator test below evaluates the seam expression verbatim.
+import {
+  setLiveOtmFleetCapitalProvider,
+  readLiveOtmFleetCapitalRows,
+  isLiveOtmFleetCapitalProviderWired,
+  type FleetOpenPositionsHealth,
+  type LiveOtmFleetCapitalRow,
+} from '../live-otm-fleet-capital.js';
+import { resolveFleetOpenPositionCount, HARD_MAX_OPEN_POSITIONS } from '../hard-controls.js';
 // TRA-3216 — the live OTM underlying allowlist + the enforcement-gate ledger it publishes through.
 import { OPTION_LIVE_OTM_UNIVERSE_VAR } from '../otm-live-universe-flag.js';
 import { clearLiveEnforceGateLedger, recordLiveEnforceDecision } from '../live-enforce-gate-ledger.js';
@@ -8285,6 +8296,125 @@ describe('GET /api/health/live-enforce-gates — arm.costBar.barsByStructure (TR
     expect(barsByStructure[0]!.structure).toBe('single_leg_otm');
     expect(barsByStructure[0]!.barR).toBe((bar as { barR: number }).barR);
     expect(barsByStructure[0]!.barIdenticalToOtm).toBe(true);
+  });
+});
+
+// TRA-5284 — the fleet open-position count the hard-controls 3-position cap
+// grades on (TRA-5283), finally on a surface. The route must serve the SAME
+// fold the order seam resolves on — a route that re-derives the count can
+// agree with the label and disagree with the seam, which is the TRA-5283
+// defect shape one layer up.
+describe('GET /api/health/live-options-fee-slippage — fleetOpenPositions (TRA-5284)', () => {
+  afterEach(() => setLiveOtmFleetCapitalProvider(null));
+
+  function serveFleetOpenPositions() {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    routes.get('/api/health/live-options-fee-slippage')![0]!({}, res);
+    return (res.body as { fleetOpenPositions: FleetOpenPositionsHealth }).fleetOpenPositions;
+  }
+
+  const row = (over: Partial<LiveOtmFleetCapitalRow> & { book: string | null }): LiveOtmFleetCapitalRow => ({
+    liveEntryGateOpen: true,
+    availableCashUsd: 100,
+    openPremiumAtRiskUsd: 0,
+    openLiveOptionRows: 0,
+    openEquityPositions: 0,
+    ...over,
+  });
+
+  it('UNWIRED — the one non-refusing degrade is named, never silent', () => {
+    const body = serveFleetOpenPositions();
+    expect(body).toEqual({
+      resolvedCount: null,
+      unreadableReason: 'fleet_read_unwired',
+      capMaxOpenPositions: HARD_MAX_OPEN_POSITIONS,
+      capLabel: 'HARD_MAX_OPEN_POSITIONS',
+      fleetReadWired: false,
+      books: null,
+    });
+  });
+
+  // AC4 — the discriminator, same shape as the seam test
+  // (signal-engine.test.ts, TRA-5283): the book under test is held FIXED and
+  // only the SIBLING book's counts move; the surface must move with it AND
+  // equal the seam's own resolve at the same instant. The seam expression is
+  // evaluated here verbatim (same provider read, self substituted for its own
+  // row) so a route that re-derives the count diverges and fails this test.
+  it("AC4 — a SIBLING book's rows move the published count, and surface == seam at the same instant", () => {
+    const seamResolve = () =>
+      resolveFleetOpenPositionCount(
+        readLiveOtmFleetCapitalRows(),
+        // admin placing an order: its own live figure is its 1 open row.
+        { book: 'admin', openPositionCount: 1 },
+        isLiveOtmFleetCapitalProviderWired(),
+      );
+
+    setLiveOtmFleetCapitalProvider(() => [
+      row({ book: 'admin', openLiveOptionRows: 1 }),
+      row({ book: 'v0nni', openLiveOptionRows: 0, openEquityPositions: 0 }),
+    ]);
+    const before = serveFleetOpenPositions();
+    expect(before.resolvedCount).toBe(1);
+    expect(before.resolvedCount).toBe(seamResolve());
+    expect(before.unreadableReason).toBeNull();
+    expect(before.fleetReadWired).toBe(true);
+
+    // Only the sibling moves: v0nni now holds 2 option rows + 1 equity mirror.
+    setLiveOtmFleetCapitalProvider(() => [
+      row({ book: 'admin', openLiveOptionRows: 1 }),
+      row({ book: 'v0nni', openLiveOptionRows: 2, openEquityPositions: 1 }),
+    ]);
+    const after = serveFleetOpenPositions();
+    expect(after.resolvedCount).toBe(4); // 1 (admin) + 3 (sibling) — at/over the cap of 3
+    expect(after.resolvedCount).toBe(seamResolve());
+    expect(after.resolvedCount! - before.resolvedCount!).toBe(3); // exactly the sibling's move
+    expect(after.capMaxOpenPositions).toBe(HARD_MAX_OPEN_POSITIONS);
+  });
+
+  it('gate-CLOSED rows are visible in books[] but excluded from the count (TRA-3445 phantom rows)', () => {
+    setLiveOtmFleetCapitalProvider(() => [
+      row({ book: 'admin', openLiveOptionRows: 1 }),
+      row({ book: 'Richard', liveEntryGateOpen: false, openLiveOptionRows: 5, openEquityPositions: 2 }),
+    ]);
+    const body = serveFleetOpenPositions();
+    expect(body.resolvedCount).toBe(1);
+    expect(body.books).toEqual([
+      { book: 'admin', liveEntryGateOpen: true, openLiveOptionRows: 1, openEquityPositions: 0 },
+      { book: 'Richard', liveEntryGateOpen: false, openLiveOptionRows: 5, openEquityPositions: 2 },
+    ]);
+    // Raw count terms only — nothing that feeds a budget rides this block.
+    expect(Object.keys(body.books![0]!).sort()).toEqual(
+      ['book', 'liveEntryGateOpen', 'openEquityPositions', 'openLiveOptionRows'],
+    );
+  });
+
+  it('AC2 — WIRED but unreadable is distinguishable from a readable count AND from unwired', () => {
+    // The provider throws: the read is wired, the resolve yields NaN, and the
+    // seam would REFUSE as open_positions_unreadable. JSON cannot carry NaN,
+    // so the surface must say it with null + a reason, not with a silent null.
+    setLiveOtmFleetCapitalProvider(() => { throw new Error('broker read broke'); });
+    expect(serveFleetOpenPositions()).toMatchObject({
+      resolvedCount: null,
+      unreadableReason: 'fleet_rows_unreadable',
+      fleetReadWired: true,
+      books: null,
+    });
+    // A gate-open row with an unreadable count is the same refusing state.
+    setLiveOtmFleetCapitalProvider(() => [
+      row({ book: 'admin', openLiveOptionRows: Number.NaN }),
+    ]);
+    const body = serveFleetOpenPositions();
+    expect(body.resolvedCount).toBeNull();
+    expect(body.unreadableReason).toBe('fleet_rows_unreadable');
+    // …and the raw rows stay served, so the broken term is attributable.
+    expect(body.books).toHaveLength(1);
   });
 });
 

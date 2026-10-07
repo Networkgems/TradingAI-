@@ -102,6 +102,11 @@ import {
 } from '../option-exec-flag.js';
 // TRA-3401 — the one-shot cost-bar grant's health block (card `6b82a9e7`).
 import { getLiveOtmOneShotGrantState } from '../live-otm-oneshot-grant.js';
+// TRA-5284 — the fleet open-position count the hard-controls 3-position cap
+// grades on (TRA-5283), folded off the SAME module-global provider the order
+// seam reads — deliberately NOT a `deps` injection, so this route cannot be
+// wired to a different read than the one it claims to publish.
+import { summarizeFleetOpenPositions } from '../live-otm-fleet-capital.js';
 import {
   summarizeLiveOptionsFeeSlippage, // TRA-1929
   summarizeLiveOptionAdmissionStamps, // TRA-3997
@@ -6673,6 +6678,32 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // (Math.max(0, …) is why 08-17's 6.91x published as "within"); this
       // block exists so that state has a byte that differs.
       canaryCeiling: gradeCanaryCeilingHealth(aggregateExposureRows, liveEnv),
+      /**
+       * ⭐ TRA-5284 (parent TRA-5282, off TRA-5283) — the COUNT beside the
+       * dollars: the fleet open-position figure the hard-controls 3-position
+       * cap (`HARD_MAX_OPEN_POSITIONS`, fleet-wide since `dfcb93bd`) grades
+       * on, which until this key existed was published NOWHERE — the cap was
+       * gradeable only by reading code, the evidence class that let the
+       * per-book defect sit unnoticed.
+       *
+       * ⭐ The PRESENCE of this key is the deployed-bytes proof (assert with
+       * `hasOwnProperty`). Folded from the SAME provider + resolver pair the
+       * order seam calls (`readLiveOtmFleetCapitalRows` +
+       * `resolveFleetOpenPositionCount`), inside the summarizer, so the route
+       * cannot re-derive a count that agrees with the label and disagrees
+       * with the seam.
+       *
+       * ⚠ READ `unreadableReason` BEFORE trusting a `null` count — the three
+       * causes an `open_positions_unreadable` refusal (or its absence) can
+       * have are three distinct shapes here: a readable count (genuine cap
+       * hit), `fleet_rows_unreadable` (wired read broke ⇒ the seam REFUSES),
+       * and `fleet_read_unwired` (the one NON-refusing degrade: every order
+       * site falls back to its own per-book count — `fleetReadWired: false`
+       * is the only byte that distinguishes that from the fleet bound being
+       * in force). Gate-closed books appear in `books[]` but not in the
+       * count, by design (TRA-3445 phantom-row note on TRA-5283).
+       */
+      fleetOpenPositions: summarizeFleetOpenPositions(),
       /**
        * ⭐ TRA-3979 — THE SAME DOLLARS `aggregateFleetBound` COUNTS, SLICED BY
        * CONTRACT AND BY UNDERLYING INSTEAD OF BY BOOK.
