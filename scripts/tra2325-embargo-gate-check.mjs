@@ -1271,20 +1271,23 @@ for (const [reason, expected] of [
   const advRow = renderEntry([win.start.toISOString(), 'dep-e2e-advance', HEAD, 'live']);
   const QUIET = ['--force-embargo-override=TRA-4535 e2e control, POSTs nothing', '--force-rth-override=TRA-4535 e2e control, POSTs nothing'];
   const PAST4 = '--allow-rollback=TRA-4535 e2e control, POSTs nothing';
+  // TRA-5265: a ZERO-sha target cannot be placed in history, so the sign-off gate (exit 11) reads BLIND
+  // ahead of the cadence gate these arms grade. Its own suite is tra5265-signoff-gate-check.mjs.
+  const SO = '--override-signoff=TRA-5265 e2e control, POSTs nothing';
   const live = activeCadenceCeiling(new Date());
   const arms = live
     ? [
-        { why: 'spent window + an advancing target ⇒ exit 10, naming the advance', deploys: [advRow, baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4], code: 10, errHas: ['REFUSED: this deploy would be commit advance #2', 'dep-e2e-advance', '--override-cadence'] },
-        { why: '…the same run with ONE fewer history row PROCEEDS as the window\'s train', deploys: [baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4, ...QUIET], code: 0, outHas: ['cadence : 0/1', 'THIS DEPLOY IS A TRAIN', 'would POST'] },
+        { why: 'spent window + an advancing target ⇒ exit 10, naming the advance', deploys: [advRow, baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4, SO], code: 10, errHas: ['REFUSED: this deploy would be commit advance #2', 'dep-e2e-advance', '--override-cadence'] },
+        { why: '…the same run with ONE fewer history row PROCEEDS as the window\'s train', deploys: [baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4, ...QUIET, SO], code: 0, outHas: ['cadence : 0/1', 'THIS DEPLOY IS A TRAIN', 'would POST'] },
         { why: 'spent window + the LIVE sha (env-apply) PROCEEDS', deploys: [advRow, baseRow], args: [`--commit=${HEAD}`, '--dry-run', ...QUIET], code: 0, outHas: ['cadence : 1/1', 'SAME build as live: not a train', 'would POST'] },
         { why: '…the same env-apply with the history UNREADABLE ⇒ exit 10 BLIND', deploys: null, deploysStatus: 503, args: [`--commit=${HEAD}`, '--dry-run', ...QUIET], code: 10, errHas: ['BLIND and fails closed', '503'] },
-        { why: '--override-cadence="TRA-#### why" PROCEEDS and is echoed', deploys: [advRow, baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4, ...QUIET, '--override-cadence=TRA-4535 e2e control, not a real deploy'], code: 0, errHas: ['OVERRIDING the TRA-4384 CADENCE CEILING', 'TRA-4535 e2e control, not a real deploy'], outHas: ['OVERRIDDEN (--override-cadence)'] },
-        { why: '--override-cadence with no ticket ⇒ exit 2', deploys: [advRow, baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4, '--override-cadence=because I said so'], code: 2, errHas: ['must NAME the ticket'] },
+        { why: '--override-cadence="TRA-#### why" PROCEEDS and is echoed', deploys: [advRow, baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4, ...QUIET, SO, '--override-cadence=TRA-4535 e2e control, not a real deploy'], code: 0, errHas: ['OVERRIDING the TRA-4384 CADENCE CEILING', 'TRA-4535 e2e control, not a real deploy'], outHas: ['OVERRIDDEN (--override-cadence)'] },
+        { why: '--override-cadence with no ticket ⇒ exit 2', deploys: [advRow, baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4, SO, '--override-cadence=because I said so'], code: 2, errHas: ['must NAME the ticket'] },
       ]
     : [
         // After the ceiling row is spent the gate is inert BY DESIGN, and this suite must say so
         // rather than go red in everyone's pretest the morning after the freeze.
-        { why: 'no ceiling row covers today: the gate is INERT and says so', deploys: [advRow, baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4, ...QUIET], code: 0, outHas: ['gate inert'] },
+        { why: 'no ceiling row covers today: the gate is INERT and says so', deploys: [advRow, baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4, ...QUIET, SO], code: 0, outHas: ['gate inert'] },
       ];
   console.log(`cadence : arm 3 — the shipped main(), stubbed Render, window ${win.start.toISOString()} (${live ? 'ceiling ACTIVE' : 'no ceiling row today — inert arm only'}):`);
   for (const a of arms) {

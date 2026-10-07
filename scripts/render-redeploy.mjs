@@ -136,11 +136,25 @@
 //      quota of COMMIT ADVANCES (counted off Render's deploy history), and this deploy would
 //      add one more. Also exit 10 when that history cannot be read (BLIND). A same-SHA
 //      redeploy is never refused. Override: --override-cadence="<TRA-####> reason". TRA-4535.
+//  11  REFUSED — live..target carries a commit registered in ops/deploy-signoffs.json whose
+//      sign-off is unmet or DECLINED (the PASSENGER problem: 9abf167f shipped unsigned as the
+//      parent of an unrelated fix, 2026-10-07). Also exit 11 when that registry is unreadable,
+//      unparseable, or names a sha this checkout cannot place (BLIND). Soak host only.
+//      Override: --override-signoff="<TRA-####> reason". TRA-5265.
 
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { classifyAuthSecret } from './lib/auth-secret-predicate.mjs';
+// TRA-5265: the deploy SIGN-OFF gate (exit 11) — pure predicate + registry reader live in the lib.
+import {
+  readSignoffs,
+  signoffState,
+  signoffBlocks,
+  signoffOverrideNamesTicket,
+  renderSignoffRefusal,
+  renderSignoffLine,
+} from './lib/signoff-gate.mjs';
 // The shallow-graft ancestry grader (TRA-3699, moved to lib by TRA-3721). Imported for
 // local use AND re-exported below — `export … from` alone would leave `isShallowCheckout`
 // undefined at the gate-6 call site in this file.
@@ -1984,6 +1998,8 @@ const HOLD_OVERRIDE_REASON = valOf('--override-hold');
 const HAS_HOLD_OVERRIDE = argv.some(a => a === '--override-hold' || a.startsWith('--override-hold='));
 const CADENCE_OVERRIDE_REASON = valOf('--override-cadence');
 const HAS_CADENCE_OVERRIDE = argv.some(a => a === '--override-cadence' || a.startsWith('--override-cadence='));
+const SIGNOFF_OVERRIDE_REASON = valOf('--override-signoff');
+const HAS_SIGNOFF_OVERRIDE = argv.some(a => a === '--override-signoff' || a.startsWith('--override-signoff='));
 const WANTS_TIP = has('--tip');
 
 function fail(code, msg) {
@@ -2090,6 +2106,12 @@ export const KNOWN_ARGS = [
     value: 'reason',
     arg: '"<TRA-####> reason"',
     help: 'deploy one more commit advance into a window whose CADENCE CEILING is spent or unreadable (exit 10). Must name a ticket.',
+  },
+  {
+    flag: '--override-signoff',
+    value: 'reason',
+    arg: '"<TRA-####> reason"',
+    help: 'deploy past a commit in live..target whose sign-off is unmet, or a BLIND ops/deploy-signoffs.json (exit 11). Must name a ticket.',
   },
 ];
 
@@ -2962,6 +2984,39 @@ async function main() {
     );
   }
 
+  // ── The SIGN-OFF gate (TRA-5265) — exit 11 ─────────────────────────────────
+  // Needs live AND target, so it sits with Gate 4. It asks the one question none of the gates
+  // above ask: does live..target carry a commit whose authorization has not been given?
+  // Fail-closed; a missing registry is BLIND, so deleting the file cannot disarm it.
+  const signoff = isSoakHost
+    ? signoffState(readSignoffs(REPO_ROOT), { target, live }, gitCarries)
+    : { verdict: 'CLEAR', unmet: [], inRange: 0, why: null };
+
+  if (signoffBlocks(signoff.verdict) && !HAS_SIGNOFF_OVERRIDE) {
+    console.error(renderSignoffRefusal(signoff, { live, target }));
+    process.exit(11);
+  }
+
+  if (signoffBlocks(signoff.verdict) && HAS_SIGNOFF_OVERRIDE) {
+    if (!SIGNOFF_OVERRIDE_REASON || !SIGNOFF_OVERRIDE_REASON.trim()) {
+      fail(2, '--override-signoff requires a non-empty reason, e.g. --override-signoff="TRA-5260 CEO approved on the thread".');
+    }
+    if (!signoffOverrideNamesTicket(SIGNOFF_OVERRIDE_REASON)) {
+      fail(2, `--override-signoff must NAME a ticket (a TRA-#### token). Got: "${SIGNOFF_OVERRIDE_REASON}".`);
+    }
+    console.error(
+      `[render-redeploy] ⚠ OVERRIDING THE DEPLOY SIGN-OFF GATE at ${new Date().toISOString()} — TRA-5265.
+` +
+        `  override: --override-signoff="${SIGNOFF_OVERRIDE_REASON}"
+` +
+        `  verdict : ${signoff.verdict}${signoff.why ? ` — ${signoff.why}` : ''}
+` +
+        signoff.unmet.map(u => `  shipping: ${u.sha.slice(0, 12)} ${u.state} (${u.ticket})
+`).join('') +
+        `  If the sign-off is later declined the only remedy is a rollback of the money host.`,
+    );
+  }
+
   // ── The CADENCE CEILING (TRA-4535) — exit 10 ────────────────────────────────
   // After Gate 4, because it needs the live commit Gate 4 already read: the same-SHA exemption
   // IS "target equals live". AHEAD of the embargo and the RTH freeze on purpose. On a night when
@@ -3107,6 +3162,9 @@ async function main() {
   // TRA-4535: printed on every run, so a green run still says how much of tonight it spends.
   console.log(
     `cadence : ${renderCadenceLine(cadence, { isSoakHost, overridden: HAS_CADENCE_OVERRIDE && cadenceBlocks(cadence.verdict) })}`,
+  );
+  console.log(
+    `signoff : ${renderSignoffLine(signoff, { isSoakHost, overridden: HAS_SIGNOFF_OVERRIDE && signoffBlocks(signoff.verdict) })}`,
   );
   console.log(
     `holds   : ${

@@ -128,6 +128,7 @@ try {
   stageScripts(graft, [
     'scripts/render-redeploy.mjs',
     'scripts/lib/auth-secret-predicate.mjs',
+    'scripts/lib/signoff-gate.mjs',
     ...ANCESTRY_LIB,
   ]);
 

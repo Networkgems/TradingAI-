@@ -1,0 +1,20 @@
+{
+  "_readme": "TRA-5265 — repo-resident DEPLOY SIGN-OFF registry read by scripts/render-redeploy.mjs (gate exit 11). A commit whose body asks for sign-off at deploy time is REGISTERED here under `requires`, keyed on SHA (the passenger problem is a property of the commit RANGE live..target, not of anyone's ticket). Recording the sign-off is ONE APPEND to `grants` ({sha, ticket, decision, by, ref, at}) — the `requires` row is never edited, so nobody edits a file twice and nothing becomes a standing hold. A `decline` grant keeps the gate shut. Rows whose sha is already live (or not in the target) are inert, so the file does not need pruning. Fails CLOSED: unparseable file, a row missing a field, a non-40-hex sha, or a required sha unknown to the checkout REFUSES (exit 11, BLIND) — it never degrades to allowed. DELETING the file is NOT the cleared state here (unlike ops/deploy-hold.json): a missing file is BLIND, so the gate cannot be disarmed by deletion. Override: --override-signoff=\"TRA-#### why\".",
+  "requires": [
+    {
+      "sha": "9abf167f815eace4e09e59d07ef1afb3857b6e39",
+      "ticket": "TRA-5260",
+      "why": "TRA-5118 changes published calendar totals by design; commit body asks for sign-off at deploy time. Kept as the replay fixture for the 2026-10-07 passenger incident (shipped unsigned in dep-db2pquqjnfac73fj8i60)."
+    }
+  ],
+  "grants": [
+    {
+      "sha": "9abf167f815eace4e09e59d07ef1afb3857b6e39",
+      "ticket": "TRA-5260",
+      "decision": "approve",
+      "by": "CEO",
+      "ref": "comment a446d349",
+      "at": "2026-10-07T01:19:53Z"
+    }
+  ]
+}
