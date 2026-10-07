@@ -1071,6 +1071,25 @@ export function classifyIssue(item, roster, { graph = null, now = null } = {}) {
   if (blockers.unreadable) return { unreadable: blockers.unreadable };
   if (!blockers.shape) return null; // ≥1 open blocker — legitimately held, stay silent.
 
+  // TRA-5258 — shape 1 is "blocked + empty blockedBy + a recovery wake". With NO
+  // `activeRecoveryAction` the platform has not called it a strand, and a row that
+  // names a live resting path is parked by design: forcing it to `todo` drops a
+  // human-gated row into an agent queue where nothing can advance it. Exempted rows
+  // are REPORTED (result.parked), never silently dropped — absent is not clean.
+  if (blockers.shape === SHAPE.EMPTY_BLOCKED_BY && !item.activeRecoveryAction) {
+    const d = item.unblockDescriptor;
+    const descriptorLive = !!(d && typeof d === 'object' && d.owner && d.action);
+    const monitorArmed = !!(item.monitorNextCheckAt && item.executionPolicy && item.executionPolicy.monitor);
+    if (descriptorLive || monitorArmed) {
+      return {
+        parked: {
+          identifier: item.identifier || item.id,
+          path: monitorArmed ? 'monitor' : 'unblockDescriptor',
+        },
+      };
+    }
+  }
+
   const assigneeAgentId = item.assigneeAgentId || null;
   const agent = assigneeAgentId ? roster.get(assigneeAgentId) : null;
 
@@ -1246,6 +1265,7 @@ export async function sweep({ getIssuesPage, getIssue, listAgents, getComments, 
 
   const hits = [];
   const unreadable = [];
+  const parked = [];
   // One clock for the whole sweep, injectable so the wake-age controls pin a
   // branch instead of racing the wall clock.
   const nowMs = Number.isFinite(opts.now) ? opts.now : Date.now();
@@ -1264,6 +1284,7 @@ export async function sweep({ getIssuesPage, getIssue, listAgents, getComments, 
       }
       const graded = classifyIssue(item, roster, { graph, now: nowMs });
       if (graded && graded.unreadable) unreadable.push(graded.unreadable);
+      else if (graded && graded.parked) parked.push(graded.parked);
       else if (graded) hits.push({ graded, item });
     }
   };
@@ -1372,6 +1393,7 @@ export async function sweep({ getIssuesPage, getIssue, listAgents, getComments, 
     itemReads: blockedRows.length,
     findings,
     unreadable,
+    parked,
     // TRA-4832 — who is READING this report. The resolve-restore verb is only
     // executable by the recovery action's own owner (or the current assignee /
     // board — `assertRecoveryActionAuthority` in the platform's issues routes,
@@ -1435,6 +1457,12 @@ export function renderReport(result) {
   }
 
   L.push(`item reads   ${result.itemReads} blocked issue(s) re-read through GET /api/issues/{id}`);
+  if (result.parked && result.parked.length) {
+    L.push(
+      `parked       ${result.parked.length} blocked+empty row(s) EXEMPT (no recovery action; live resting path): ` +
+        result.parked.map((p) => `${p.identifier}[${p.path}]`).join(', '),
+    );
+  }
   L.push('');
 
   if (result.findings.length === 0) {
@@ -2179,6 +2207,28 @@ const CASES = [
     expect: 'BLIND',
     build: () => transportFor(fakeBoard([stranded('s1', 'TRA-8010', 'agent-cto')]), { ignoreOffset: true }),
     assert: (r) => /ignored offset/.test(r.blind) && r.findings.length === 0,
+  },
+  {
+    name: 'TRA-5258 — blocked+empty, NO recovery action, populated unblockDescriptor => parked, NOT a finding; with a recovery action or a hollow descriptor it STILL is',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(
+        fakeBoard([
+          stranded('p1', 'TRA-8101', 'agent-cto', {
+            activeRecoveryAction: null,
+            unblockDescriptor: { owner: { agentId: 'agent-cfo' }, action: 'keep report in front of board' },
+          }),
+          stranded('p2', 'TRA-8102', 'agent-cto', {
+            unblockDescriptor: { owner: { agentId: 'agent-cfo' }, action: 'x' },
+          }),
+          stranded('p3', 'TRA-8103', 'agent-cto', { activeRecoveryAction: null, unblockDescriptor: { owner: null } }),
+        ]),
+      ),
+    assert: (r) =>
+      r.findings.length === 2 &&
+      !r.findings.some((f) => f.identifier === 'TRA-8101') &&
+      r.parked.length === 1 &&
+      r.parked[0].identifier === 'TRA-8101',
   },
   {
     name: 'TRAP 2 — item route carries NO blockedBy key => BLIND, never "all clear" and never "all flagged"',

@@ -650,6 +650,7 @@ function gradeTrigger({ routine, trigger, runs, now, windowStartMs, graceMs, max
     servedCount: served.size,
     suppressedCount: suppressed,
     lost: lostSlots.length,
+    lostSlotMs: lostSlots.slice(),
     clampedBy,
     firstLostCensored,
     firstLostAt: lostSlots.length ? new Date(lostSlots[0]).toISOString() : null,
@@ -888,7 +889,35 @@ export function gradeDarkness(tape, events, { fromMs, toMs, darkGapMs }) {
   };
 }
 
-function renderDarkReport(dark, { fromMs, days }) {
+/**
+ * TRA-5258 — attribute each LOST slot to the dark span that actually contains
+ * it. The old footer asserted every per-routine loss was a symptom of "this
+ * single cause", which is false whenever a loss predates or falls between the
+ * spans (2b3b32bc's 964h gap starts a month before the earliest span). Losses
+ * outside every span are reported as their own UNATTRIBUTED bucket, never
+ * folded into the newest span.
+ */
+export function attributeLosses(findings, windows) {
+  const perWindow = windows.map(() => 0);
+  let unattributed = 0;
+  let total = 0;
+  let unknown = 0;
+  for (const f of findings || []) {
+    if (!Array.isArray(f.lostSlotMs)) {
+      unknown += f.lost || 0; // absent evidence is its own state, not "unattributed"
+      continue;
+    }
+    for (const t of f.lostSlotMs) {
+      total++;
+      const i = windows.findIndex((w) => t >= w.startMs && t <= w.endMs);
+      if (i >= 0) perWindow[i]++;
+      else unattributed++;
+    }
+  }
+  return { perWindow, unattributed, total, unknown };
+}
+
+function renderDarkReport(dark, { fromMs, days }, findings = []) {
   const out = [];
   out.push('');
   if (dark.verdict === 'BLIND') {
@@ -918,7 +947,13 @@ function renderDarkReport(dark, { fromMs, days }) {
     out.push(`        ${split}`);
   }
   if (dark.windows.length) {
-    out.push('    (per-routine SLOT_LOSS/LATE rows inside these spans are SYMPTOMS of this single cause)');
+    const at = attributeLosses(findings, dark.windows);
+    out.push(`    LOST-SLOT ATTRIBUTION (${at.total} lost slot(s) across ${findings.length} finding(s)):`);
+    dark.windows.forEach((w, i) => out.push(`      ${at.perWindow[i]} inside ${w.start} -> ${w.end}`));
+    out.push(
+      `      ${at.unattributed} UNATTRIBUTED (inside NO dark span above - a different cause, e.g. a scheduler freeze; do not read as these spans' symptoms)`,
+    );
+    if (at.unknown) out.push(`      ${at.unknown} NOT MEASURED (finding carried no slot list)`);
   }
   return out;
 }
@@ -1487,6 +1522,16 @@ const DARK_CONTROLS = [
     },
   },
   {
+    name: 'TRA-5258 — a lost slot outside every dark span is UNATTRIBUTED, never folded into a span; no slot list reads NOT MEASURED',
+    run: () => {
+      const W = [{ startMs: 1000, endMs: 2000 }];
+      const at = attributeLosses([{ lost: 3, lostSlotMs: [500, 1500, 3000] }, { lost: 4 }], W);
+      if (at.perWindow[0] !== 1) return `expected 1 inside the span, got ${at.perWindow[0]}`;
+      if (at.unattributed !== 2) return `expected 2 unattributed, got ${at.unattributed}`;
+      return at.unknown === 4 || `expected 4 NOT MEASURED, got ${at.unknown}`;
+    },
+  },
+  {
     name: 'bar placement — 8.3h (measured overnight-sleep max) is NOT a window at the default bar',
     run: () => {
       const d = gradeDarkness(
@@ -1917,7 +1962,7 @@ async function main() {
     );
   } else {
     for (const l of renderReport(result, names)) console.log(l);
-    for (const l of renderDarkReport(dark, { fromMs, days })) console.log(l);
+    for (const l of renderDarkReport(dark, { fromMs, days }, result.findings || [])) console.log(l);
     console.log(`\n  OVERALL ${overall} (routines ${result.verdict} · darkness ${dark.verdict})`);
   }
   return VERDICT_EXIT[overall] ?? 3;
