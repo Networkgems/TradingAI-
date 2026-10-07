@@ -798,6 +798,7 @@ import {
 } from './underlying-asset-class.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import type { DailySignalRecord, ReportInput } from './reports/eod-report.js';
+import { resolveSignalOutcomes, type SignalOutcomeSource, type SignalResolutionSummary } from './signal-resolution.js';
 import type { PnlTracker } from './pnl-tracker.js';
 import { randomUUID } from 'crypto';
 import { logger } from './observability/index.js';
@@ -6699,10 +6700,17 @@ export class SignalEngine {
         this.allClosedPositions.push(...closed);
         const accountState = this.account.getState();
         const managedEquity = accountState.totalEquity * MANAGED_ACCOUNT_RATIO;
-        // Annotate daily signal records with outcomes and feed risk governor
+        // Annotate daily signal records with outcomes and feed risk governor.
+        // TRA-5275 — prefer the exact id join (the open stamps `signalId` from
+        // the record's own `signal.id`), and only fall back to the legacy
+        // (symbol, type) pair for pre-TRA-333 rows. The old `find` also matched
+        // an already-resolved record first, which then refused the write and
+        // left the genuinely-unresolved sibling unresolved forever.
         for (const pos of closed) {
           const sigType = this.positionSignalType.get(pos.id);
-          const rec = this.dailySignals.find(s => s.symbol === pos.symbol && s.type === sigType);
+          const rec =
+            this.dailySignals.find(s => pos.signalId != null && s.id === pos.signalId)
+            ?? this.dailySignals.find(s => s.symbol === pos.symbol && s.type === sigType && s.outcome == null);
           if (rec && rec.outcome == null) {
             rec.outcome = (pos.pnl ?? 0) > 0 ? 'win' : 'loss';
             const risk = Math.abs(pos.entryPrice - pos.stopLoss) * pos.quantity;
@@ -25066,7 +25074,66 @@ export class SignalEngine {
     return this.getTechnicalSnapshot(symbol) ?? this.refreshTechnicalSnapshot(symbol);
   }
 
+  /**
+   * TRA-5275 — resolve today's signal records against the closed books before
+   * any report reads them. This is the ONLY writer that covers every close
+   * path (broker-confirmed live exits, expiry settlements, manual closes,
+   * broker-reconcile, closes landing after a restart): it joins by the exact
+   * `signalId` the open stamped, so reject-path records — signals that never
+   * opened a position — stay honestly unresolved. Idempotent (resolved rows
+   * are skipped), and it runs HERE rather than inside each close path so rows
+   * fired under a build that never resolved anything still backfill from the
+   * persisted books on the first post-deploy read.
+   */
+  private resolveDailySignalOutcomesFromClosedBooks(): SignalResolutionSummary {
+    const sources: SignalOutcomeSource[] = [];
+    for (const p of this.allClosedPositions) {
+      if (!p.signalId) continue;
+      sources.push({
+        signalId: p.signalId,
+        closedAt: p.closedAt,
+        pnl: p.pnl,
+        riskUsd: Math.abs(p.entryPrice - p.stopLoss) * p.quantity,
+      });
+    }
+    // Still-open rows veto their signal id: the outcome is not final yet.
+    for (const p of this.account.getState().openPositions) {
+      if (p.signalId) sources.push({ signalId: p.signalId });
+    }
+    // BOTH env buckets, mode-scoped: a sandbox-opened row must still resolve
+    // its signal after the operator flips `liveTradierEnvOptions`.
+    for (const env of ['sandbox', 'production'] as const) {
+      const acct = this.optionsAccounts[env];
+      for (const o of acct.getClosedOptionsForMode(this.mode)) {
+        sources.push({
+          signalId: o.signalId,
+          closedAt: o.closedAt,
+          pnl: o.pnl,
+          // The breaker's defined-risk expression (TRA-1023): a spread's max
+          // loss, else the long leg's premium-at-risk.
+          riskUsd: typeof o.maxLossUsd === 'number' && o.maxLossUsd > 0
+            ? o.maxLossUsd
+            : (o.premiumPaid ?? 0) * (o.contracts ?? 0) * 100,
+        });
+      }
+      for (const o of acct.getStateForMode(this.mode).openOptions) {
+        if (o.signalId) sources.push({ signalId: o.signalId });
+      }
+    }
+    const summary = resolveSignalOutcomes(this.dailySignals, sources);
+    if (summary.resolved > 0) {
+      log.info('signal outcomes resolved from closed books (TRA-5275)', {
+        resolved: summary.resolved,
+        alreadyResolved: summary.alreadyResolved,
+        unresolved: summary.unresolved,
+        scanned: summary.scanned,
+      });
+    }
+    return summary;
+  }
+
   getReportSnapshot(): ReportInput {
+    this.resolveDailySignalOutcomesFromClosedBooks();
     return {
       state: this.getState(),
       allClosedPositions: [...this.allClosedPositions],
