@@ -84,10 +84,13 @@ function aggregateRvScan(census) {
 const STAGE_ORDER = [
   ['feed/scan', (g) => g.startsWith('scan:')],
   ['candidate generation', (g) => g === 'no_candidates' || g === 'no_shadow_series'],
-  ['strategy gates', (g) => ['no_trend_confluence', 'no_trend_aligned_candidate', 'entry_window_closed', 'recent_duplicate', 'churn_brake'].includes(g)],
+  ['strategy gates', (g) => ['no_trend_confluence', 'no_trend_aligned_candidate', 'entry_window_closed', 'recent_duplicate', 'churn_brake'].includes(g) || g.startsWith('learning_budget:')],
   ['contract selection', (g) => g.startsWith('contract_floor') || g === 'no_in_band_strike' || g === 'no_liquid_contract' || g.startsWith('quality_gate:')],
   ['spread ceiling', (g) => g === 'spread_ceiling'],
   ['cost bar', (g) => g === 'cost_aware_bar' || g === 'cost_bar'],
+  // TRA-5155: parked echoes (`recent_duplicate:parked_echo:<originGate>`) are re-counts of a
+  // DOWNSTREAM refusal, not upstream deaths; kept in their own stage, excluded from "strategy gates".
+  ['parked echoes (re-count)', (g) => g.startsWith('recent_duplicate:parked_echo:')],
 ];
 
 function printCell(a) {
@@ -107,6 +110,17 @@ function printCell(a) {
       console.log(`      ${g.padEnd(32)} ${String(n).padStart(9)}  ${pct(n, total)}`);
     }
   }
+  const echoes = Object.entries(a.rejections).filter(([g]) => g.startsWith('recent_duplicate:parked_echo:'));
+  if (echoes.length) {
+    console.log('  echo reconciliation (echo vs same-cell origin-gate count; echo>=origin expected, ~12/hr):');
+    for (const [g, n] of echoes) {
+      const origin = g.slice('recent_duplicate:parked_echo:'.length);
+      const o = a.rejections[origin] || 0;
+      console.log(`      ${origin.padEnd(34)} echo ${String(n).padStart(6)}  origin ${String(o).padStart(6)}${o ? `  x${(n / o).toFixed(2)}` : '  (origin not rejected in this cell: parked via passed/other path)'}`);
+    }
+  }
+  const staged = STAGE_ORDER.reduce((t, [, m]) => t + Object.entries(a.rejections).filter(([g]) => m(g)).reduce((s2, [, n]) => s2 + n, 0), 0);
+  console.log(`  shares re-sum: staged ${staged} + passed ${a.passed} = ${staged + a.passed} vs evaluated ${total} -> ${pct(staged + a.passed, total)}`);
   const known = new Set(STAGE_ORDER.flatMap(([, m]) => Object.keys(a.rejections).filter(m)));
   const other = Object.entries(a.rejections).filter(([g]) => !known.has(g));
   if (other.length) {
