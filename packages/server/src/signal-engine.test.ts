@@ -8340,7 +8340,10 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     // fleet term is NOT in force, so a day on which the bound was never actually
     // enforced is otherwise indistinguishable after the fact from a day on which
     // it simply never bit. Same discipline: named row, exact total.
-    expect(retained.find((g) => g.gate === 'fleet_reachable_bound')).toMatchObject({ evaluated: 1, blocked: 0 });
+    // TRA-5291 — `evaluated: 2`, not 1: A now also binds at the shared
+    // buy_to_open seam (board ruling a+, card d243464d), so an OTM order
+    // records this gate at the admission site AND at the mirror seam.
+    expect(retained.find((g) => g.gate === 'fleet_reachable_bound')).toMatchObject({ evaluated: 2, blocked: 0 });
     // TRA-3942 — and a FIFTH: the ENTRY-TIME window records both verdicts, and
     // `TRADING_TIME` (10:20 ET) is inside the morning window, so this pass is an
     // ADMIT. It is the FIRST gate on the funnel, which is what makes its
@@ -8379,7 +8382,8 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     // without an admitting sleeve "enforcing and nothing tried it" and "not
     // wired in" would be the same JSON.
     expect(retained.find((g) => g.gate === 'sleeve_stand_down')).toMatchObject({ evaluated: 1, blocked: 0 });
-    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(10);
+    // TRA-5291 — 11, not 10: the seam's `fleet_reachable_bound` row above.
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(11);
   });
 
   // ─── TRA-3942 — the ORDERING claim, graded BEHAVIOURALLY ────────────────────
@@ -8459,9 +8463,13 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     // DIFFERENT and already-pinned reason: both are flag-disarmed on this path,
     // which is exactly the flag-OFF test above. Naming them separately keeps this
     // control from claiming a reachability it does not demonstrate.)
-    for (const gate of ['universe', 'aggregate_cap', 'canary_ceiling', 'fleet_reachable_bound'] as const) {
+    for (const gate of ['universe', 'aggregate_cap', 'canary_ceiling'] as const) {
       expect(admitted.find((g) => g.gate === gate)).toMatchObject({ evaluated: 1 });
     }
+    // TRA-5291 — `fleet_reachable_bound` reads 2 on an admitted pass: once at
+    // the OTM admission site, once at the shared buy_to_open seam (board
+    // ruling a+, card d243464d — A binds ALL live option entries).
+    expect(admitted.find((g) => g.gate === 'fleet_reachable_bound')).toMatchObject({ evaluated: 2 });
     expect(admittedStub.buyContractsLimit).toHaveBeenCalledTimes(1);
   });
 

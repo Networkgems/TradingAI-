@@ -2606,6 +2606,208 @@ export function fitsLiveOtmReachableBound(
 }
 
 /**
+ * TRA-5291 — why the shared-seam fleet gate refused. Present exactly when
+ * refused; every code is a REFUSAL, never a degrade-to-permissive.
+ */
+export type SeamFleetBoundReasonCode =
+  | 'over_fleet_reachable_bound'
+  | 'fleet_at_risk_unreadable'
+  | 'fleet_cap_unreadable'
+  | 'entry_notional_unreadable';
+
+/** TRA-5291 — the shared-seam fleet-authorization verdict, terms attached. */
+export interface SeamFleetBoundVerdict {
+  allowed: boolean;
+  /** Present exactly when refused. */
+  reasonCode?: SeamFleetBoundReasonCode;
+  /** Present exactly when refused; discloses every term the verdict used. */
+  reason?: string;
+  /** `A` as graded. */
+  fleetCapUsd: number;
+  /** `Σ_j atRisk_j` with the caller's own figure substituted. `null` ⇒ unreadable. */
+  fleetAtRiskUsd: number | null;
+  /** Gate-open books the fold covered (the caller included). */
+  fleetAtRiskBooks: number;
+  /** `A − Σ_j atRisk_j`, SIGNED. `null` ⇒ unreadable. */
+  fleetHeadroomSignedUsd: number | null;
+  /** Which fold produced the verdict. `self_only_unwired` exists only where no fleet exists. */
+  basis: 'fleet' | 'self_only_unwired';
+}
+
+/**
+ * TRA-5291 (board ruling a+, card `d243464d`, parent TRA-5282) — the FLEET
+ * AGGREGATE AUTHORIZATION `A`, graded at the shared `mirrorLiveOptionOpen`
+ * buy_to_open seam for EVERY sleeve: refuse when `Σ_j atRisk_j + notional > A`.
+ *
+ * Until this ticket `A` was consulted ONLY on the OTM admission site
+ * (`runOtmScan`'s `aggregate_cap`/`fleet_reachable_bound` pair) — measured
+ * 2026-10-06: two real-money directional fills, both gates `evaluated: 0` on
+ * the day. The board ruled (a+): A binds ALL live option entries, so the one
+ * seam every live buy_to_open passes (RV / OTM / directional) now consults it.
+ *
+ * ⚠ SELF IS SUBSTITUTED, NEVER READ FROM THE ROWS (TRA-3872): every caller of
+ * the seam opens the paper position BEFORE mirroring, so the calling book's
+ * fleet row already contains this order's premium. The caller passes its own
+ * at-risk EXCLUDING the row being graded; the matching fleet row is skipped.
+ * A self row with a `null` book cannot be matched and is counted AS WELL — an
+ * overcount, i.e. the error lands on the refusing side (same direction as
+ * `resolveFleetOpenPositionCount`'s self fold).
+ *
+ * FAIL CLOSED (AC2): a dark fleet read NEVER lands in the permissive branch —
+ * `x != null` admits `NaN`, the TRA-3440 shape. `fleet_at_risk_unreadable`
+ * covers the WIRED-but-dark states: provider returned null/threw, a gate-open
+ * row's at-risk is non-finite (NaN pins here, not just null), or the caller's
+ * own at-risk is unusable.
+ *
+ * The ONE degrade that is not a refusal (`basis: 'self_only_unwired'`): an
+ * UNWIRED provider — a context with no fleet (single-engine tests; production
+ * wires the provider once at boot in `index.ts`) — grades the caller's own
+ * at-risk against `A` instead, the TRA-3879 AC4 never-dark-a-book posture.
+ * Still bounded, never permissive.
+ *
+ * Boundary INCLUSIVE and cent-compared, exactly like
+ * {@link fitsLiveOtmReachableBound}, so the seam and the OTM admission site
+ * cannot disagree about their shared boundary.
+ */
+export function gradeFleetReachableBoundAtSeam(
+  fleetCapUsd: number,
+  rows: readonly LiveOtmFleetCapitalRow[] | null,
+  self: { book: string | null; openPremiumAtRiskUsd: number },
+  entryNotionalUsd: number,
+  fleetReadWired: boolean,
+): SeamFleetBoundVerdict {
+  const usable = (v: unknown): v is number =>
+    typeof v === 'number' && Number.isFinite(v) && v >= 0;
+  const refuse = (
+    reasonCode: SeamFleetBoundReasonCode,
+    reason: string,
+    terms?: { fleetAtRiskUsd?: number | null; fleetAtRiskBooks?: number; basis?: 'fleet' | 'self_only_unwired' },
+  ): SeamFleetBoundVerdict => ({
+    allowed: false,
+    reasonCode,
+    reason,
+    fleetCapUsd,
+    fleetAtRiskUsd: terms?.fleetAtRiskUsd ?? null,
+    fleetAtRiskBooks: terms?.fleetAtRiskBooks ?? 0,
+    fleetHeadroomSignedUsd:
+      typeof terms?.fleetAtRiskUsd === 'number' && Number.isFinite(fleetCapUsd)
+        ? (cents(fleetCapUsd) - cents(terms.fleetAtRiskUsd)) / 100
+        : null,
+    basis: terms?.basis ?? 'fleet',
+  });
+
+  if (!Number.isFinite(fleetCapUsd) || fleetCapUsd <= 0) {
+    return refuse(
+      'fleet_cap_unreadable',
+      `live option open REFUSED — the fleet aggregate authorization A is unreadable `
+        + `(${String(fleetCapUsd)}); an unreadable authorization is not evidence of headroom, `
+        + `so the seam fails CLOSED (TRA-5291 AC2)`,
+    );
+  }
+  if (!Number.isFinite(entryNotionalUsd) || entryNotionalUsd <= 0) {
+    return refuse(
+      'entry_notional_unreadable',
+      `live option open REFUSED — this entry's notional is unreadable `
+        + `(${String(entryNotionalUsd)}); it cannot be proven to fit the fleet authorization `
+        + `A $${fleetCapUsd.toFixed(2)}, so the seam fails CLOSED (TRA-5291 AC2)`,
+    );
+  }
+  if (!usable(self.openPremiumAtRiskUsd)) {
+    return refuse(
+      'fleet_at_risk_unreadable',
+      `live option open REFUSED — this book's own open premium at risk is unreadable `
+        + `(${String(self.openPremiumAtRiskUsd)}), so Σ_j atRisk_j cannot be proven and the seam `
+        + `fails CLOSED against A $${fleetCapUsd.toFixed(2)} (TRA-5291 AC2; never the TRA-3440 `
+        + `permissive branch)`,
+    );
+  }
+
+  let fleetAtRiskCents: number;
+  let books: number;
+  let basis: 'fleet' | 'self_only_unwired';
+  if (!Array.isArray(rows)) {
+    if (fleetReadWired) {
+      // WIRED but the read returned nothing: the provider threw or returned a
+      // non-array. That is a dark read, and a dark read refuses — degrading to
+      // the self-only fold here would grade a strict subset and call it the
+      // fleet, the exact loosening `sumLiveOtmFleetAtRiskUsd` refuses one
+      // level up.
+      return refuse(
+        'fleet_at_risk_unreadable',
+        `live option open REFUSED — the fleet at-risk read is DARK at the buy_to_open seam `
+          + `(provider wired but returned no rows): an unreadable Σ_j atRisk_j is not evidence of `
+          + `headroom, so the seam fails CLOSED against A $${fleetCapUsd.toFixed(2)} `
+          + `(TRA-5291 AC2; TRA-3879 degrade shape; never the TRA-3440 permissive branch)`,
+      );
+    }
+    fleetAtRiskCents = cents(self.openPremiumAtRiskUsd);
+    books = 1;
+    basis = 'self_only_unwired';
+  } else {
+    let acc = 0;
+    let folded = 0;
+    for (const row of rows) {
+      if (row === null || row === undefined || typeof row.liveEntryGateOpen !== 'boolean') {
+        return refuse(
+          'fleet_at_risk_unreadable',
+          `live option open REFUSED — a fleet row is malformed at the buy_to_open seam, so `
+            + `Σ_j atRisk_j cannot be proven; the seam fails CLOSED against `
+            + `A $${fleetCapUsd.toFixed(2)} (TRA-5291 AC2)`,
+        );
+      }
+      if (row.book !== null && row.book === self.book) continue; // self substituted below (TRA-3872)
+      if (!row.liveEntryGateOpen) continue;
+      if (!usable(row.openPremiumAtRiskUsd)) {
+        return refuse(
+          'fleet_at_risk_unreadable',
+          `live option open REFUSED — gate-open book ${row.book ?? '(unattributed)'} publishes an `
+            + `unreadable open premium at risk (${String(row.openPremiumAtRiskUsd)}), so `
+            + `Σ_j atRisk_j cannot be proven; the seam fails CLOSED against `
+            + `A $${fleetCapUsd.toFixed(2)} (TRA-5291 AC2; NaN lands HERE, never in the `
+            + `permissive branch — the TRA-3440 shape)`,
+        );
+      }
+      acc += cents(row.openPremiumAtRiskUsd);
+      folded += 1;
+    }
+    fleetAtRiskCents = acc + cents(self.openPremiumAtRiskUsd);
+    books = folded + 1;
+    basis = 'fleet';
+  }
+
+  const fleetAtRiskUsd = fleetAtRiskCents / 100;
+  const fleetHeadroomSignedUsd = (cents(fleetCapUsd) - fleetAtRiskCents) / 100;
+  const allowed = cents(entryNotionalUsd) <= cents(fleetCapUsd) - fleetAtRiskCents;
+  if (allowed) {
+    return {
+      allowed: true,
+      fleetCapUsd,
+      fleetAtRiskUsd,
+      fleetAtRiskBooks: books,
+      fleetHeadroomSignedUsd,
+      basis,
+    };
+  }
+  return {
+    allowed: false,
+    reasonCode: 'over_fleet_reachable_bound',
+    reason:
+      `live option open REFUSED — FLEET aggregate authorization: Σ fleet at-risk `
+      + `$${fleetAtRiskUsd.toFixed(2)} over ${books} gate-open book(s) + this `
+      + `$${entryNotionalUsd.toFixed(2)} entry exceeds A $${fleetCapUsd.toFixed(2)} `
+      + `(headroom $${fleetHeadroomSignedUsd.toFixed(2)}) [self at-risk excludes the row being `
+      + `mirrored — TRA-3872; basis ${basis}] (A binds ALL live option entries at the shared `
+      + `buy_to_open seam — board ruling a+ card d243464d, TRA-5291; A bounds capital REACHABLE `
+      + `— CEO ruling TRA-3703 \`4b54935e\`)`,
+    fleetCapUsd,
+    fleetAtRiskUsd,
+    fleetAtRiskBooks: books,
+    fleetHeadroomSignedUsd,
+    basis,
+  };
+}
+
+/**
  * TRA-3997 (parent TRA-3703) — freeze the admission reading the order site just
  * compared an entry against, in the shape the row keeps
  * ({@link OptionAdmissionStamp}).
@@ -2988,13 +3190,14 @@ export interface LiveOtmFleetBoundGrade {
    * not an expected reading (TRA-3660).
    *
    * ⚠️ TRA-5279 — SCOPE. This attests the `single_leg_otm` admission site ONLY
-   * (`runOtmScan`'s `aggregate_cap`/`fleet_reachable_bound` pair). Directional
-   * and RV live entries pass the shared `mirrorLiveOptionOpen` seam, which
-   * consults NEITHER gate — measured 2026-10-06: two directional fills, both
-   * gates `evaluated: 0` on the day while `canary_ceiling`/`sleeve_stand_down`
-   * read 2. `true` here must never be read as "no live entry can take
-   * Σ atRisk past A"; whether A should bind directional is a board question
-   * (TRA-5279 follow-up), not a reading this flag can carry.
+   * (`runOtmScan`'s `aggregate_cap`/`fleet_reachable_bound` pair) — it is
+   * graded off the gate-open rows' `admissibleEntryUsd`, which only the OTM
+   * admission publishes. TRA-5291 (board ruling a+, card `d243464d`) has since
+   * wired `A` at the shared `mirrorLiveOptionOpen` seam for EVERY sleeve
+   * (`gradeFleetReachableBoundAtSeam`), so on this build no live entry can
+   * take Σ atRisk past A — but the EVIDENCE for the seam gate is its own
+   * `fleet_reachable_bound` ledger rows carrying directional/RV sleeves, not
+   * this flag, which keeps its original OTM-rows meaning.
    */
   reachableBoundEnforced: boolean;
 }
@@ -3379,7 +3582,8 @@ export function gradeLiveOtmFleetBound(
         + `$${(sumAdmissibleEntryUsd as number).toFixed(2)}; Σ B_i $${sumBookCapUsd.toFixed(2)}; `
         + `grandfathered excess $${(grandfatheredExcessUsd as number).toFixed(2)}; OTM order path `
         + `${reachableBoundEnforced ? 'ENFORCING' : 'NOT enforcing'} the reachable bound — `
-        + 'directional/RV live entries do NOT consult it (TRA-5279)]';
+        + 'and A binds ALL live option entries at the shared buy_to_open seam '
+        + '(TRA-5291, board ruling a+ card d243464d)]';
 
   let verdict: LiveOtmFleetBoundVerdict;
   let reason: string;
@@ -3412,12 +3616,13 @@ export function gradeLiveOtmFleetBound(
       + 'above a book\'s own cap because the cap tightened underneath an already-open position, which '
       + 'Σ B_i omits exactly because a budget cannot go negative. '
       + (reachableBoundEnforced
-        ? 'The OTM order path IS enforcing min(cap_i − atRisk_i, A − Σ_j atRisk_j), so no new OTM '
-          + 'entry can widen this; a directional or RV live entry does NOT consult this bound and '
-          + 'still can (TRA-5279). It closes when the open position does — see TRA-3911.'
+        ? 'The OTM order path IS enforcing min(cap_i − atRisk_i, A − Σ_j atRisk_j), and every live '
+          + 'entry (directional/RV included) also consults A at the shared buy_to_open seam '
+          + '(TRA-5291, board ruling a+ card d243464d), so no new live entry can widen this. '
+          + 'It closes when the open position does — see TRA-3911.'
         : 'The OTM order path is NOT enforcing the reachable bound (rows publish no admissibleEntryUsd) — '
-          + 'the next OTM entry can widen this (TRA-3911 AC1 is the fix), and directional/RV live '
-          + 'entries never consult this bound either way (TRA-5279).')
+          + 'the next OTM entry can widen this (TRA-3911 AC1 is the fix); directional/RV live entries '
+          + 'consult A only at the shared buy_to_open seam (TRA-5291).')
       + reachableSuffix;
   } else {
     verdict = 'breach';

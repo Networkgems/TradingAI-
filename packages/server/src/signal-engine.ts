@@ -151,7 +151,7 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isSwingSignalScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalArmed, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, liveOptionTestAggregateHeadroomSignedUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction, resolveLiveOtmSizingBasisUsd, sumLiveOtmFleetAtRiskUsd, resolveLiveOtmAdmissibleEntryUsd, fitsLiveOtmReachableBound, foldUnsettledLivePremiumUsd, resolveSettledAvailableCashUsd, isLivePremiumUnsettled } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isSwingSignalScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalArmed, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, liveOptionTestAggregateHeadroomSignedUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction, resolveLiveOtmSizingBasisUsd, sumLiveOtmFleetAtRiskUsd, resolveLiveOtmAdmissibleEntryUsd, fitsLiveOtmReachableBound, gradeFleetReachableBoundAtSeam, foldUnsettledLivePremiumUsd, resolveSettledAvailableCashUsd, isLivePremiumUnsettled } from './option-exec-flag.js';
 import type { LiveOtmAdmissibleBoundBy } from './option-exec-flag.js';
 // TRA-3997 (parent TRA-3703) — freeze the order site's admission reading onto
 // the row it is about to open. See the OTM bounded-test site below.
@@ -15020,6 +15020,71 @@ export class SignalEngine {
         username: this.alertUsername ?? null,
       });
       tradierVoid(standDown.reason!, 'policy');
+      return false;
+    }
+
+    // TRA-5291 (board ruling a+, card `d243464d`, parent TRA-5282) — THE FLEET
+    // AGGREGATE AUTHORIZATION `A`, consulted at THIS seam for EVERY sleeve:
+    // refuse the open when `Σ_j atRisk_j + notional > A`. Until this ticket A
+    // was consulted only on the OTM admission site (`runOtmScan`'s
+    // `aggregate_cap`/`fleet_reachable_bound` pair at ~:16580/:16695) — the
+    // 2026-10-06 directional fills passed canary_ceiling, the hard controls
+    // and sleeve_stand_down here while both fleet gates read `evaluated: 0`.
+    //
+    // Placement: AFTER the gates above so none of them loses its denominator,
+    // BEFORE the BP pre-checks and the broker submit so a refusal never
+    // reaches Tradier (the canary-ceiling rationale, same seam).
+    //
+    // TRA-3872 — the self term is `canaryAtRisk`, which EXCLUDES the row being
+    // graded (`opened` is already in the book pre-mirror); the fleet fold
+    // substitutes it for this book's own fleet row for the same reason.
+    //
+    // FAIL CLOSED on a dark read (TRA-5291 AC2): a wired-but-dark fleet read,
+    // a NaN row, or a NaN notional all land in the REFUSING branch under a
+    // named reason code — never the permissive one (the TRA-3440 shape). The
+    // one non-refusing degrade is an UNWIRED provider (single-engine tests;
+    // production wires it at boot in index.ts), which grades this book's own
+    // at-risk against A instead — bounded, never permissive.
+    //
+    // Recorded on BOTH verdicts with the SLEEVE as scope, so an inert day
+    // (`evaluated > 0`, `blocked 0`) is distinguishable from an unreached one
+    // (`evaluated 0`). ⚠ An OTM order therefore records `fleet_reachable_bound`
+    // twice — once at admission (with the per-book `budget` block), once here
+    // (seam row, no budget block) — which is honest: two sites, two verdicts.
+    const fleetBoundA = resolveLiveOptionTestAggregateCapUsd(process.env);
+    const seamFleetBound = gradeFleetReachableBoundAtSeam(
+      fleetBoundA,
+      readLiveOtmFleetCapitalRows(),
+      { book: this.alertUsername ?? null, openPremiumAtRiskUsd: canaryAtRisk.usd },
+      notionalCost,
+      isLiveOtmFleetCapitalProviderWired(),
+    );
+    recordLiveEnforceDecision(
+      'fleet_reachable_bound',
+      opts?.sleeve ?? 'unattributed',
+      !seamFleetBound.allowed,
+      etDateString(new Date()),
+      seamFleetBound.reason,
+      Date.now(),
+      {
+        reasonCode: seamFleetBound.reasonCode,
+        book: this.alertUsername ?? null,
+      },
+    );
+    if (!seamFleetBound.allowed) {
+      log.warn('live option open REFUSED by the fleet aggregate authorization at the shared seam (TRA-5291)', {
+        optionSymbol: opened.optionSymbol,
+        sleeve: opts?.sleeve ?? 'unattributed',
+        notionalCost,
+        fleetCapUsd: seamFleetBound.fleetCapUsd,
+        fleetAtRiskUsd: seamFleetBound.fleetAtRiskUsd,
+        fleetAtRiskBooks: seamFleetBound.fleetAtRiskBooks,
+        fleetHeadroomSignedUsd: seamFleetBound.fleetHeadroomSignedUsd,
+        basis: seamFleetBound.basis,
+        reasonCode: seamFleetBound.reasonCode,
+        username: this.alertUsername ?? null,
+      });
+      tradierVoid(seamFleetBound.reason!, 'policy');
       return false;
     }
 

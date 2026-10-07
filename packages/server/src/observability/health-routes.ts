@@ -5540,7 +5540,12 @@ export function rollUpExitCadence(engines: ExitCadenceHealth[]): ExitCadenceRoll
 // the prose. The incident this encodes: TRA-4795's defect test graded
 // `sleeve_stand_down` (mirror-seam) against `cost_bar` admits (scan-seam) and
 // fired a false wiring accusation against a correctly wired gate.
-export const MIRROR_SEAM_GATES = ['canary_ceiling', 'sleeve_stand_down'] as const;
+// TRA-5291 (board ruling a+, card d243464d) — `fleet_reachable_bound` joined
+// the seam: A binds ALL live option entries, recorded per sleeve on both
+// verdicts. ⚠ That gate ALSO records at the OTM admission site (scan-seam,
+// with the `budget` block), so an OTM order contributes TWO rows to it — one
+// per seam, different denominators; the seam row carries no `budget`.
+export const MIRROR_SEAM_GATES = ['canary_ceiling', 'sleeve_stand_down', 'fleet_reachable_bound'] as const;
 
 /**
  * TRA-5208 — the wheel-routing ARM state, published where an operator looks.
@@ -8421,7 +8426,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       + ' are bound at the single live `buy_to_open` BROKER-MIRROR seam (`mirrorLiveOptionOpen` in '
       + 'signal-engine.ts) and are denominated in LIVE BROKER ORDERS actually being submitted to '
       + 'Tradier; every other row here is denominated in scan CANDIDATES (`aggregate_cap` in '
-      + 'attempted symbol-level ENTRIES — a third denominator again). ⇒ NEVER grade a mirror-seam '
+      + 'attempted symbol-level ENTRIES — a third denominator again). ⚠ `fleet_reachable_bound` '
+      + 'sits on BOTH seams since TRA-5291 (board ruling a+, card d243464d: A binds ALL live '
+      + 'entries): the OTM admission site records it per scan candidate WITH a `budget` block, the '
+      + 'mirror seam records it per broker order (any sleeve) WITHOUT one — an OTM order therefore '
+      + 'contributes two rows to that gate, so never read its `evaluated` as an order count. '
+      + '⇒ NEVER grade a mirror-seam '
       + 'gate\'s `evaluated` against a scan gate\'s admits. The incident (TRA-4795, 2026-09-25): a '
       + 'defect test written as "`cost_bar` admitted > 0 and `sleeve_stand_down` still 0 ⇒ wiring '
       + 'DEFECT, escalate" measured TRUE against a correctly wired gate — the 178 admitted strikes '

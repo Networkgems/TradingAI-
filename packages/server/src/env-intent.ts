@@ -424,18 +424,20 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
     // resolving from a lever no instrument graded — exactly the class of
     // undeclared lever `env-drift` is blind to.
     key: 'LIVE_OPTION_TEST_AGGREGATE_CAP_USD',
-    intended: '400',
+    intended: '500',
     provenance:
-      'TRA-5279 (Q2). Resolver: resolveLiveOptionTestAggregateCapUsd (option-exec-flag.ts) — code ' +
-      'default AND ceiling are $750 (the board\'s original TRA-3384 "max $750 total"); a stored ' +
-      'value clamps DOWN only. Live bqb1 stores 400. The board-ratified figure is $500 (restore ' +
-      'stamp 5fc18af7, TRA-4988), so the live posture is $100 TIGHTER by a write nobody attributed ' +
-      '— risk-reducing, needs no sign-off (capRatification on /api/health/live-options-fee-slippage ' +
-      'already publishes the mismatch as "Live is TIGHTER"). This row pins the posture IN FORCE: a ' +
-      'silent restore to 500, any raise, or a WIPE (absence resolves to the $750 default — wider ' +
-      'than the ratified 500) is now a named mismatch instead of invisible. Raising it requires a ' +
-      'board card superseding 5fc18af7. ⚠️ SCOPE (TRA-5279 Q1): this cap binds the OTM admission ' +
-      'site only; directional/RV live entries do not consult it.',
+      'TRA-5291 (board ruling a+, card d243464d, answered by local-board 2026-10-07T10:50:33Z, ' +
+      'parent TRA-5282): A binds ALL live option entries AND is restored to the board\'s own ' +
+      'ratified $500 (stamp 5fc18af7, var OPTION_LIVE_TEST_AGGREGATE_CAP_USD_RATIFIED) in the same ' +
+      'change — the card that supersedes the unattributed tightening to 400 TRA-5279 (Q2) pinned ' +
+      'here. Resolver: resolveLiveOptionTestAggregateCapUsd (option-exec-flag.ts) — code default ' +
+      'AND ceiling are $750 (the board\'s original TRA-3384 "max $750 total"); a stored value ' +
+      'clamps DOWN only, so 500 is inside the ceiling. This row pins the posture IN FORCE: a ' +
+      'silent revert to 400 (tighter but un-ruled), any raise, or a WIPE (absence resolves to the ' +
+      '$750 default — wider than ratified) is a named mismatch. Moving it again requires a board ' +
+      'card superseding d243464d. SCOPE (TRA-5291 D1): A is consulted at the shared ' +
+      'mirrorLiveOptionOpen buy_to_open seam for every sleeve (directional/RV/OTM) AND at the OTM ' +
+      'admission site.',
     resolve: (env) => String(resolveLiveOptionTestAggregateCapUsd(env)),
   },
   {
