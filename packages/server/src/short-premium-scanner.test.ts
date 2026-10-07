@@ -13,6 +13,7 @@ import {
   SHORT_PREMIUM_MIN_IV_PERCENTILE,
 } from './short-premium-scanner.js';
 import { MIN_IV_SAMPLES, type IvRankCoverageReading } from './iv-rank-store.js';
+import { isShortPremiumIvFloorArmed, SHORT_PREMIUM_IV_FLOOR_FLAG } from './option-exec-flag.js';
 
 // TRA-1292 — the wiring seam between the warm RV-scanner chain snapshot and the
 // pure short-premium engine, plus the in-memory store backing
@@ -88,18 +89,36 @@ describe('scanShortPremiumFromSnapshot', () => {
     }
   });
 
-  it('stands the scan down with iv_percentile_low when a finite percentile below 50 is passed', () => {
-    const out = scanShortPremiumFromSnapshot(snap(ladder()), CALM_CLOSES, SHORT_PREMIUM_MIN_IV_PERCENTILE - 1);
+  it('ARMED, stands the scan down with iv_percentile_low when a finite percentile below 50 is passed', () => {
+    const out = scanShortPremiumFromSnapshot(snap(ladder()), CALM_CLOSES, SHORT_PREMIUM_MIN_IV_PERCENTILE - 1, {
+      ivFloorArmed: true,
+    });
     expect(out.reason).toBe('iv_percentile_low');
     expect(out.candidates).toHaveLength(0);
     expect(out.ivPercentile).toBe(SHORT_PREMIUM_MIN_IV_PERCENTILE - 1);
   });
 
-  it('passes a percentile exactly AT the floor — the boundary is >=, not > (TRA-5280)', () => {
-    const out = scanShortPremiumFromSnapshot(snap(ladder()), CALM_CLOSES, SHORT_PREMIUM_MIN_IV_PERCENTILE, { now: NOW });
+  it('ARMED, passes a percentile exactly AT the floor — the boundary is >=, not > (TRA-5280)', () => {
+    const out = scanShortPremiumFromSnapshot(snap(ladder()), CALM_CLOSES, SHORT_PREMIUM_MIN_IV_PERCENTILE, {
+      now: NOW,
+      ivFloorArmed: true,
+    });
     expect(out.reason).toBe('ok');
     expect(out.ivPercentile).toBe(SHORT_PREMIUM_MIN_IV_PERCENTILE);
     expect(out.candidates.length).toBeGreaterThan(0);
+  });
+
+  it('TRA-5292: on the DEFAULT env the floor is UNARMED — the same sub-floor percentile does not gate', () => {
+    // The pre-TRA-5292 behaviour of this exact input was iv_percentile_low.
+    // Default env ⇒ ENABLE_SHORT_PREMIUM_IV_FLOOR unset ⇒ the floor binds on
+    // nothing, so the store crossing MIN_IV_SAMPLES cannot change behaviour.
+    const out = scanShortPremiumFromSnapshot(snap(ladder()), CALM_CLOSES, SHORT_PREMIUM_MIN_IV_PERCENTILE - 1, {
+      now: NOW,
+    });
+    expect(out.reason).toBe('ok');
+    expect(out.candidates.length).toBeGreaterThan(0);
+    // The percentile still rides the record — observe-only accrual continues.
+    expect(out.ivPercentile).toBe(SHORT_PREMIUM_MIN_IV_PERCENTILE - 1);
   });
 
   it('defers to observe-only (does not gate) when the IV percentile is unknown', () => {
@@ -185,27 +204,76 @@ describe('IV-rank coverage stamp + rollup (TRA-4917)', () => {
     expect(out.atmIv).toBeNull();
   });
 
-  it('a null percentile still fails OPEN — the diagnostic changes nothing about the gate', () => {
+  it('a null percentile still fails OPEN even ARMED — the diagnostic changes nothing about the gate', () => {
     for (const code of ['no_atm_iv', 'uncovered', 'insufficient_history', 'flat_window'] as const) {
       const out = scanShortPremiumFromSnapshot(
         snap(ladder()),
         CALM_CLOSES,
         reading({ coverage: code, atmIv: code === 'no_atm_iv' ? null : 0.4 }),
-        { now: NOW },
+        { now: NOW, ivFloorArmed: true },
       );
       expect(out.reason).toBe('ok');
       expect(out.candidates.length).toBeGreaterThan(0);
       expect(out.ivPercentile).toBeNull();
       expect(out.ivRankCoverage).toBe(code);
     }
-    // …and a FINITE low percentile stands the scan down.
+    // …and a FINITE low percentile stands the ARMED scan down.
     const low = scanShortPremiumFromSnapshot(
       snap(ladder()),
       CALM_CLOSES,
       reading({ ivRank: 70, ivPercentile: SHORT_PREMIUM_MIN_IV_PERCENTILE - 1, coverage: 'covered' }),
-      { now: NOW },
+      { now: NOW, ivFloorArmed: true },
     );
     expect(low.reason).toBe('iv_percentile_low');
+  });
+
+  it('TRA-5292: a depth-20 FLAT window never gates — in BOTH arm states (stale feed ≠ cheap premium)', () => {
+    // The dangerous case from the finding: the same stale quote repeated fills
+    // the window, computeIvPercentile returns 0 (currentIv == flat value), and
+    // a percentile-keyed floor would read a dead feed as "premium not rich
+    // enough to sell". The floor must treat flat_window as honest-unknown.
+    const flat = reading({
+      ivRank: null, // rank fails open on max <= min, by construction
+      ivPercentile: 0,
+      ivSampleDepth: MIN_IV_SAMPLES,
+      coverage: 'flat_window',
+    });
+    for (const ivFloorArmed of [false, true]) {
+      const out = scanShortPremiumFromSnapshot(snap(ladder()), CALM_CLOSES, flat, { now: NOW, ivFloorArmed });
+      expect(out.reason).toBe('ok');
+      expect(out.candidates.length).toBeGreaterThan(0);
+      expect(out.ivRankCoverage).toBe('flat_window');
+      // The degenerate percentile stays published as a diagnostic.
+      expect(out.ivPercentile).toBe(0);
+    }
+  });
+
+  it('TRA-5292: crossing MIN_IV_SAMPLES produces ZERO behavioural change on the default env', () => {
+    // Depth 19 (insufficient_history, percentile null — live today) vs depth 20
+    // (covered, finite percentile BELOW the floor — the post-crossing worst
+    // case). On the default env both must scan identically: same reason, same
+    // candidate set. This is the pin on "the arm is a decision, not a date".
+    const below = scanShortPremiumFromSnapshot(
+      snap(ladder()),
+      CALM_CLOSES,
+      reading({ ivPercentile: null, ivSampleDepth: MIN_IV_SAMPLES - 1, coverage: 'insufficient_history' }),
+      { now: NOW },
+    );
+    const crossed = scanShortPremiumFromSnapshot(
+      snap(ladder()),
+      CALM_CLOSES,
+      reading({
+        ivRank: 10,
+        ivPercentile: SHORT_PREMIUM_MIN_IV_PERCENTILE - 40,
+        ivSampleDepth: MIN_IV_SAMPLES,
+        coverage: 'covered',
+      }),
+      { now: NOW },
+    );
+    expect(below.reason).toBe('ok');
+    expect(crossed.reason).toBe('ok');
+    expect(crossed.candidates.length).toBe(below.candidates.length);
+    expect(crossed.candidates.map((c) => c.structure)).toEqual(below.candidates.map((c) => c.structure));
   });
 
   it('TRA-5280: the floor must NOT bind on the rank — a sub-floor rank alone never gates', () => {
@@ -294,6 +362,10 @@ describe('IV-rank coverage stamp + rollup (TRA-4917)', () => {
     expect(cov.ivRankFloor).toBe(SHORT_PREMIUM_MIN_IV_PERCENTILE);
     expect(cov.ivPercentileFloor).toBe(SHORT_PREMIUM_MIN_IV_PERCENTILE);
     expect(cov.floorStatistic).toBe('ivPercentile');
+    // TRA-5292 — armed-vs-inert is ON the wire, never inferred from counts.
+    // Default env in this suite ⇒ unarmed, and the lever is named beside it.
+    expect(cov.floorArmed).toBe(false);
+    expect(cov.floorArmEnvVar).toBe('ENABLE_SHORT_PREMIUM_IV_FLOOR');
     expect(cov.gateEvaluable).toBe(1);
     expect(cov.gateInert).toBe(3);
     expect(cov.minSamples).toBe(MIN_IV_SAMPLES);
@@ -414,5 +486,77 @@ describe('IV-rank coverage stamp + rollup (TRA-4917)', () => {
     expect(stale.populated).toBe(false);
     expect(stale.partitionOk).toBeNull();
     expect(stale.lastRecordedAt).toBeNull();
+  });
+});
+
+describe('IV-floor arm (TRA-5292)', () => {
+  beforeEach(() => clearShortPremiumScans());
+
+  const reading = (over: Partial<IvRankCoverageReading> = {}): IvRankCoverageReading => ({
+    ivRank: null,
+    ivPercentile: null,
+    atmIv: 0.4,
+    ivSampleDepth: 3,
+    coverage: 'insufficient_history',
+    ...over,
+  });
+
+  it('the arm is env-resolved, default OFF, and the lever name on the wire is the real one', () => {
+    expect(isShortPremiumIvFloorArmed({})).toBe(false);
+    expect(isShortPremiumIvFloorArmed({ [SHORT_PREMIUM_IV_FLOOR_FLAG]: '' })).toBe(false);
+    expect(isShortPremiumIvFloorArmed({ [SHORT_PREMIUM_IV_FLOOR_FLAG]: '0' })).toBe(false);
+    expect(isShortPremiumIvFloorArmed({ [SHORT_PREMIUM_IV_FLOOR_FLAG]: 'true' })).toBe(true);
+    expect(isShortPremiumIvFloorArmed({ [SHORT_PREMIUM_IV_FLOOR_FLAG]: '1' })).toBe(true);
+    // If someone renames the flag, the published lever must move with it.
+    expect(SHORT_PREMIUM_IV_FLOOR_FLAG).toBe('ENABLE_SHORT_PREMIUM_IV_FLOOR');
+  });
+
+  it('armed-vs-inert is discriminable on the summary wire alone — candidateCount is NOT the witness', () => {
+    // Identical store contents under both arm states: candidateCount reads the
+    // same, which is exactly why it cannot be the discriminator. floorArmed is.
+    const out = scanShortPremiumFromSnapshot(
+      snap(ladder()),
+      CALM_CLOSES,
+      reading({ ivRank: 70, ivPercentile: 70, ivSampleDepth: 240, coverage: 'covered' }),
+      { now: NOW },
+    );
+    recordShortPremiumScan({ ...out, symbol: 'JJJ' }, NOW);
+    const inert = summarizeShortPremiumScans(NOW, false);
+    const armed = summarizeShortPremiumScans(NOW, true);
+    expect(inert.candidateCount).toBe(armed.candidateCount);
+    expect(inert.ivRankCoverage.floorArmed).toBe(false);
+    expect(armed.ivRankCoverage.floorArmed).toBe(true);
+    // Readable even over an EMPTY fold (pre-open, post-TTL): the arm state is
+    // an env fact, not a population statistic.
+    clearShortPremiumScans();
+    const empty = summarizeShortPremiumScans(NOW, true).ivRankCoverage;
+    expect(empty.populated).toBe(false);
+    expect(empty.floorArmed).toBe(true);
+    expect(empty.floorArmEnvVar).toBe(SHORT_PREMIUM_IV_FLOOR_FLAG);
+  });
+
+  it('gateEvaluable excludes flat_window — a degenerate percentile is not an evaluable floor compare', () => {
+    const flat = scanShortPremiumFromSnapshot(
+      snap(ladder()),
+      CALM_CLOSES,
+      reading({ ivPercentile: 0, ivSampleDepth: MIN_IV_SAMPLES, coverage: 'flat_window' }),
+      { now: NOW },
+    );
+    recordShortPremiumScan({ ...flat, symbol: 'KKK' }, NOW);
+    const covered = scanShortPremiumFromSnapshot(
+      snap(ladder()),
+      CALM_CLOSES,
+      reading({ ivRank: 70, ivPercentile: 70, ivSampleDepth: 240, coverage: 'covered' }),
+      { now: NOW },
+    );
+    recordShortPremiumScan({ ...covered, symbol: 'LLL' }, NOW);
+
+    const cov = summarizeShortPremiumScans(NOW).ivRankCoverage;
+    expect(cov.scanCount).toBe(2);
+    expect(cov.byCode.flat_window).toBe(1);
+    // The flat scan's percentile is finite (0) yet it must not count as an
+    // evaluable floor compare — the floor treats flat_window as honest-unknown.
+    expect(cov.gateEvaluable).toBe(1);
+    expect(cov.gateInert).toBe(1);
   });
 });

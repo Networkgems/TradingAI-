@@ -61,6 +61,9 @@ globalThis.fetch = async (url, init) => {
     }
     return json(cfg.deploys);
   }
+  // TRA-5239: the in-flight gate reads the deploy list on EVERY soak-host run. A suite that did not
+  // configure `deploys` is not grading it, so an unconfigured list is an empty (settled) one.
+  if (/\/services\/[^/]+\/deploys/.test(u)) return json([]);
   if (/\/api\/health\/version/.test(u) && cfg.health) return json(cfg.health);
   if (/\/services\/[^/]+$/.test(u)) return json(service);
 

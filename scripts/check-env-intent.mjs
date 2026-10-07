@@ -213,6 +213,14 @@ async function readDurabilityPayload() {
 const flagOn = (raw) =>
   typeof raw === 'string' && ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 
+// Positive-number cap clamped DOWN to a ceiling, else the default (mirrors the
+// resolve bodies of the LIVE_LEARNING_BUDGET_* manifest rows in env-intent.ts).
+const posCap = (raw, ceiling, dflt, floor) => {
+  const n = Number(raw ?? '');
+  const v = typeof raw === 'string' && raw.trim() !== '' && Number.isFinite(n) && n > 0 ? Math.min(n, ceiling) : dflt;
+  return floor ? Math.floor(v) : v;
+};
+
 // One row per manifest lever. `reads` is every env key the resolver consults —
 // a lever can be a function of more than one (the quote guard is), and each one
 // is validated before the resolver runs.
@@ -267,6 +275,41 @@ const STORED_RESOLVERS = {
   ENABLE_OPTION_MAKER_TELEMETRY: {
     reads: ['ENABLE_OPTION_MAKER_TELEMETRY'],
     resolve: (env) => (flagOn(env['ENABLE_OPTION_MAKER_TELEMETRY']) ? 'on' : 'off'),
+  },
+  // option-exec-flag.ts (isShortPremiumIvFloorArmed) — plain `flagOn`; the
+  // TRA-5292 ARM switch for the short-premium elevated-IV percentile floor,
+  // intended 'off' until TRA-5173 releases the floor by decision. Added in the
+  // same train as its manifest row so the checker never reads BLIND on a lever
+  // the manifest grew (the TRA-5295 defect shape).
+  ENABLE_SHORT_PREMIUM_IV_FLOOR: {
+    reads: ['ENABLE_SHORT_PREMIUM_IV_FLOOR'],
+    resolve: (env) => (flagOn(env['ENABLE_SHORT_PREMIUM_IV_FLOOR']) ? 'on' : 'off'),
+  },
+  // TRA-5222 / TRA-5279 — numeric board caps, ported from the manifest rows in
+  // env-intent.ts (post-clamp, as live-learning-budget.ts `capFromEnv` and
+  // option-exec-flag.ts resolveLiveOptionTestAggregateCapUsd resolve them).
+  // Re-verified against the shipped resolver every run by crossCheckAgainstShipped.
+  LIVE_LEARNING_BUDGET_MAX_LOSS_USD: {
+    reads: ['LIVE_LEARNING_BUDGET_MAX_LOSS_USD'],
+    resolve: (env) => String(posCap(env['LIVE_LEARNING_BUDGET_MAX_LOSS_USD'], 1000, 300, false)),
+  },
+  LIVE_LEARNING_BUDGET_PER_OPEN_USD: {
+    reads: ['LIVE_LEARNING_BUDGET_PER_OPEN_USD'],
+    resolve: (env) => String(posCap(env['LIVE_LEARNING_BUDGET_PER_OPEN_USD'], 150, 100, false)),
+  },
+  LIVE_LEARNING_BUDGET_MAX_OPENS: {
+    reads: ['LIVE_LEARNING_BUDGET_MAX_OPENS'],
+    resolve: (env) => String(posCap(env['LIVE_LEARNING_BUDGET_MAX_OPENS'], 60, 40, true)),
+  },
+  // option-exec-flag.ts:1692 — absent/non-numeric/<=0 -> default 750; else min(n, 750).
+  LIVE_OPTION_TEST_AGGREGATE_CAP_USD: {
+    reads: ['LIVE_OPTION_TEST_AGGREGATE_CAP_USD'],
+    resolve: (env) => {
+      const raw = env['LIVE_OPTION_TEST_AGGREGATE_CAP_USD'];
+      if (typeof raw !== 'string') return '750';
+      const n = Number(raw.trim());
+      return String(!Number.isFinite(n) || n <= 0 ? 750 : Math.min(n, 750));
+    },
   },
   // TRA-4801 — index.ts:1243, the CREDENTIAL ROUTER, which is the read with
   // consequences:

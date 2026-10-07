@@ -87,7 +87,7 @@ import {
 } from './option-exec-flag.js';
 import { isOptionMakerTelemetryEnabled } from './option-maker-fill-ledger.js';
 import { isExplorationAllowanceFlagOn } from './directional-exploration-allowance.js';
-import { isWheelIvEntryFilterEnabled } from './option-exec-flag.js';
+import { isShortPremiumIvFloorArmed, isWheelIvEntryFilterEnabled } from './option-exec-flag.js';
 import { resolveExpectancyGateConfig } from '@trading-app/agents';
 
 export interface EnvLeverIntent {
@@ -273,6 +273,26 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
       'sustained across a deploy (TRA-5173).',
     resolve: (env) => (isWheelIvEntryFilterEnabled(env) ? 'on' : 'off'),
     overlayBacked: true,
+  },
+  {
+    // TRA-5292 — the short-premium elevated-IV percentile floor's ARM switch.
+    // Unlike the two fail-closed consumers above, the scanner's floor is
+    // fail-open — but before this lever it was a hard-coded const that would
+    // have SELF-ARMED the first session the IV store crossed MIN_IV_SAMPLES
+    // (= 20; late bound 2026-10-29, earlier if anything seeds the store),
+    // gating 100% of scans on a date rather than a decision and before its own
+    // TRA-5173 PASS bar (depth >= 20 sustained across a deploy) could be
+    // evaluated. Registering it here grades the posture: `on` without the
+    // paired manifest edit means someone armed the floor outside the TRA-5173
+    // release decision.
+    key: 'ENABLE_SHORT_PREMIUM_IV_FLOOR',
+    intended: 'off',
+    provenance:
+      'code default, off (TRA-5292; observe-only forward sample accrues either way). The floor ' +
+      'MUST stay unarmed until TRA-5173 passes its depth>=20-sustained-across-a-deploy grade and ' +
+      'releases it by decision; armed state is published on /api/health/short-premium ' +
+      '(ivRankCoverage.floorArmed) so armed-vs-inert never has to be inferred from candidateCount.',
+    resolve: (env) => (isShortPremiumIvFloorArmed(env) ? 'on' : 'off'),
   },
   {
     key: 'ENABLE_OPTION_LIVE_RV_LONG',

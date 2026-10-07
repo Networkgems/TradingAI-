@@ -110,6 +110,9 @@
 //                       This is the seventh override. Like --override-hold it must name a
 //                       ticket, because a second train needs an owner who will answer for it.
 //                       TRA-4535.
+//   --force-concurrent-deploy="<TRA-####> reason"  deploy while another deploy of this service is
+//                       still IN FLIGHT (exit 12). Must name a ticket: superseding a build that has
+//                       not booted yet is a decision somebody answers for. TRA-5239.
 //   --dry-run           print the gate decision and the intended call, POST nothing.
 //   --help, -h          print usage and exit 0 WITHOUT deploying. Added by TRA-4420: on
 //                       2026-09-09 this flag was unrecognised, therefore ignored, and the
@@ -140,6 +143,13 @@
 //      sign-off is unmet or DECLINED (the PASSENGER problem: 9abf167f shipped unsigned as the
 //      parent of an unrelated fix, 2026-10-07). Also exit 11 when that registry is unreadable,
 //      unparseable, or names a sha this checkout cannot place (BLIND). Soak host only.
+//  12  REFUSED — another deploy of this service is IN FLIGHT (any status Render has not settled:
+//      created/queued/build_in_progress/update_in_progress/pre_deploy_in_progress, or one this
+//      script does not recognise), or the deploy list cannot be read (BLIND). Gate 4 grades the
+//      target against what is serving NOW, so two individually-forward deploys can compose into a
+//      rollback (00:31/00:43/00:44Z 2026-10-07: c3a2d337 -> 365d94ec, then a same-SHA c3a2d337
+//      env-apply 37s later; Render happened to cancel it). Applies to same-SHA env-apply too.
+//      Override: --force-concurrent-deploy="<TRA-####> reason". Soak host only. TRA-5239.
 //      Override: --override-signoff="<TRA-####> reason". TRA-5265.
 
 import { spawnSync } from 'node:child_process';
@@ -780,6 +790,55 @@ export function cadenceBlocks(verdict) {
 // that says why it could not wait.
 export function cadenceOverrideNamesTicket(reason) {
   return /\bTRA-\d+\b/i.test(String(reason ?? ''));
+}
+
+// -- The IN-FLIGHT gate (TRA-5239) -- exit 12 ---------------------------------
+// Every other gate grades ONE deploy against the instant it runs. Two deploys created minutes
+// apart are each individually forward and can still compose into a rollback: the second boots
+// last. So this gate looks at the OTHER deploys. A status is only "settled" if we KNOW it is, so
+// an unrecognised status blocks (fail closed) rather than being waved through.
+//   CLEAR      every row in the list is settled                  => proceed
+//   IN_FLIGHT  at least one row is not settled                    => REFUSE
+//   BLIND      the list was not read                              => REFUSE
+export const INFLIGHT_SETTLED_STATUSES = new Set([
+  'live',
+  'deactivated',
+  'build_failed',
+  'update_failed',
+  'pre_deploy_failed',
+  'canceled',
+]);
+
+export function inflightState({ history }) {
+  if (!history || history.error || !Array.isArray(history.rows)) {
+    return { verdict: 'BLIND', inflight: [], why: history?.error ?? 'the deploy history was not read' };
+  }
+  const inflight = history.rows.map(cadenceRow).filter(r => !INFLIGHT_SETTLED_STATUSES.has(r.status));
+  return { verdict: inflight.length ? 'IN_FLIGHT' : 'CLEAR', inflight, why: null };
+}
+
+export function inflightBlocks(verdict) {
+  return verdict === 'IN_FLIGHT' || verdict === 'BLIND';
+}
+
+export const inflightOverrideNamesTicket = cadenceOverrideNamesTicket;
+
+export function renderInflightRefusal(state, target) {
+  const head =
+    state.verdict === 'BLIND'
+      ? `[render-redeploy] REFUSED: the deploy list could not be read, so whether another deploy is IN FLIGHT cannot be shown - BLIND and fails closed (TRA-5239).\n  why: ${state.why}`
+      : `[render-redeploy] REFUSED: ${state.inflight.length} other deploy(s) of this service are still IN FLIGHT - TRA-5239.\n` +
+        state.inflight
+          .map(r => `    - ${cadenceAt(r)}  ${r.id}  ${r.commit ? r.commit.slice(0, 8) : '(no commit)'}  [${r.status}]`)
+          .join('\n');
+  return (
+    `${head}\n` +
+    `  target  : ${target?.sha ?? '(unresolved)'}\n` +
+    `  Gate 4 grades a deploy against what is serving NOW. A second deploy created before the first has\n` +
+    `  booted can land LAST, and the composition can be a rollback no per-deploy gate sees. Wait for the\n` +
+    `  in-flight deploy to settle (live / canceled / failed), or, if superseding it is the point, re-run with\n` +
+    `  --force-concurrent-deploy="<TRA-####> why" (it must name a ticket and is echoed on the record).`
+  );
 }
 
 const cadenceAt = r => (Number.isFinite(r.t) ? new Date(r.t).toISOString() : '(undated)');
@@ -1998,6 +2057,10 @@ const HOLD_OVERRIDE_REASON = valOf('--override-hold');
 const HAS_HOLD_OVERRIDE = argv.some(a => a === '--override-hold' || a.startsWith('--override-hold='));
 const CADENCE_OVERRIDE_REASON = valOf('--override-cadence');
 const HAS_CADENCE_OVERRIDE = argv.some(a => a === '--override-cadence' || a.startsWith('--override-cadence='));
+const CONCURRENT_OVERRIDE_REASON = valOf('--force-concurrent-deploy');
+const HAS_CONCURRENT_OVERRIDE = argv.some(
+  a => a === '--force-concurrent-deploy' || a.startsWith('--force-concurrent-deploy='),
+);
 const SIGNOFF_OVERRIDE_REASON = valOf('--override-signoff');
 const HAS_SIGNOFF_OVERRIDE = argv.some(a => a === '--override-signoff' || a.startsWith('--override-signoff='));
 const WANTS_TIP = has('--tip');
@@ -2106,6 +2169,12 @@ export const KNOWN_ARGS = [
     value: 'reason',
     arg: '"<TRA-####> reason"',
     help: 'deploy one more commit advance into a window whose CADENCE CEILING is spent or unreadable (exit 10). Must name a ticket.',
+  },
+  {
+    flag: '--force-concurrent-deploy',
+    value: 'reason',
+    arg: '"<TRA-####> reason"',
+    help: 'deploy while another deploy of this service is still IN FLIGHT, or its list is unreadable (exit 12). Must name a ticket.',
   },
   {
     flag: '--override-signoff',
@@ -2309,6 +2378,7 @@ export function renderUsage() {
     'EXIT CODES',
     '  0  deploy triggered (or --dry-run allowed, or --help printed)',
     '  2  usage / unknown argument / auth / API error — this run created NO deploy',
+    '  12 REFUSED - another deploy is IN FLIGHT (or the deploy list is unreadable), no override',
     '  4  REFUSED — RTH freeze on the soak host, no override',
     '  5  REFUSED — a dated embargo covers this instant, no override',
     '  6  REFUSED — the deploy would carry a HELD COMMIT, or cannot be proven not to',
@@ -3054,6 +3124,37 @@ async function main() {
         `  This is commit advance #${cadence.advances.length + 1} in the window. Tell the freeze owner on ` +
         `${cadence.ceiling.ticket.split(' ')[0]} BEFORE the box boots, not after.`,
     );
+  }
+
+  // -- The IN-FLIGHT gate (TRA-5239) -- exit 12 ---------------------------------
+  // One page, newest first: an unsettled deploy is by construction among the newest rows.
+  // Same-SHA env-apply is NOT exempt - it is the sharp edge (the duplicate 00:44Z c3a2d337).
+  const inflight = isSoakHost
+    ? inflightState({ history: await fetchDeployHistory(service.id, Infinity) })
+    : { verdict: 'CLEAR', inflight: [], why: null };
+
+  if (inflightBlocks(inflight.verdict) && !HAS_CONCURRENT_OVERRIDE) {
+    console.error(renderInflightRefusal(inflight, target));
+    process.exit(12);
+  }
+
+  if (inflightBlocks(inflight.verdict) && HAS_CONCURRENT_OVERRIDE) {
+    if (!CONCURRENT_OVERRIDE_REASON || !CONCURRENT_OVERRIDE_REASON.trim()) {
+      fail(2, '--force-concurrent-deploy requires a non-empty reason, e.g. --force-concurrent-deploy="TRA-5239 superseding the stuck build".');
+    }
+    if (!inflightOverrideNamesTicket(CONCURRENT_OVERRIDE_REASON)) {
+      fail(2, `--force-concurrent-deploy must NAME a ticket (a TRA-#### token). Got: "${CONCURRENT_OVERRIDE_REASON}".`);
+    }
+    console.error(
+      `[render-redeploy] WARNING: OVERRIDING THE IN-FLIGHT GATE at ${new Date().toISOString()} - TRA-5239.\n` +
+        `  override: --force-concurrent-deploy="${CONCURRENT_OVERRIDE_REASON}"\n` +
+        `  verdict : ${inflight.verdict}${inflight.why ? ` - ${inflight.why}` : ''}\n` +
+        inflight.inflight.map(r => `  in flight: ${r.id} ${r.commit ? r.commit.slice(0, 8) : '(no commit)'} [${r.status}]\n`).join('') +
+        `  Whichever deploy boots LAST wins. Re-read /api/health/version after both settle.`,
+    );
+  }
+  if (isSoakHost) {
+    console.log(`inflight: ${inflight.verdict === 'CLEAR' ? 'no other deploy in flight' : `${inflight.verdict} - OVERRIDDEN (--force-concurrent-deploy)`}`);
   }
 
   if (isSoakHost && embargo && !HAS_EMBARGO_OVERRIDE) {

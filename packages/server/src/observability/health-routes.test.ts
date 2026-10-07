@@ -74,6 +74,7 @@ import {
   OPTION_WHEEL_ROUTING_FLAG,
   OPTION_SHORT_PREMIUM_SCANNER_FLAG,
   WHEEL_IV_FILTER_FLAG,
+  SHORT_PREMIUM_IV_FLOOR_FLAG,
 } from '../option-exec-flag.js';
 // TRA-5284 — the fleet open-position publication is graded against the SAME
 // provider + resolver pair the order seam calls, imported as symbols so the
@@ -9351,5 +9352,51 @@ describe('TRA-5208 wheel-routing arm state on /wheel-promotion-gate and /short-p
     expect(body.enabled).toBe(false);
     expect(body.enabledSource).toBe('off');
     expect(body.wheelRouting).toMatchObject({ armed: false, scannerEnabled: false });
+  });
+});
+
+// TRA-5292 — the elevated-IV percentile floor's ARM state must be readable on
+// the no-auth route ITSELF, beside `floorStatistic`/`ivPercentileFloor`: an
+// inert floor and an armed floor dropping every row read identically in
+// `candidateCount`, so the discriminator has to be on the wire, not inferred.
+// (The rollup math is covered in short-premium-scanner.test.ts; this pins the
+// route carrying it, env-resolved at serve time.)
+describe('TRA-5292 IV-floor arm state on /short-premium', () => {
+  const serve = async (): Promise<Record<string, unknown>> => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    await routes.get('/api/health/short-premium')![0]!({ query: {} }, res);
+    return res.body as Record<string, unknown>;
+  };
+
+  beforeEach(() => {
+    delete process.env[SHORT_PREMIUM_IV_FLOOR_FLAG];
+  });
+
+  afterEach(() => {
+    delete process.env[SHORT_PREMIUM_IV_FLOOR_FLAG];
+  });
+
+  it('default env reads INERT: floorArmed false, with the lever name and floor value beside it', async () => {
+    const cov = (await serve()).ivRankCoverage as Record<string, unknown>;
+    expect(cov.floorArmed).toBe(false);
+    expect(cov.floorArmEnvVar).toBe(SHORT_PREMIUM_IV_FLOOR_FLAG);
+    // The TRA-4917/TRA-5280 wire identities ride along untouched.
+    expect(cov.ivPercentileFloor).toBe(50);
+    expect(cov.ivRankFloor).toBe(50);
+    expect(cov.floorStatistic).toBe('ivPercentile');
+  });
+
+  it('an env arm flips floorArmed true on the same read — candidateCount is never the witness', async () => {
+    process.env[SHORT_PREMIUM_IV_FLOOR_FLAG] = '1';
+    const cov = (await serve()).ivRankCoverage as Record<string, unknown>;
+    expect(cov.floorArmed).toBe(true);
+    expect(cov.floorArmEnvVar).toBe(SHORT_PREMIUM_IV_FLOOR_FLAG);
   });
 });

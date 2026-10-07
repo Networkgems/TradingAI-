@@ -478,6 +478,27 @@ cohort is an artefact of the LIST route, which carries **no `blockedBy` key at a
 sweep keyed on it would strip live dependencies off correctly-parked work across the whole
 board. Repairs are **per-row and authored**, by the owner named in the report.
 
+### In-flight gate (TRA-5239) — `render-redeploy.mjs` exit 12
+
+Every gate in `render-redeploy.mjs` grades **one** deploy against the instant it runs, so none of
+them can see two deploys that are each forward and together a rollback. 2026-10-07 00:31/00:43/00:44Z:
+`c3a2d337` live → `365d94ec` (tip, +7 commits) → a same-SHA `c3a2d337` env-apply created 37 s later.
+Gate 4 correctly called the third "not a rollback" (`c3a2d337` *was* serving at 00:44:06Z). **Render
+cancelling the duplicate was luck, not a guarantee we own** — had it booted last, bqb1 would have
+rolled back 7 commits with `--allow-rollback` never consulted.
+
+Exit 12 refuses when **any** deploy of the service is unsettled (`created`, `queued`,
+`build_in_progress`, `update_in_progress`, `pre_deploy_in_progress`, or a status this script does not
+know) or when the deploy list is unreadable (BLIND, fails closed). A **same-SHA env-apply is not
+exempt** — it is the sharp edge. Override: `--force-concurrent-deploy="TRA-#### why"` (must name a
+ticket, echoed on the record). Soak host only. Wait for the in-flight deploy to go `live`/`canceled`
+instead; do not trigger a second one "to be safe". Grade: `pnpm check:inflight-gate` (replays the real
+triple; runs in `pretest`).
+
+⚠️ **Scope.** This gate lives inside the script, so it covers the **API** deploy surface only. A
+dashboard-initiated deploy runs it (and every other gate) not at all — see TRA-5239 items 1–3 for
+detection, per-member permissions and the env-lever census; those are still open.
+
 ### RTH deploy FREEZE (TRA-1996) — bqb1 deploys are REFUSED 13:25–20:00Z Mon–Fri
 
 The "deploy by SHA" rule above bounds *what* ships; this rule bounds *when*. Even a
