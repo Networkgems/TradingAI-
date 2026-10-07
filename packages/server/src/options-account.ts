@@ -31,6 +31,7 @@ import type {
   OptionProfitFloorPdtHold,
   OptionMarkProvenance,
   OptionExecBidUnquotedReason,
+  OptionExitBookedBasis,
 } from '@trading-app/shared';
 import {
   EXIT_CHANDELIER_ATR_MULT,
@@ -217,9 +218,6 @@ import {
   marketableMarkPerShare,
   marketableUnrealizedUsd,
   positionSide,
-  // TRA-3502 — the exact per-position half-spread, for the exit sites whose reference
-  // price is a TRIGGER LEVEL rather than the quote's own mid. See `demoExitFillPrice`.
-  halfSpreadFracFromQuoteForSide,
 } from './marketable-open-mtm.js';
 // TRA-3502 — quote-coverage ledger, APPLICATION seam. The `resolution` seam lives in
 // `signal-engine.ts::refreshOptionMarks` and is the one with a failing state while the
@@ -8057,6 +8055,19 @@ export class PaperOptionsAccount {
           ...(exitSlippageUsd !== null
             ? { exitSlippageUsd, exitSlippageBasis: 'quote_cross' as const }
             : {}),
+          // TRA-5274 — WHICH basis the demo book booked this close's final fill
+          // at (`crossable_bid` vs a model vs the bare mark), beside the fill
+          // itself. Absent on live rows (their booking is the broker's real
+          // fill) and on rows closed by a pre-stamp build. The crossed fold
+          // censuses this as `bookedExitBasis`, which is what makes "the booked
+          // column is now crossable" checkable live instead of asserted.
+          ...(position.exitBookedBasis !== undefined
+            ? { exitBookedBasis: position.exitBookedBasis }
+            : {}),
+          ...(typeof position.exitBookedPremium === 'number'
+            && Number.isFinite(position.exitBookedPremium)
+            ? { exitBookedPremium: position.exitBookedPremium }
+            : {}),
           // TRA-4317 (AC1) — the profit-lock release level as the rule computed
           // it at the firing tick, beside the provenance of the mark it read.
           // Absent stays absent: only a profit-lock fire writes one, and ⛔ a
@@ -9129,27 +9140,12 @@ export class PaperOptionsAccount {
    */
   private demoExitFillPrice(price: number, opt: OptionPosition): number {
     if ((opt.mode ?? 'demo') !== 'demo') return price;
+    const side = positionSide(opt);
+    const quote = this.liveQuoteFor(opt);
+    // TRA-3502 instrumentation — unchanged semantics: the seam is graded only
+    // while the marketable flag is armed, so its coverage counters keep meaning
+    // "what the marketable valuation would have resolved".
     if (this.marketableOpenMtm.enabled) {
-      const side = positionSide(opt);
-      // TRA-3502 — the live two-sided quote, when this tick served one, SUPERSEDES the
-      // modeled `h`. Two branches, because this method's `price` is NOT always the mid:
-      // `checkExits`' structural and TP1 sites pass the current `mark`, but the SL /
-      // trailing site passes the TRIGGER LEVEL (`stopLossPremium` /
-      // `trailingStopPremium` / the chandelier), and `closeOption` passes
-      // `opt.currentPremium`.
-      //
-      //   • price IS this quote's own mid  ⇒ the exact bid (long) / ask (short). This is
-      //     the "per-position own quote" measurement: 100% tail coverage, 1.00× charged,
-      //     $0.00 mean abs error on the quote-bearing rows.
-      //   • price is a TRIGGER LEVEL       ⇒ apply the quote's MEASURED half-spread
-      //     fraction to that level. Substituting the raw bid here would be a different
-      //     change entirely: a row whose mark gapped to $0.10 under a $0.50 stop would
-      //     book $0.09 instead of $0.43, which is not "thread the quote in", it is
-      //     re-deciding what price a stop fills at. The measured fraction is still an
-      //     exact per-position number — it just replaces the CONSTANT, not the level.
-      //
-      // Both branches are quote-served; the fallback below is the only `h` path left.
-      const quote = this.liveQuoteFor(opt);
       markMarketableQuoteSeamWired('application');
       recordMarketableQuoteResolution({
         seam: 'application',
@@ -9157,33 +9153,73 @@ export class PaperOptionsAccount {
         mode: 'demo', // the live early-return above makes this exhaustive
         now: Date.now(),
       });
-      if (quote != null) {
-        const quoteMid = (quote.bid + quote.ask) / 2;
-        // Same cached chain row on the same pass ⇒ exact equality is the norm; the
-        // epsilon only absorbs float round-trips, never a genuinely different level.
-        const priceIsQuoteMid = Math.abs(price - quoteMid) <= 1e-9 * Math.max(1, Math.abs(quoteMid));
-        const measured = halfSpreadFracFromQuoteForSide(
-          { bid: quote.bid, ask: quote.ask, mark: quoteMid },
-          side,
-        );
-        if (priceIsQuoteMid) {
-          return marketableMarkPerShare({
-            midPerShare: price,
-            side,
-            quote: { bid: quote.bid, ask: quote.ask },
-          });
-        }
-        if (measured != null) {
-          return marketableMarkPerShare({ midPerShare: price, side, halfSpreadFrac: measured });
-        }
+    }
+    // TRA-5274 — BOOK AT THE CROSSABLE QUOTE, unconditionally, when this tick
+    // served a usable book: a long exit sells the BID, a covered short buys
+    // back the ASK. This supersedes both models below and is NOT gated on
+    // `marketableOpenMtm.enabled` — that flag arms a VALUATION basis for the
+    // open book, while this is the price a close actually transacts at.
+    //
+    // Measured 30 days of `single_leg_directional` closes (2026-09-07..10-06,
+    // TRA-5248 review): booked-at-the-mark read +$20.20 while the same rows
+    // at prices that could actually cross read −$248.00 — the entire reported
+    // edge was the booking basis. 20 of the 23 closes were chandelier
+    // "scratches" at avgR −0.0075 that are losses after the spread.
+    //
+    // ⚠ This deliberately replaces the former TRA-3502 trigger-level branch
+    // (measured half-spread applied to the LEVEL): a stop whose book has
+    // gapped below its level books the bid the market is actually showing,
+    // not a modelled fill at a price nothing bids. That is the issue's
+    // "a stop level is one that can be hit" — the booked number and the
+    // TRA-4674 crossed column now agree by construction on every quoted row.
+    //
+    // `liveQuoteFor` admits `bid === 0` (a one-sided book is still a book for
+    // a BUY-back); a zero bid is NOT a crossable sell, so a long falls through
+    // to the models rather than booking $0.00 off a book with no buyer.
+    if (quote != null) {
+      const crossable = side === 'long' ? quote.bid : quote.ask;
+      if (Number.isFinite(crossable) && crossable > 0) {
+        this.stampExitBookedBasis(opt, side === 'long' ? 'crossable_bid' : 'crossable_ask', crossable);
+        return crossable;
       }
-      return marketableMarkPerShare({
+    }
+    if (this.marketableOpenMtm.enabled) {
+      // No usable book this tick — the TRA-2233 modeled half-spread haircut on
+      // the reference premium (the quote-served branches it used to carry are
+      // superseded by the crossable booking above).
+      const fill = marketableMarkPerShare({
         midPerShare: price,
         side,
         halfSpreadFrac: this.marketableOpenMtm.halfSpreadFrac,
       });
+      this.stampExitBookedBasis(opt, 'modelled_half_spread', fill);
+      return fill;
     }
-    return price * (1 - this.demoSlippagePct);
+    const fill = price * (1 - this.demoSlippagePct);
+    // `mark_unquoted` is the honest label for the pct-0 default: the booked
+    // number IS the reference premium, and nothing crossable checked it.
+    this.stampExitBookedBasis(
+      opt,
+      this.demoSlippagePct > 0 ? 'modelled_slippage_pct' : 'mark_unquoted',
+      fill,
+    );
+    return fill;
+  }
+
+  /**
+   * TRA-5274 — record WHICH basis the demo book's last exit fill booked at, on
+   * the position, so `queueJournalClose` can fold it onto the close row. Re-
+   * stamped per fill on purpose (a TP1 partial's stamp is superseded by the
+   * final slice's): the close row's label describes the fill that ENDED the
+   * row. Observe-only; nothing reads it back into a level or an order.
+   */
+  private stampExitBookedBasis(
+    opt: OptionPosition,
+    basis: OptionExitBookedBasis,
+    fill: number,
+  ): void {
+    opt.exitBookedBasis = basis;
+    opt.exitBookedPremium = fill;
   }
 
   /**
@@ -11605,6 +11641,22 @@ export class PaperOptionsAccount {
         at: Date.now(),
       };
 
+      // TRA-5274 — the CROSSABLE evaluation premium for the threshold reads
+      // below. Every row past the `coveredWrite` gate above is LONG the
+      // premium, so the price a close can actually transact at is the BID;
+      // when this tick served a usable one the premium-space thresholds (TP1,
+      // take-profit-early, the hard/catastrophic stop, the trailing stop) are
+      // evaluated against it, so a stop level is one that can be HIT and a
+      // profit target is one that can be BANKED. A dark tick keeps the mid
+      // `mark` read — with no bid there is no crossable basis, and a dark
+      // quote must not disarm a stop (same posture as TRA-4285's profit-lock
+      // leg, which already evaluated on this basis; this extends it to the
+      // rest of the premium-space family). The underlying-space chandelier
+      // triggers on the UNDERLYING and is untouched — its defect was the
+      // booking basis, which `demoExitFillPrice` now fixes at the fill.
+      const crossablePremium =
+        quoteAtFire !== null && quoteAtFire.bid > 0 ? quoteAtFire.bid : mark;
+
       // OTM positions follow the OTM_RISK_PARAMS trail/partial schedule;
       // RV positions follow RV_RISK_PARAMS (TRA-191); ATM legacy paths stay on
       // OPTIONS_* constants so existing behaviour is unchanged for those tickets.
@@ -12494,7 +12546,10 @@ export class PaperOptionsAccount {
       // lifecycle. Rows with 2+ contracts are untouched.
       const tp1FullExit = this.tp1FullExit1Lot && opt.contractsRemaining === 1;
       if (
-        otmStopTrigger === null && !opt.tp1Hit && isArmedThreshold(opt.tp1Premium) && mark >= opt.tp1Premium
+        // TRA-5274 — the target is read on the CROSSABLE bid: a TP1 the mid
+        // touches but the bid does not is a profit that cannot be banked, and
+        // booking it used to turn the unbankable half-spread into reported edge.
+        otmStopTrigger === null && !opt.tp1Hit && isArmedThreshold(opt.tp1Premium) && crossablePremium >= opt.tp1Premium
         && (opt.contractsRemaining > 1 || tp1FullExit)
       ) {
         const exitContracts = tp1FullExit
@@ -12743,7 +12798,11 @@ export class PaperOptionsAccount {
           const tp = takeProfitEarlyDecision({
             side: 'buy',
             entry: opt.premiumPaid,
-            currentPrice: mark,
+            // TRA-5274 — captured profit is measured on the CROSSABLE bid: a
+            // capture fraction the mid reaches but the bid does not is profit
+            // the close cannot bank. The fire stamp below keeps recording BOTH
+            // (`markAtFire` + `execBidAtFire`), so the basis stays auditable.
+            currentPrice: crossablePremium,
             maxProfitPrice: opt.tp1Premium,
             captureFrac: exitRisk.takeProfitEarlyCaptureFrac,
           });
@@ -13091,7 +13150,12 @@ export class PaperOptionsAccount {
         // rule reads the same way at both trigger sites and a future non-finite
         // value (a `null` from disk ToNumber-coerces to 0 in `mark <= null`
         // too) cannot quietly change which way this branch falls.
-        const slBreached = isArmedThreshold(opt.stopLossPremium) && mark <= opt.stopLossPremium;
+        // TRA-5274 — breached when the CROSSABLE bid is through the level: the
+        // bid is the price a stop actually fills at, and a stop the mid
+        // respects while the bid sits below it is a stop that has already been
+        // hit in every sense that costs money. Dark tick ⇒ the mid read, as
+        // before (a dark quote must not disarm a stop).
+        const slBreached = isArmedThreshold(opt.stopLossPremium) && crossablePremium <= opt.stopLossPremium;
         if (!inOpeningRange && opt.slHeldInOpeningRange) {
           // The window has closed for this row; the latch is consumed either
           // way. If the stop is still through, the branch below fires it on
@@ -13147,7 +13211,8 @@ export class PaperOptionsAccount {
           // policy that lets them breathe while still bounding a day's loss.
           const dayKey = etDateKey(Date.now());
           const catastrophicLevel = opt.premiumPaid * (1 - liveStopPolicy!.catastrophicLossPct);
-          const catastrophic = opt.premiumPaid > 0 && mark <= catastrophicLevel;
+          // TRA-5274 — same crossable read as `slBreached` above.
+          const catastrophic = opt.premiumPaid > 0 && crossablePremium <= catastrophicLevel;
           if (dailyClosePhase.inCloseWindow) {
             exitPremium = opt.stopLossPremium;
             exitKind = 'sl';
@@ -13214,7 +13279,8 @@ export class PaperOptionsAccount {
         // bookkeeping yet — the 3/3 live dumps were all `chandelier`, and a
         // premium trail only arms after the position is up `trailActivatePct`
         // — recorded as a residual on the ticket.
-        } else if (opt.trailingActive && isArmedThreshold(opt.trailingStopPremium) && mark <= opt.trailingStopPremium) {
+        // TRA-5274 — the trail, like the hard stop, is read on the crossable bid.
+        } else if (opt.trailingActive && isArmedThreshold(opt.trailingStopPremium) && crossablePremium <= opt.trailingStopPremium) {
           // TRA-4020 — (R2) freshness-scoped window; (R4) the refusal is counted.
           if (premiumTrailInOpeningRange) {
             noteOpeningRangeSuppression(opt, mark, Date.now());

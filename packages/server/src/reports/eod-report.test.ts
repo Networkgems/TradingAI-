@@ -752,6 +752,9 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
     unpriced: 1,
     unpricedReasons: { structure_not_crossable: 1 as number },
     unmeasuredDeltaBackstop: 0,
+    // TRA-5274 — the booked-basis census; the one closed bull_put row carries
+    // no stamp (multi-leg import), so it folds under `absent`.
+    bookedExitBasis: { absent: 1 as number },
     crossedPnlUsd: null,
     bookedPnlUsdPriced: null,
     spreadDragUsd: null,

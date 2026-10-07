@@ -3865,6 +3865,19 @@ export type OptionBasisWriter =
   | 'operator_restatement'
   | 'desk_lot_split';
 
+/**
+ * TRA-5274 — the basis a demo exit fill was BOOKED at. See
+ * {@link OptionPosition.exitBookedBasis} for the per-value semantics; the
+ * discriminating pair is `crossable_*` (a real book side this close could
+ * transact at) vs everything else (a model or the bare mark).
+ */
+export type OptionExitBookedBasis =
+  | 'crossable_bid'
+  | 'crossable_ask'
+  | 'modelled_half_spread'
+  | 'modelled_slippage_pct'
+  | 'mark_unquoted';
+
 export interface OptionPosition {
   id: string;
   symbol: string;
@@ -3999,6 +4012,31 @@ export interface OptionPosition {
    * price the book will be EXITED at must come from the tick's own quote.
    */
   lastUsableQuote?: { bid: number; ask: number; at: number };
+  /**
+   * TRA-5274 — WHICH price the demo book's LAST exit fill was booked at, stamped
+   * by `demoExitFillPrice` every time it resolves a fill and folded onto the
+   * journal close row as `exitBookedBasis`. The close row therefore carries the
+   * FINAL closing slice's basis.
+   *
+   *   • `crossable_bid` / `crossable_ask` — this tick served a usable two-sided
+   *     quote and the fill booked at the side a close actually transacts on
+   *     (long sells the bid; a covered short buys back the ask).
+   *   • `modelled_half_spread`  — no usable quote this tick; the TRA-2233
+   *     marketable model priced the fill off the reference premium.
+   *   • `modelled_slippage_pct` — no usable quote and the marketable flag is
+   *     dark; the legacy TRA-374 haircut applied with a non-zero pct.
+   *   • `mark_unquoted`         — no usable quote, no model armed: the fill IS
+   *     the reference premium (the pre-TRA-5274 behaviour on every close). The
+   *     booked number on such a row is a mark, not a crossable price, and the
+   *     crossed column cannot check it.
+   *
+   * Demo rows only — a live close books the broker's real fill and needs no
+   * booking-basis label (TRA-2819's `pnlBasis: 'broker-fill'` covers it).
+   * Observe-only; nothing reads it back into a level or an order.
+   */
+  exitBookedBasis?: OptionExitBookedBasis;
+  /** TRA-5274 — the per-share premium that fill booked at, beside its basis. */
+  exitBookedPremium?: number;
   /**
    * TRA-4317 (AC1) — the profit-lock release level at the tick the give-back
    * rule fired, stamped beside `exitMarkProvenance` (first fire only, same

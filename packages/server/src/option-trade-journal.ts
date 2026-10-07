@@ -2,7 +2,7 @@ import { readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { deriveEntrySpreadPct } from '@trading-app/shared';
-import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp, OptionExitQuote, OptionMarkProvenance, OptionPeakStampBasis, OptionProfitLockFire, OptionTakeProfitEarlyFire, OptionChandelierFire } from '@trading-app/shared';
+import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp, OptionExitBookedBasis, OptionExitQuote, OptionMarkProvenance, OptionPeakStampBasis, OptionProfitLockFire, OptionTakeProfitEarlyFire, OptionChandelierFire } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
 import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-throttle-sizing.js';
@@ -626,6 +626,17 @@ export interface OptionTradeJournalClose {
    */
   exitSlippageBasis?: 'quote_cross' | 'broker_fill';
   /**
+   * TRA-5274 — WHICH basis the demo book booked this close's final fill at,
+   * with the fill itself beside it. See
+   * {@link OptionTradeJournalRecord.exitBookedBasis}. Absent on live rows and
+   * on close paths that ran no demo fill resolution (expiry settles, broker
+   * reconciles) — absence is the verdict "no demo booking basis applies here",
+   * ⛔ never defaulted.
+   */
+  exitBookedBasis?: OptionExitBookedBasis;
+  /** TRA-5274 — the per-share premium that fill booked at. */
+  exitBookedPremium?: number;
+  /**
    * TRA-4997 — THE EXIT-SIDE BOOK, captured at the close seam that EVERY close
    * path funnels through (`queueJournalClose`), not just the exit cascade's fire
    * site that {@link markProvenance} covers. This is what turns `crossedPnlUsd`
@@ -980,6 +991,17 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
    * backfilled.
    */
   exitQuote?: OptionExitQuote;
+  /**
+   * TRA-5274 — WHICH basis the demo book BOOKED this row's final closing fill
+   * at, folded from the CLOSE row. `crossable_bid`/`crossable_ask` = the fill
+   * was a real book side this close could transact on, so `realizedPnlUsd` and
+   * `crossedPnlUsd` agree by construction; `mark_unquoted` = the booked number
+   * is a mark nothing crossable checked. Absent on live rows (broker fills)
+   * and on rows closed by a pre-stamp build. ⛔ Never backfilled.
+   */
+  exitBookedBasis?: OptionExitBookedBasis;
+  /** TRA-5274 — the per-share premium that fill booked at, beside its basis. */
+  exitBookedPremium?: number;
   /** TRA-3945 — broker order id of the realising close, folded from the CLOSE row. */
   brokerOrderId?: string | number | null;
   /**
@@ -2936,10 +2958,14 @@ function foldLine(
       // would price the new close's cross against a book from the wrong event.
       exitSlippageBasis: _exitSlippageBasis,
       exitQuote: _exitQuote,
+      // TRA-5274 — the replaced close's booked-basis stamp goes with it for the
+      // same reason as its book: it labels a fill that was never this close's.
+      exitBookedBasis: _exitBookedBasis,
+      exitBookedPremium: _exitBookedPremium,
       ...kept
     } = rec;
     void _pnlBasis; void _feesUsd; void _entryFillPremium; void _exitFillPremium; void _before; void _exitSlippage; void _entryBasis; void _contractsAtClose;
-    void _exitSlippageBasis; void _exitQuote;
+    void _exitSlippageBasis; void _exitQuote; void _exitBookedBasis; void _exitBookedPremium;
     map.set(line.id, {
       ...kept,
       outcome: c.outcome,
@@ -2953,6 +2979,11 @@ function foldLine(
       // the replaced close's (dropped in the destructure above).
       ...(c.exitSlippageBasis !== undefined ? { exitSlippageBasis: c.exitSlippageBasis } : {}),
       ...(c.exitQuote !== undefined ? { exitQuote: { ...c.exitQuote } } : {}),
+      // TRA-5274 — the superseding close's own booked-basis stamp, or absent.
+      ...(c.exitBookedBasis !== undefined ? { exitBookedBasis: c.exitBookedBasis } : {}),
+      ...(typeof c.exitBookedPremium === 'number' && Number.isFinite(c.exitBookedPremium)
+        ? { exitBookedPremium: c.exitBookedPremium }
+        : {}),
       brokerOrderId: c.brokerOrderId ?? null,
       // TRA-4031 — the superseding close names its own basis, or the field is
       // absent (never the replaced close's).
@@ -2989,6 +3020,15 @@ function foldLine(
       ? { exitSlippageBasis: line.close.exitSlippageBasis }
       : {}),
     ...(line.close.exitQuote !== undefined ? { exitQuote: { ...line.close.exitQuote } } : {}),
+    // TRA-5274 — the booked-basis label and its fill; absent stays absent (a
+    // live row, or a pre-stamp close).
+    ...(line.close.exitBookedBasis !== undefined
+      ? { exitBookedBasis: line.close.exitBookedBasis }
+      : {}),
+    ...(typeof line.close.exitBookedPremium === 'number'
+      && Number.isFinite(line.close.exitBookedPremium)
+      ? { exitBookedPremium: line.close.exitBookedPremium }
+      : {}),
     // TRA-3945 — the dedupe handle for the evaluation window; absent stays absent.
     ...(line.close.brokerOrderId !== undefined ? { brokerOrderId: line.close.brokerOrderId } : {}),
     // TRA-4031 — the basis the exit rule consumed; absent stays absent (a

@@ -58,6 +58,13 @@ export interface CrossedPricingRow {
    * crossed number on a row that already priced is bit-for-bit unchanged.
    */
   exitQuote?: OptionExitQuote | null;
+  /**
+   * TRA-5274 — which basis the demo book BOOKED the closing fill at, off the
+   * journal record. Censused on the fold as `bookedExitBasis` (absent rows
+   * under `'absent'`), so "the booked column is crossable now" is a count a
+   * reader can check, not a claim.
+   */
+  exitBookedBasis?: string;
 }
 
 /**
@@ -289,6 +296,18 @@ export interface CrossedFoldCells {
    * regardless of which {@link CrossedUnpricedReason} won.
    */
   unmeasuredDeltaBackstop: number;
+  /**
+   * TRA-5274 — census of the booked exit-fill basis over ALL closed rows in
+   * this fold (not only the priced ones): how many closes BOOKED at a crossable
+   * book side (`crossable_bid`/`crossable_ask`) vs a model
+   * (`modelled_half_spread`/`modelled_slippage_pct`) vs the bare mark
+   * (`mark_unquoted`), with rows carrying no stamp — live rows, pre-stamp
+   * builds — under `absent`. Values sum to the fold's closed-row count. This is
+   * the forward check on the TRA-5274 booking-basis change: a healthy session
+   * is carried by `crossable_bid`, and a `mark_unquoted` row is exactly a row
+   * the crossed column will not be able to price.
+   */
+  bookedExitBasis: Partial<Record<string, number>>;
   /** Σ crossed P&L over the priced rows; null (never 0) when priced === 0. */
   crossedPnlUsd: number | null;
   /** Σ `realizedPnlUsd` over the SAME priced rows — the matched booked column. */
@@ -316,9 +335,15 @@ export function foldCrossedCells(closedRows: CrossedPricingRow[]): CrossedFoldCe
   let flat = 0;
   let pricedByFireTickQuote = 0;
   let unmeasuredDeltaBackstop = 0;
+  const bookedExitBasis: Partial<Record<string, number>> = {};
   const lastKnownAges: number[] = [];
   const crossedRs: number[] = [];
   for (const row of closedRows) {
+    // TRA-5274 — basis census over EVERY closed row, priced or not: an
+    // unpriceable row's booking basis is part of what a reader needs to grade
+    // the booked headline.
+    const basisKey = row.exitBookedBasis ?? 'absent';
+    bookedExitBasis[basisKey] = (bookedExitBasis[basisKey] ?? 0) + 1;
     const p = priceCrossedRow(row);
     if (p.crossedPnlUsd === null) {
       const reason = p.crossedUnpriced ?? 'exit_quote_missing';
@@ -356,6 +381,7 @@ export function foldCrossedCells(closedRows: CrossedPricingRow[]): CrossedFoldCe
     unpriced: closedRows.length - priced,
     unpricedReasons: reasons,
     unmeasuredDeltaBackstop,
+    bookedExitBasis,
     crossedPnlUsd,
     bookedPnlUsdPriced,
     spreadDragUsd:
