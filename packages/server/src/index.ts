@@ -1,4 +1,5 @@
 import express from 'express';
+import { isStockMarketOpen } from '@trading-app/shared'; // AI ideas background refresh
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 // TRA-2599 — `stat` left with the storage diagnostic; see `storage-health.ts`.
@@ -7918,8 +7919,13 @@ app.get('/api/health/short-squeeze/capture/partition/:date', async (req, res) =>
 // the result to the C5 panel's `OptionsIdeasFeed`. Returns a clearly-labelled
 // non-live response (HTTP 200, `source: 'non_live'`) when no Anthropic key or
 // Tradier creds are configured, so the panel always renders coherently.
-app.get('/api/options/ideas', requireAuth, async (_req, res) => {
-  const ctx = await userCtx(res);
+/**
+ * The AI Options Ideas cycle: build the feed for one user and run the two
+ * (flag-gated, DEMO-only) auto-entry paths over it. Shared by the panel's GET
+ * route and the background refresher below, so an idea is auto-entered the same
+ * way whether or not anyone has the panel open.
+ */
+async function runOptionsIdeasCycle(ctx: UserContext) {
   const settings = getSettings(ctx.username);
   const env = settings.liveTradierEnvOptions ?? 'sandbox';
   // TRA-3112 — MARKET-DATA builder, deliberately. `buildIdeasFeed` only ever calls
@@ -7989,8 +7995,63 @@ app.get('/api/options/ideas', requireAuth, async (_req, res) => {
     });
     if (summary.submitted > 0) broadcastEngineState(ctx);
   }
+  return feed;
+}
+
+app.get('/api/options/ideas', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  const feed = await runOptionsIdeasCycle(ctx);
   res.json(feed);
 });
+
+// AI Ideas BACKGROUND REFRESH — the two auto-entry paths above only ran when
+// someone opened the AI Ideas panel (the GET route was their only caller), so
+// "auto" quietly meant "auto while the tab is open". When armed, this runs the
+// SAME cycle for one named book on a timer during regular trading hours.
+// Entries stay exactly as gated as the click path: paper/demo only, defined
+// risk, POP floor, max-loss cap, kill switch, demo auto-trade ON — and only if
+// ENABLE_OPTIONS_PROPOSAL_RAIL + ENABLE_OPTION_DEMO_AUTO_CONFIRM (or
+// ENABLE_OPTION_IDEAS_AUTO_EXECUTE) are on. Each run spends LLM budget, so the
+// interval floor is 15 minutes and the monthly cap (OPTIONS_IDEAS_MONTHLY_USD_CAP)
+// still applies inside buildIdeasFeed.
+//   ENABLE_OPTION_IDEAS_BACKGROUND_REFRESH=1
+//   OPTION_IDEAS_REFRESH_OWNER=<username>          (required — the book to run for)
+//   OPTION_IDEAS_REFRESH_MINUTES=60                (default 60, min 15)
+{
+  const on = ['1', 'true', 'yes', 'on'].includes(String(process.env['ENABLE_OPTION_IDEAS_BACKGROUND_REFRESH'] ?? '').trim().toLowerCase());
+  const owner = String(process.env['OPTION_IDEAS_REFRESH_OWNER'] ?? '').trim();
+  const minutesRaw = Number(process.env['OPTION_IDEAS_REFRESH_MINUTES'] ?? '60');
+  const minutes = Number.isFinite(minutesRaw) ? Math.max(15, minutesRaw) : 60;
+  if (on && owner) {
+    let running = false;
+    const tick = async (): Promise<void> => {
+      if (running || !isStockMarketOpen()) return;
+      running = true;
+      try {
+        const wasNew = !tryGetUserContext(owner);
+        const ctx = await ensureUserContext(owner);
+        if (wasNew) attachBroadcastHandlers(ctx);
+        const feed = await runOptionsIdeasCycle(ctx);
+        log.info('AI ideas background refresh ran', {
+          owner,
+          ideas: Array.isArray(feed.ideas) ? feed.ideas.length : null,
+          source: (feed as { source?: string }).source ?? null,
+        });
+      } catch (err) {
+        log.warn('AI ideas background refresh failed', {
+          owner,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        running = false;
+      }
+    };
+    setInterval(() => { void tick(); }, minutes * 60_000).unref();
+    log.info('AI ideas background refresh ARMED', { owner, minutes });
+  } else if (on) {
+    log.warn('ENABLE_OPTION_IDEAS_BACKGROUND_REFRESH is on but OPTION_IDEAS_REFRESH_OWNER is unset — not armed');
+  }
+}
 
 // TRA-845 — Layer-4 options alert engine. Diffs the last two recorded chain
 // partitions (new strikes/expiries + big IV moves) and scans the authed user's
