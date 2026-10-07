@@ -57,6 +57,7 @@ const cfg = {
   confirmations: Number(process.env.WATCHDOG_CONFIRMATIONS || 3),
   cooldownSec: Number(process.env.WATCHDOG_COOLDOWN_SEC || 1800),
   httpTimeoutMs: 8000,
+  dbStaleSec: Number(process.env.WATCHDOG_DB_STALE_SEC || 3600),      // TRA-5252 fallback witness
   pgPort: Number(process.env.WATCHDOG_PG_PORT || 54329),
   pgModule: process.env.WATCHDOG_PG_MODULE ||
     path.join(process.env.LOCALAPPDATA || '', 'npm-cache', '_npx', '43414d9b790239bb', 'node_modules', 'pg'),
@@ -95,12 +96,16 @@ function listenerPid() {
   const n = parseInt((r.stdout || '').trim(), 10); return Number.isFinite(n) ? n : 0;
 }
 
-function classify(probe, pid) {
+function classify(probe, pid, db) {
   if (!pid) return { outcome: 'port_not_listening', detail: 'no listener on :' + cfg.port };
   if (probe.error === 'timeout') return { outcome: 'http_unresponsive', detail: `probe route timed out after ${cfg.httpTimeoutMs}ms while pid ${pid} holds the port` };
   if (probe.error) return { outcome: 'http_unresponsive', detail: 'probe route error ' + probe.error };
-  if (probe.status !== 200 || !probe.json || !probe.json.tickProbeInstalled || !probe.json.timers || !probe.json.timers.length)
+  if (probe.status !== 200 || !probe.json || !probe.json.tickProbeInstalled || !probe.json.timers || !probe.json.timers.length) {
+    // TRA-5252: a probe failure must degrade the watchdog, not disarm it. Fall back to the DB witness.
+    if (db && Number.isFinite(db.ageSec) && db.ageSec > cfg.dbStaleSec)
+      return { outcome: 'db_stale_probe_absent', detail: `no tick probe (HTTP ${probe.status}) and newest heartbeat_run is ${db.ageSec}s old (> ${cfg.dbStaleSec}s)` };
     return { outcome: 'tick_probe_absent', detail: `HTTP ${probe.status}; server has no (or empty) tick probe -- NOT MEASURED` };
+  }
   const worst = Math.max(...probe.json.timers.map(t => t.secondsSinceLastFire == null ? Infinity : t.secondsSinceLastFire));
   const bootAgeSec = (Date.now() - Date.parse(probe.json.bootAt)) / 1000;
   if (worst === Infinity && bootAgeSec < cfg.tickStaleSec) return { outcome: 'ok', detail: `booted ${Math.round(bootAgeSec)}s ago; no tick yet (inside stale window)` };
@@ -112,10 +117,10 @@ function classify(probe, pid) {
   const pid = listenerPid();
   const probe = pid ? await getJson('/api/health/scheduler-ticks') : {};
   const db = await dbWitness();
-  const { outcome, detail } = classify(probe, pid);
+  const { outcome, detail } = classify(probe, pid, db);
 
   let prev = {}; try { prev = JSON.parse(fs.readFileSync(STATE, 'utf8')); } catch {}
-  const bad = outcome === 'tick_stalled' || outcome === 'http_unresponsive';
+  const bad = outcome === 'tick_stalled' || outcome === 'http_unresponsive' || outcome === 'db_stale_probe_absent';
   const badSince = bad ? (prev.badOutcome === outcome && prev.badSince ? prev.badSince : nowIso()) : null;
   const badRuns = bad ? ((prev.badOutcome === outcome ? prev.badRuns : 0) || 0) + 1 : 0;
   const badForSec = badSince ? Math.round((Date.now() - Date.parse(badSince)) / 1000) : 0;

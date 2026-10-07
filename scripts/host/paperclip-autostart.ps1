@@ -147,7 +147,11 @@ $argLine = ($CmdArgs | ForEach-Object { '"' + $_ + '"' }) -join ' '
 # from NODE_OPTIONS by the probe itself so agent children do not inherit it).
 $Probe = Join-Path $Root 'paperclip-tick-probe.cjs'
 if (Test-Path $Probe) {
-  $env:NODE_OPTIONS = (($env:NODE_OPTIONS + ' --require "' + $Probe + '"')).Trim()
+  # TRA-5252: Node's NODE_OPTIONS parser treats a backslash inside quotes as an escape, so
+  # the Windows path arrived with every separator eaten (Cannot find module, probe never
+  # loaded, watchdog read tick_probe_absent every cycle). Forward slashes survive it.
+  $ProbeOpt = $Probe.Replace('\', '/')
+  $env:NODE_OPTIONS = (($env:NODE_OPTIONS + ' --require "' + $ProbeOpt + '"')).Trim()
   Write-Log 'INFO' "tick probe preloaded: $Probe"
 } else {
   Write-Log 'WARN' "tick probe NOT found at $Probe -- starting without it (watchdog will read tick_probe_absent)"
