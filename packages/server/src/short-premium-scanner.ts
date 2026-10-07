@@ -11,6 +11,9 @@ import {
   type IvRankCoverageCode,
   type IvRankCoverageReading,
 } from './iv-rank-store.js';
+// TRA-5292 — the floor's ARM switch. Off (default) the floor gates nothing at
+// any store depth, so crossing MIN_IV_SAMPLES cannot change behaviour by itself.
+import { isShortPremiumIvFloorArmed, SHORT_PREMIUM_IV_FLOOR_FLAG } from './option-exec-flag.js';
 // TRA-5176 — every recorded scan also folds into the DURABLE per-session
 // arrival ledger (the dated series TRA-5173 item 2 grades on). The in-memory
 // store below stays exactly what it was: a live snapshot.
@@ -37,11 +40,15 @@ import { recordShortPremiumArrival } from './short-premium-arrival-ledger.js';
 // statistics over 366 days, so one vol spike sets the denominator for a year).
 // The rank is RETIRED as a gate statistic and kept only as a published
 // diagnostic. A FINITE percentile below the floor stands the scan down here
-// with a discriminating `reason`; an unknown percentile (thin IV store on a
-// fresh demo, TRA-1114) is allowed to surface OBSERVE-ONLY candidates so the
-// forward sample can accrue while the store warms — the >= 50 floor is
-// re-asserted as a hard LIVE-promotion gate, not an observe gate. Live promotion
-// stays gated on TRA-382 regardless.
+// with a discriminating `reason` — but ONLY while the floor is ARMED
+// (TRA-5292: env ENABLE_SHORT_PREMIUM_IV_FLOOR, default OFF, so crossing the
+// store's MIN_IV_SAMPLES depth is behaviour-neutral until TRA-5173 releases
+// the floor by decision), and NEVER on a `flat_window` (a degenerate window is
+// a stale-feed signature, honest-unknown to the floor). An unknown percentile
+// (thin IV store on a fresh demo, TRA-1114) is allowed to surface OBSERVE-ONLY
+// candidates so the forward sample can accrue while the store warms — the
+// >= 50 floor is re-asserted as a hard LIVE-promotion gate, not an observe
+// gate. Live promotion stays gated on TRA-382 regardless.
 //
 // ⚠️ TRA-4917 — MEASURED on bqb1 (live SHA 66a8a1ab40cc, 2026-09-25T17:25Z), that
 // floor was INERT: `ivRank` was null on 164/164 published rows, so `ivrank_low`
@@ -62,8 +69,25 @@ import { recordShortPremiumArrival } from './short-premium-arrival-ledger.js';
  * The elevated-IV floor (mirrors the engine default) — the desk's sell gate.
  * Keys on the trailing-window IV PERCENTILE since TRA-5280; the same `>= 50`
  * value the retired rank floor carried, applied to the more robust statistic.
+ *
+ * TRA-5292 — this VALUE binds only while the floor is ARMED
+ * ({@link isShortPremiumIvFloorArmed}, env `ENABLE_SHORT_PREMIUM_IV_FLOOR`,
+ * default OFF). Unarmed, the first depth-20 session would otherwise have
+ * started gating 100% of scans on a date rather than a decision — before the
+ * TRA-5173 PASS bar (depth >= 20 sustained across a deploy) could be evaluated.
  */
 export const SHORT_PREMIUM_MIN_IV_PERCENTILE = 50;
+
+/**
+ * TRA-5292 — server-side scan options: the engine options plus the floor-arm
+ * test seam. Callers normally omit `ivFloorArmed` and the scan resolves it from
+ * the env each pass, so an env write (plus the redeploy that applies it) is the
+ * release path and no code change re-arms the floor.
+ */
+export interface ShortPremiumScanOptions extends ShortPremiumScannerOptions {
+  /** Overrides the env-resolved arm state (tests). Default: env-resolved. */
+  ivFloorArmed?: boolean;
+}
 
 /** Why a scan produced (or did not produce) structures — surfaced for diagnosis. */
 export type ShortPremiumScanReason =
@@ -152,13 +176,22 @@ export function scanShortPremiumFromSnapshot(
   snap: ShortPremiumSnapshotInput,
   dailyCloses: readonly number[],
   ivRankInput: ShortPremiumIvRankInput,
-  options: ShortPremiumScannerOptions = {},
+  options: ShortPremiumScanOptions = {},
   lookbackDays = 20,
 ): ShortPremiumScanResult {
   const symbol = snap.symbol.trim().toUpperCase();
   const minIvPercentile = options.minIvPercentile ?? SHORT_PREMIUM_MIN_IV_PERCENTILE;
   const reading = normalizeIvRankInput(ivRankInput);
   const ivPercentile = reading.ivPercentile;
+  // TRA-5292 — the floor binds only when ARMED, and never on a `flat_window`:
+  // a flat 20-sample window is a stale-feed signature (the same quote repeated),
+  // not a statement about premium richness. Its percentile is defined (0 when
+  // currentIv <= the flat value) where the rank's is not, so without this
+  // carve-out the floor would book a dead feed as "premium not rich enough to
+  // sell" the instant the store crossed MIN_IV_SAMPLES. Honest-unknown ⇒ fail
+  // open, matching the rank's `max <= min ⇒ null` behaviour.
+  const floorArmed = options.ivFloorArmed ?? isShortPremiumIvFloorArmed();
+  const floorBinds = floorArmed && reading.coverage !== 'flat_window';
   const base: Omit<ShortPremiumScanResult, 'candidates' | 'reason'> = {
     symbol,
     spot: Number.isFinite(snap.spot) && snap.spot > 0 ? snap.spot : null,
@@ -177,8 +210,11 @@ export function scanShortPremiumFromSnapshot(
 
   // Faithful desk gate (TRA-5280: percentile-keyed; the rank must NOT bind): a
   // KNOWN percentile below the floor stands the scan down. An unknown
-  // percentile (null) defers to observe-only so the forward sample can accrue.
+  // percentile (null) defers to observe-only so the forward sample can accrue
+  // (the TRA-5170 fail-open branch) — and since TRA-5292 the comparison runs
+  // only while `floorBinds` (armed + not a flat window) holds at all.
   if (
+    floorBinds &&
     typeof ivPercentile === 'number' &&
     Number.isFinite(ivPercentile) &&
     ivPercentile < minIvPercentile
@@ -191,9 +227,14 @@ export function scanShortPremiumFromSnapshot(
     return { ...base, candidates: [], reason: 'no_realized_vol' };
   }
 
+  // TRA-5292 — the engine re-applies the same strict `ivPercentile <
+  // minIvPercentile` compare internally, so when the floor must not bind the
+  // engine gets a floor of 0: `ivPercentile` is always >= 0, so `p < 0` never
+  // fires and nothing gates, while the true percentile still flows through to
+  // the candidate echoes unchanged.
   const candidates = findShortPremiumStructures(snap.rows, base.spot, realizedVol, {
     ...options,
-    minIvPercentile,
+    minIvPercentile: floorBinds ? minIvPercentile : 0,
     ivPercentile,
   });
   return {
@@ -352,12 +393,26 @@ export interface ShortPremiumIvRankCoverageRollup {
   /** TRA-5280 — which statistic the floor compares against. Self-describing wire. */
   floorStatistic: 'ivPercentile';
   /**
-   * Scans where the floor comparison actually evaluated — finite `ivPercentile`
-   * since TRA-5280. (No longer == `ivRankMeasured`: the percentile is defined on
-   * a flat window where the rank is not, so this can exceed it.)
+   * TRA-5292 — whether the floor is ARMED (env `ENABLE_SHORT_PREMIUM_IV_FLOOR`,
+   * resolved at fold time; default OFF). `false` means the floor gates NOTHING
+   * at any store depth. This is the armed-vs-inert discriminator the TRA-4917
+   * incident family keeps missing: `candidateCount` reads identically when the
+   * floor is inert and when it is armed and dropping everything, so the arm
+   * state must be ON the wire, not inferred. Published even on an empty fold —
+   * it is an env fact, not a population statistic.
+   */
+  floorArmed: boolean;
+  /** TRA-5292 — the env lever that arms the floor, named so the release path needs no code read. */
+  floorArmEnvVar: string;
+  /**
+   * Scans where the floor comparison is evaluable — finite `ivPercentile`
+   * since TRA-5280, EXCLUDING `flat_window` scans since TRA-5292 (a degenerate
+   * window's percentile is defined but is a stale-feed signature, so the floor
+   * treats it as honest-unknown and never gates on it). Counts "would the
+   * armed floor compare here"; whether it actually binds is `floorArmed`.
    */
   gateEvaluable: number;
-  /** Scans where the floor was INERT because the percentile was null (fails open, by design). */
+  /** Scans where the floor comparison cannot run: null percentile, or a `flat_window` (both fail open, by design). */
   gateInert: number;
   /** The sample floor a trailing window must clear before any rank is emitted. */
   minSamples: number;
@@ -408,22 +463,25 @@ function zeroByCode(): Record<IvRankCoverageCode, number> {
   return out;
 }
 
-/** Build the TRA-4917 rollup off the rendered views. Pure. */
+/** Build the TRA-4917 rollup off the rendered views. Pure beyond the injected arm state. */
 function buildIvRankCoverageRollup(
   views: readonly ShortPremiumScanView[],
+  floorArmed: boolean,
 ): ShortPremiumIvRankCoverageRollup {
   const finite = (v: number | null): boolean => v != null && Number.isFinite(v);
   const byCode = zeroByCode();
   const unknownByCode = zeroByCode();
   let ivRankMeasured = 0;
-  let ivPercentileMeasured = 0;
+  let gateEvaluable = 0;
   let candidateCount = 0;
   let candidateIvRankMeasured = 0;
   for (const v of views) {
     byCode[v.ivRankCoverage] = (byCode[v.ivRankCoverage] ?? 0) + 1;
     if (finite(v.ivRank)) ivRankMeasured++;
     else unknownByCode[v.ivRankCoverage] = (unknownByCode[v.ivRankCoverage] ?? 0) + 1;
-    if (finite(v.ivPercentile)) ivPercentileMeasured++;
+    // TRA-5292 — a flat window's percentile is finite but the floor treats it
+    // as honest-unknown, so it is NOT evaluable (mirrors the scan gate).
+    if (finite(v.ivPercentile) && v.ivRankCoverage !== 'flat_window') gateEvaluable++;
     candidateCount += v.candidates.length;
     for (const c of v.candidates) if (finite(c.ivRank)) candidateIvRankMeasured++;
   }
@@ -477,8 +535,10 @@ function buildIvRankCoverageRollup(
     ivRankFloor: SHORT_PREMIUM_MIN_IV_PERCENTILE,
     ivPercentileFloor: SHORT_PREMIUM_MIN_IV_PERCENTILE,
     floorStatistic: 'ivPercentile',
-    gateEvaluable: ivPercentileMeasured,
-    gateInert: scanCount - ivPercentileMeasured,
+    floorArmed,
+    floorArmEnvVar: SHORT_PREMIUM_IV_FLOOR_FLAG,
+    gateEvaluable,
+    gateInert: scanCount - gateEvaluable,
     minSamples: MIN_IV_SAMPLES,
     partitionOk: populated ? mismatches.length === 0 : null,
     partitionMismatch: !populated
@@ -495,7 +555,12 @@ function buildIvRankCoverageRollup(
  * expected-value-per-risk first), then by symbol for stability. Pure beyond the
  * injected clock.
  */
-export function summarizeShortPremiumScans(now: number = Date.now()): ShortPremiumScansSummary {
+export function summarizeShortPremiumScans(
+  now: number = Date.now(),
+  // TRA-5292 — resolved here (not inside the pure rollup builder) so the arm
+  // state on the wire is the same read the scan gate would make this instant.
+  floorArmed: boolean = isShortPremiumIvFloorArmed(),
+): ShortPremiumScansSummary {
   const views: Array<{ view: ShortPremiumScanView; topScore: number }> = [];
   for (const [key, entry] of store) {
     if (now - entry.recordedAt >= STORE_TTL_MS) {
@@ -553,7 +618,7 @@ export function summarizeShortPremiumScans(now: number = Date.now()): ShortPremi
   return {
     symbolCount: scans.length,
     candidateCount: scans.reduce((acc, s) => acc + s.candidateCount, 0),
-    ivRankCoverage: buildIvRankCoverageRollup(scans),
+    ivRankCoverage: buildIvRankCoverageRollup(scans, floorArmed),
     reasonCounts,
     scans,
   };

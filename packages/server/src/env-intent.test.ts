@@ -155,6 +155,22 @@ describe('summarizeEnvIntent (TRA-4474)', () => {
     expect(s.mismatches).toEqual(['ENABLE_OPTION_LIVE_RV_LONG']);
   });
 
+  it('TRA-5292: the short-premium IV-floor arm is graded — absent is a matching off, armed is a named mismatch', () => {
+    // The floor must stay unarmed until TRA-5173 releases it by decision, so
+    // an `on` found on the host without the paired manifest edit is the event
+    // this row exists to catch.
+    const s = graded(RULED_PROD_ENV);
+    expect(s.levers.find((l) => l.key === 'ENABLE_SHORT_PREMIUM_IV_FLOOR')).toMatchObject({
+      present: false,
+      effective: 'off',
+      intended: 'off',
+      matches: true,
+    });
+    const armed = graded({ ...RULED_PROD_ENV, ENABLE_SHORT_PREMIUM_IV_FLOOR: 'true' });
+    expect(armed.ok).toBe(false);
+    expect(armed.mismatches).toEqual(['ENABLE_SHORT_PREMIUM_IV_FLOOR']);
+  });
+
   // This assertion has now run THREE ways. Until 2026-09-22 it graded a wipe of
   // the TRA-2877 standing arm; TRA-4750 stood the sleeve down and it graded a
   // silent RE-ARM; card 6b82a9e7 on TRA-3401 (2026-09-24) executed the TRA-4750

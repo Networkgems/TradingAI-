@@ -1017,6 +1017,34 @@ export function isOptionShortPremiumScannerEnabled(env: NodeJS.ProcessEnv = proc
 }
 
 // --------------------------------------------------------------------------
+// TRA-5292 (rides TRA-1292's scanner; the TRA-5173 release lever) — the ARM
+// switch for the short-premium elevated-IV percentile floor.
+//
+// The floor value itself is `SHORT_PREMIUM_MIN_IV_PERCENTILE = 50` in
+// short-premium-scanner.ts. Before this flag existed the floor was non-binding
+// only because the statistic was null below MIN_IV_SAMPLES (= 20) — so the
+// first session the IV store crossed depth 20 the floor would have started
+// gating 100% of scans on a DATE, not a decision, and before its own TRA-5173
+// PASS bar (depth >= 20 sustained ACROSS a deploy) could even be evaluated.
+//
+// OFF (default/absent) ⇒ the floor gates NOTHING at any store depth: scans and
+// candidates still carry `ivPercentile`, the forward sample keeps accruing,
+// and crossing MIN_IV_SAMPLES changes zero behaviour. ON ⇒ a finite
+// ivPercentile below the floor stands the scan down (`iv_percentile_low`).
+// TRA-5173 arms this explicitly when its grade passes; until then it stays
+// off, and the armed state is published on GET /api/health/short-premium
+// (`ivRankCoverage.floorArmed`) so armed-vs-inert is readable without
+// inferring from candidateCount.
+// --------------------------------------------------------------------------
+
+export const SHORT_PREMIUM_IV_FLOOR_FLAG = 'ENABLE_SHORT_PREMIUM_IV_FLOOR';
+
+/** True iff the short-premium elevated-IV percentile floor is ARMED (gates). */
+export function isShortPremiumIvFloorArmed(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[SHORT_PREMIUM_IV_FLOOR_FLAG]);
+}
+
+// --------------------------------------------------------------------------
 // TRA-4570/4626 (landed by TRA-4705) — observe-only SWING signal scanner
 // (post-earnings IV crush, momentum breakout IV lag, panic reversal, ranked by
 // the fusion engine) surfaced on `EngineState.swingSignals` / the Swing tab.
