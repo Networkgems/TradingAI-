@@ -6741,6 +6741,8 @@ export interface EodReport {
     engineOptionsPnl?: number;
     brokerPnl?: number | null;
     brokerEvidenceSource?: 'sidecar' | 'fifo_row' | 'sidecar_quiet' | null;
+    /** TRA-5270 — on `tradier-balance` cells: graded against broker realized, or why not. */
+    balanceGrade?: 'graded' | 'ungraded_fifo_basis' | 'ungraded_no_broker_figure';
     detail: string;
     at: string;
   };

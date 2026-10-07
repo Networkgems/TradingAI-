@@ -22,6 +22,7 @@ import { describe, expect, it } from 'vitest';
 import {
   auditLiveCellSource,
   auditStampFromStoredBlock,
+  balanceGradeCoverage,
   brokerFigureFromHeader,
   classifyCellPnlSource,
   decideLiveCellSourceDisposition,
@@ -235,101 +236,174 @@ describe('a broker-tagged cell whose figure its own header contradicts', () => {
 
 // ── TRA-5270: a tradier-balance cell whose header AGREES with the figure but both are off the broker ──
 
-describe('TRA-5270 — a flat-book tradier-balance cell off broker realized', () => {
-  // 2026-07-01 / 07-08, live, read before the TRA-5149 forced backfill: the header
-  // and the rendered figure agreed with each other (so `broker_figure_overwritten`
-  // could not fire) while broker realized was +74.30 / +168.15 away.
+describe('TRA-5270 — a tradier-balance cell off sidecar-backed broker realized', () => {
+  const SIDECAR = (realizedUsd: number): BrokerDayEvidence => ({ known: true, realizedUsd, source: 'sidecar' });
+  const balanceCell = (date: string, rendered: number, broker: BrokerDayEvidence) =>
+    cell({
+      reportDate: date,
+      pnlSource: 'tradier-balance',
+      combinedPnl: rendered,
+      optionsPnl: 0,
+      // The row's own header agrees with its figure — the only thing the old arm checked.
+      markdown: tra359Header(date, '468.58', '2026-06-30', '510.76', (rendered >= 0 ? '+' : '') + rendered.toFixed(2)),
+      broker,
+    });
+
+  // 2026-07-01 / 07-08, live, read before the TRA-5149 forced backfill.
   const LIVE = [
     { date: '2026-07-01', rendered: -42.18, broker: -116.48, gap: 74.3 },
     { date: '2026-07-08', rendered: 61.91, broker: -106.24, gap: 168.15 },
   ] as const;
 
   for (const row of LIVE) {
-    it(`flags ${row.date} — renders ${row.rendered}, broker realized ${row.broker}`, () => {
-      const stated = (row.rendered >= 0 ? '+' : '') + row.rendered.toFixed(2);
-      const v = auditLiveCellSource(
-        cell({
-          reportDate: row.date,
-          pnlSource: 'tradier-balance',
-          combinedPnl: row.rendered,
-          optionsPnl: 0,
-          openPositionCount: 0,
-          markdown: tra359Header(row.date, '468.58', '2026-06-30', '510.76', stated),
-          broker: { known: true, realizedUsd: row.broker },
-        }),
-      );
+    it(`flags ${row.date} — renders ${row.rendered}, broker realized ${row.broker}, with the gap in the verdict`, () => {
+      const v = auditLiveCellSource(balanceCell(row.date, row.rendered, SIDECAR(row.broker)));
       expect(v.status).toBe('balance_cell_off_broker_realized');
       expect(v.brokerPnl).toBe(row.broker);
-      expect(v.detail).toContain(`${row.gap.toFixed(2)}`);
+      expect(v.balanceGrade).toBe('graded');
+      expect(v.detail).toContain(row.gap.toFixed(2));
       expect(isUnreconciled(v)).toBe(true);
     });
   }
 
-  it('does NOT flag a flat-book cell that ties to broker realized', () => {
-    const v = auditLiveCellSource(
-      cell({
-        pnlSource: 'tradier-balance',
-        combinedPnl: -116.48,
-        openPositionCount: 0,
-        markdown: tra359Header('2026-07-01', '468.58', '2026-06-30', '585.06', '-116.48'),
-        broker: { known: true, realizedUsd: -116.48 },
-      }),
-    );
+  it('does NOT flag a cell that ties to broker realized, and says it was graded', () => {
+    const v = auditLiveCellSource(balanceCell('2026-07-01', -116.48, SIDECAR(-116.48)));
     expect(v.status).toBe('ok');
+    expect(v.balanceGrade).toBe('graded');
+    expect(v.detail).toContain('Ties to broker realized');
   });
 
-  it('does NOT flag a cell carrying open positions (balance delta includes unrealized) — and says it was not graded', () => {
+  it('own tolerance: a $1.16 cross-measure gap is noise, a $6.81 gap is not (not the 0.011 self-consistency bar)', () => {
+    expect(auditLiveCellSource(balanceCell('2026-08-28', -57.4, SIDECAR(-56.24))).status).toBe('ok');
+    expect(auditLiveCellSource(balanceCell('2026-08-25', 7.57, SIDECAR(0.76))).status).toBe('balance_cell_off_broker_realized');
+  });
+
+  it('is NOT gated on open-position count: the live 2026-08-05 row (openPositionCount 0) is graded and flags', () => {
+    const v = auditLiveCellSource(balanceCell('2026-08-05', -240.64, SIDECAR(-427.11)));
+    expect(v.status).toBe('balance_cell_off_broker_realized');
+  });
+
+  it('a fifo_row basis is UNGRADED — a reconstructed 0.00 is an absence, not a broker zero', () => {
     const v = auditLiveCellSource(
-      cell({
-        reportDate: '2026-08-05',
-        pnlSource: 'tradier-balance',
-        combinedPnl: -240.64,
-        openPositionCount: 2,
-        markdown: tra359Header('2026-08-05', '1,283.58', '2026-08-04', '1,524.22', '-240.64'),
-        broker: { known: true, realizedUsd: -424 },
-      }),
+      balanceCell('2026-07-09', -178.11, { known: true, realizedUsd: 0, source: 'fifo_row' }),
     );
     expect(v.status).toBe('ok');
+    expect(v.balanceGrade).toBe('ungraded_fifo_basis');
     expect(v.detail).toContain('not graded against broker realized');
   });
 
   it('does NOT read an unrecorded sidecar date as a broker zero', () => {
     const v = auditLiveCellSource(
-      cell({
-        pnlSource: 'tradier-balance',
-        combinedPnl: 50,
-        openPositionCount: 0,
-        markdown: tra359Header('2026-07-20', '518.58', '2026-07-17', '468.58', '+50.00'),
-        broker: { known: true, realizedUsd: 0, source: 'sidecar_quiet' },
-      }),
+      balanceCell('2026-07-20', 50, { known: true, realizedUsd: 0, source: 'sidecar_quiet' }),
     );
     expect(v.status).toBe('ok');
-    expect(v.detail).toContain('not graded against broker realized');
+    expect(v.balanceGrade).toBe('ungraded_no_broker_figure');
+  });
+
+  it('an unreadable broker leg is ungraded, never a pass-as-graded', () => {
+    const v = auditLiveCellSource(balanceCell('2026-07-20', 50, { known: false, reason: 'sidecar unreadable' }));
+    expect(v.status).toBe('ok');
+    expect(v.balanceGrade).toBe('ungraded_no_broker_figure');
+  });
+
+  it('ok-graded and ok-ungraded never share bytes (the house bug)', () => {
+    const graded = auditLiveCellSource(balanceCell('2026-07-01', -116.48, SIDECAR(-116.48)));
+    const ungraded = auditLiveCellSource(
+      balanceCell('2026-07-01', -116.48, { known: true, realizedUsd: -116.48, source: 'fifo_row' }),
+    );
+    expect(graded.status).toBe('ok');
+    expect(ungraded.status).toBe('ok');
+    expect(graded.detail).not.toBe(ungraded.detail);
+    expect(graded.balanceGrade).not.toBe(ungraded.balanceGrade);
+  });
+
+  it('the stamp carries balanceGrade, and the coverage floor counts the denominator', () => {
+    const at = '2026-10-07T00:00:00.000Z';
+    const stamps = [
+      balanceCell('2026-07-01', -42.18, SIDECAR(-116.48)),
+      balanceCell('2026-07-02', -0.08, { known: true, realizedUsd: 0, source: 'fifo_row' }),
+      balanceCell('2026-07-03', 1, { known: true, realizedUsd: 0, source: 'sidecar_quiet' }),
+      balanceCell('2026-07-06', 5, SIDECAR(5)),
+    ].map(c => decideLiveCellSourceDisposition(auditLiveCellSource(c), at).audit);
+    expect(stamps.map(s => s.balanceGrade)).toEqual([
+      'graded', 'ungraded_fifo_basis', 'ungraded_no_broker_figure', 'graded',
+    ]);
+    expect(balanceGradeCoverage(stamps)).toEqual({
+      total: 4, graded: 2, ungraded_fifo_basis: 1, ungraded_no_broker_figure: 1, unstamped: 0,
+    });
+    // A stamp that predates the field is counted, not silently folded into a bucket.
+    expect(balanceGradeCoverage([{}]).unstamped).toBe(1);
+  });
+
+  it('a stored balance_cell_off_broker_realized block re-derives a graded stamp', () => {
+    const s = auditStampFromStoredBlock({
+      reason: 'balance_cell_off_broker_realized',
+      renderedPnl: -42.18, brokerPnl: -116.48, engineOptionsPnl: 0, detail: 'x', at: '2026-10-07T00:00:00.000Z',
+    });
+    expect(s.balanceGrade).toBe('graded');
+  });
+
+  // BLAST RADIUS AS DATA — the 52 `ok` tradier-balance cells on live 5c936c11 whose verdict the
+  // first draft changed (26), read off the wire by the CEO. Replayed through the shipped
+  // function: how many still flip under the re-keyed rule.
+  it('blast radius: of the 26 cells the first draft flipped, which still flip', () => {
+    const TABLE: Array<[string, number, number, 'sidecar' | 'fifo_row']> = [
+      ['2026-06-30', -88.04, 0, 'fifo_row'], ['2026-07-02', -0.08, 0, 'fifo_row'],
+      ['2026-07-09', -178.11, 0, 'fifo_row'], ['2026-07-10', -0.04, 0, 'fifo_row'],
+      ['2026-08-04', -22.93, 155.75, 'sidecar'], ['2026-08-05', -240.64, -427.11, 'sidecar'],
+      ['2026-08-06', -59.09, -20.86, 'sidecar'], ['2026-08-09', -63.54, 0, 'fifo_row'],
+      ['2026-08-10', -16.47, 0, 'fifo_row'], ['2026-08-11', -0.42, -16.86, 'sidecar'],
+      ['2026-08-12', -0.1, 0, 'fifo_row'], ['2026-08-17', -197.36, 0, 'fifo_row'],
+      ['2026-08-18', -196.44, -393.92, 'sidecar'], ['2026-08-19', -0.12, 0, 'fifo_row'],
+      ['2026-08-20', -71.36, 0, 'fifo_row'], ['2026-08-21', -26.53, -17.7, 'sidecar'],
+      ['2026-08-24', -34.59, -99.72, 'sidecar'], ['2026-08-25', 7.57, 0.76, 'sidecar'],
+      ['2026-08-26', -20.17, -7.24, 'sidecar'], ['2026-08-27', -0.13, -1.24, 'sidecar'],
+      ['2026-08-28', -57.4, -56.24, 'sidecar'], ['2026-08-31', -66.1, 0, 'fifo_row'],
+      ['2026-09-01', -49, 0, 'fifo_row'], ['2026-09-02', 5.73, -130.72, 'sidecar'],
+      ['2026-09-03', -10.12, 0, 'fifo_row'], ['2026-10-05', -10, 0, 'fifo_row'],
+    ];
+    const out = TABLE.map(([d, r, b, src]) => {
+      const v = auditLiveCellSource(balanceCell(d, r, { known: true, realizedUsd: b, source: src }));
+      return { d, status: v.status, grade: v.balanceGrade };
+    });
+    const flagged = out.filter(o => o.status === 'balance_cell_off_broker_realized').map(o => o.d);
+    // every fifo_row cell (14) is ungraded; only sidecar-backed gaps > $5 flip (10 of 12)
+    expect(out.filter(o => o.grade === 'ungraded_fifo_basis').length).toBe(14);
+    expect(flagged).toEqual([
+      '2026-08-04', '2026-08-05', '2026-08-06', '2026-08-11', '2026-08-18',
+      '2026-08-21', '2026-08-24', '2026-08-25', '2026-08-26', '2026-09-02',
+    ]);
   });
 });
 
 // ── NEGATIVE CONTROLS: real healthy rows that must not flag ──────────────────
 
 describe('healthy real rows are NOT flagged', () => {
-  it('2026-08-05 — a balance delta that legitimately differs from optionsPnl', () => {
-    // combinedPnl -240.64 (account value change, includes unrealized) vs
-    // optionsPnl -424.00 (engine realized closes). Different measures. If this
-    // flags, the audit fires on every ordinary day with open positions.
-    const v = auditLiveCellSource(
-      cell({
-        reportDate: '2026-08-05',
-        pnlSource: 'tradier-balance',
-        combinedPnl: -240.64,
-        optionsPnl: -424,
-        markdown: tra359Header('2026-08-05', '1,283.58', '2026-08-04', '1,524.22', '-240.64'),
-        broker: { known: true, realizedUsd: -424 },
-      }),
+  it('2026-08-05 — vs the engine leg (optionsPnl) a balance delta is not graded; vs sidecar broker realized it IS (TRA-5270)', () => {
+    // combinedPnl -240.64 (account value change) vs optionsPnl -424.00 (engine
+    // realized closes). TRA-5118 held this as a healthy "measure difference".
+    // TRA-5270 reverses that for the BROKER leg: the live row has
+    // openPositionCount 0, optionsPnl (-424) and broker realized (-427.11) agree
+    // within $3, and the rendered -240.64 is the outlier. Without a broker
+    // figure it stays ungraded and says so.
+    const base = {
+      reportDate: '2026-08-05',
+      pnlSource: 'tradier-balance',
+      combinedPnl: -240.64,
+      optionsPnl: -424,
+      markdown: tra359Header('2026-08-05', '1,283.58', '2026-08-04', '1,524.22', '-240.64'),
+    };
+    const ungraded = auditLiveCellSource(cell({ ...base, broker: { known: true, realizedUsd: -424 } }));
+    expect(ungraded.status).toBe('ok');
+    expect(ungraded.balanceGrade).toBe('ungraded_no_broker_figure');
+    const graded = auditLiveCellSource(
+      cell({ ...base, broker: { known: true, realizedUsd: -427.11, source: 'sidecar' } }),
     );
-    expect(v.status).toBe('ok');
-    expect(isUnreconciled(v)).toBe(false);
+    expect(graded.status).toBe('balance_cell_off_broker_realized');
+    expect(isUnreconciled(graded)).toBe(true);
   });
 
-  it('2026-08-04 — the same shape at a different magnitude', () => {
+  it('2026-08-04 — no broker figure: ungraded, and the verdict says so', () => {
     const v = auditLiveCellSource(
       cell({
         reportDate: '2026-08-04',
@@ -340,6 +414,7 @@ describe('healthy real rows are NOT flagged', () => {
       }),
     );
     expect(v.status).toBe('ok');
+    expect(v.balanceGrade).toBe('ungraded_no_broker_figure');
   });
 
   it('a realized-backfill row is broker-sourced by construction and never header-graded', () => {
@@ -592,11 +667,10 @@ describe('TRA-5118 — broker realized P&L on a date the cell booked none', () =
     expect(v.sourceClass).toBe('unlabelled');
   });
 
-  it('does not flag the 07-01 / 07-08 shape — a broker-labelled balance delta vs realized closes is a measure difference', () => {
-    // These two are in TRA-3100's nine, but their rendered figures ARE broker
-    // balance deltas confirmed by their own headers. Balance delta includes
-    // open-position MTM; realized closes do not. On a day with open positions
-    // they SHOULD differ, and flagging them would fire on every such day.
+  it('07-01 shape with NO sidecar-backed broker figure stays ok-but-ungraded (graded shape: TRA-5270 block)', () => {
+    // TRA-5270 supersedes the TRA-5118 reading that this shape is a "measure
+    // difference": WITH a sidecar-backed realized figure it now flags (see the
+    // TRA-5270 block). Here the broker leg carries no source, so it is ungraded.
     const v = auditLiveCellSource(
       cell({
         reportDate: '2026-07-01',
@@ -609,6 +683,7 @@ describe('TRA-5118 — broker realized P&L on a date the cell booked none', () =
     );
     expect(v.status).toBe('ok');
     expect(v.sourceClass).toBe('broker');
+    expect(v.balanceGrade).toBe('ungraded_no_broker_figure');
   });
 });
 

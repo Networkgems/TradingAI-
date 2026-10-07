@@ -196,6 +196,18 @@ export function resolveBrokerDayEvidence(
   return { known: false, reason: totals.reason };
 }
 
+/**
+ * TRA-5270 — how a `tradier-balance` cell was treated by the balance-vs-realized
+ * grade. Serialized on the stamp so a sweep reads the DENOMINATOR (how many cells
+ * the grade actually reached) and a gate that excludes most of its population
+ * cannot read as a working one.
+ *  - `graded` — compared to a sidecar-backed broker realized figure.
+ *  - `ungraded_fifo_basis` — the only broker leg is the row's own FIFO block; a
+ *    reconstruction that found no closes is an absence, not a measured broker zero.
+ *  - `ungraded_no_broker_figure` — no readable broker figure for the date.
+ */
+export type BalanceGrade = 'graded' | 'ungraded_fifo_basis' | 'ungraded_no_broker_figure';
+
 export type LiveCellSourceStatus =
   | 'ok'
   /** A broker-tagged row whose stored figure contradicts the broker figure it states. */
@@ -232,6 +244,8 @@ export interface LiveCellSourceVerdict {
   brokerPnl: number | null;
   /** TRA-5118 — which evidence carried the broker leg; `null` when blind/unused. */
   brokerEvidenceSource: BrokerEvidenceSource | null;
+  /** TRA-5270 — set only on a `tradier-balance` cell: was it graded against broker realized? */
+  balanceGrade?: BalanceGrade;
   /** Operator-facing sentence. Never a number the caller should trade on. */
   detail: string;
 }
@@ -243,17 +257,23 @@ export interface LiveCellSourceInput {
   realizedPnl: number;
   optionsPnl: number;
   markdown: string | undefined;
-  /**
-   * Open positions on the row. Gates the TRA-5270 balance-vs-realized grade: a
-   * balance delta only equals realized P&L when nothing is marked to market.
-   */
-  openPositionCount?: number;
   /** Broker realized options P&L for the date. Omit only on a non-live book. */
   broker: BrokerDayEvidence;
 }
 
 /** Dollar tolerance. Both sides are rounded currency, so a cent is the floor. */
 const TOLERANCE_USD = 0.011;
+
+/**
+ * TRA-5270 — tolerance for a `tradier-balance` cell vs broker realized. NOT the
+ * 0.011 above: that is right for header-vs-figure self-consistency (same number,
+ * two renderings). A balance delta and a sidecar realized figure are different
+ * measures over different spans (commissions/fees, rounding across several
+ * legs, intraday MTM drift), so small gaps are measurement noise. Measured on
+ * the live store, the sidecar-backed gaps under $5 are 1.11 and 1.16. $5 clears
+ * those and still catches the shape this ticket is about (+74.30, +168.15).
+ */
+const BALANCE_VS_REALIZED_TOLERANCE_USD = 5;
 
 function usd(n: number): string {
   if (!Number.isFinite(n)) return '$—';
@@ -278,6 +298,30 @@ function ok(input: LiveCellSourceInput, sourceClass: CellSourceClass, detail: st
     brokerEvidenceSource: brokerEvidenceSourceOf(input),
     detail,
   };
+}
+
+function withGrade(v: LiveCellSourceVerdict, balanceGrade: BalanceGrade): LiveCellSourceVerdict {
+  return { ...v, balanceGrade };
+}
+
+/**
+ * TRA-5270 — the coverage floor. How many `tradier-balance` stamps the
+ * balance-vs-realized grade reached vs excluded, by reason. A sweep must print
+ * this beside any "N flagged" count: a grade that excludes most of its population
+ * is otherwise indistinguishable from one that found nothing.
+ */
+export function balanceGradeCoverage(
+  stamps: ReadonlyArray<{ balanceGrade?: BalanceGrade | null }>,
+): { total: number; graded: number; ungraded_fifo_basis: number; ungraded_no_broker_figure: number; unstamped: number } {
+  const c = { total: 0, graded: 0, ungraded_fifo_basis: 0, ungraded_no_broker_figure: 0, unstamped: 0 };
+  for (const s of stamps) {
+    c.total++;
+    if (s.balanceGrade === 'graded') c.graded++;
+    else if (s.balanceGrade === 'ungraded_fifo_basis') c.ungraded_fifo_basis++;
+    else if (s.balanceGrade === 'ungraded_no_broker_figure') c.ungraded_no_broker_figure++;
+    else c.unstamped++;
+  }
+  return c;
 }
 
 /**
@@ -346,35 +390,50 @@ export function auditLiveCellSource(input: LiveCellSourceInput): LiveCellSourceV
     }
     // TRA-5270 — the header check above is SELF-consistency: header and figure can
     // agree and both be off the broker (07-01 +74.30, 07-08 +168.15). Grade the
-    // figure against broker realized, but only where the two measures coincide: a
-    // balance delta includes unrealized MTM, so on a cell carrying open positions a
-    // gap is normal (the 2026-08-05 control). Where it cannot be graded, SAY SO —
-    // `ok` here must not read the same as "tied to the broker".
+    // figure against SIDECAR-backed broker realized. The ungraded arms say so in
+    // the detail AND in `balanceGrade`, so `ok` here never reads the same as
+    // "tied to the broker".
+    //
+    // Deliberately NOT gated on the row's open-position count: it is 0 on 55/55
+    // live `tradier-balance` rows (a gate excluding nothing), and today's archive
+    // count is 0 exactly in the case that matters (a position carried from the
+    // previous snapshot and closed today). A `fifo_row` basis is ungraded: its
+    // realized of 0.00 is "no closes reconstructed", not a broker zero.
     const headerOk = `Broker balance delta, confirmed against the row's own header (${signed(stated)}).`;
-    const flat = input.openPositionCount === 0;
-    if (!flat || !input.broker.known || input.broker.source === 'sidecar_quiet') {
-      const why = !flat
-        ? 'the cell carries open positions or its count is unknown, so the balance delta includes unrealized'
-        : 'no broker realized figure was recorded for the date';
-      return ok(input, sourceClass, `${headerOk} Header only — not graded against broker realized: ${why}.`);
+    const ev = brokerEvidenceSourceOf(input);
+    if (!input.broker.known || ev === 'sidecar_quiet' || ev === null) {
+      return withGrade(
+        ok(input, sourceClass, `${headerOk} Header only — not graded against broker realized: no broker realized figure was recorded for the date.`),
+        'ungraded_no_broker_figure',
+      );
+    }
+    if (ev === 'fifo_row') {
+      return withGrade(
+        ok(input, sourceClass, `${headerOk} Header only — not graded against broker realized: the only broker leg is the row's own FIFO reconstruction (${signed(input.broker.realizedUsd)}), an absence of reconstructed closes rather than a measured broker figure.`),
+        'ungraded_fifo_basis',
+      );
     }
     const brokerRealized = input.broker.realizedUsd;
-    if (Math.abs(input.combinedPnl - brokerRealized) > TOLERANCE_USD) {
+    if (Math.abs(input.combinedPnl - brokerRealized) > BALANCE_VS_REALIZED_TOLERANCE_USD) {
       return {
         status: 'balance_cell_off_broker_realized',
         sourceClass,
         renderedPnl: input.combinedPnl,
         engineOptionsPnl: input.optionsPnl,
         brokerPnl: brokerRealized,
-        brokerEvidenceSource: brokerEvidenceSourceOf(input),
+        brokerEvidenceSource: ev,
+        balanceGrade: 'graded',
         detail:
-          `${input.reportDate} renders ${signed(input.combinedPnl)} from a broker balance delta on a flat book, `
+          `${input.reportDate} renders ${signed(input.combinedPnl)} from a broker balance delta, `
           + `but the broker's realized P&L for the date is ${signed(brokerRealized)}, a gap of `
-          + `${usd(input.combinedPnl - brokerRealized)}. Its own header agrees with the rendered figure, so the `
-          + `header check could not see it. Realized broker fills own a settled cell.`,
+          + `${usd(input.combinedPnl - brokerRealized)} (tolerance ${usd(BALANCE_VS_REALIZED_TOLERANCE_USD)}). `
+          + `Its own header agrees with the rendered figure, so the header check could not see it.`,
       };
     }
-    return ok(input, sourceClass, `${headerOk} Ties to broker realized (${signed(brokerRealized)}).`);
+    return withGrade(
+      ok(input, sourceClass, `${headerOk} Ties to broker realized (${signed(brokerRealized)}).`),
+      'graded',
+    );
   }
 
   // ── engine-sourced or unlabelled ──────────────────────────────────────────
@@ -533,6 +592,8 @@ export interface BrokerSourceAuditStamp {
   engineOptionsPnl?: number;
   brokerPnl?: number | null;
   brokerEvidenceSource?: BrokerEvidenceSource | null;
+  /** TRA-5270 — present on `tradier-balance` cells only. */
+  balanceGrade?: BalanceGrade;
   detail: string;
   at: string;
 }
@@ -557,6 +618,7 @@ export function auditStampFromStoredBlock(block: PnlUnreconciledBlock): BrokerSo
     renderedPnl: block.renderedPnl,
     engineOptionsPnl: block.engineOptionsPnl,
     brokerPnl: block.brokerPnl,
+    ...(block.reason === 'balance_cell_off_broker_realized' ? { balanceGrade: 'graded' as const } : {}),
     detail: block.detail,
     at: block.at,
   };
@@ -593,6 +655,7 @@ export function decideLiveCellSourceDisposition(
     engineOptionsPnl: Number(verdict.engineOptionsPnl.toFixed(2)),
     brokerPnl: verdict.brokerPnl === null ? null : Number(verdict.brokerPnl.toFixed(2)),
     brokerEvidenceSource: verdict.brokerEvidenceSource,
+    ...(verdict.balanceGrade ? { balanceGrade: verdict.balanceGrade } : {}),
     detail: verdict.detail,
     at,
   };
