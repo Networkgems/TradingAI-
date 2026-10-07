@@ -364,6 +364,8 @@ export function auditLiveCellSource(input: LiveCellSourceInput): LiveCellSourceV
     return {
       status: 'pre_onset_demo_option_pnl',
       sourceClass,
+      // The arm never consults the broker evidence it echoes in `brokerPnl`.
+      brokerEvidenceSource: null,
       renderedPnl: input.combinedPnl,
       engineOptionsPnl: input.optionsPnl,
       brokerPnl: input.broker.known ? input.broker.realizedUsd : null,

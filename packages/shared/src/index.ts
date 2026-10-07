@@ -6769,6 +6769,7 @@ export interface EodReport {
   brokerSourceAudit?: {
     status:
       | 'ok'
+      | 'pre_onset_demo_option_pnl'
       | 'engine_close_without_broker_fill'
       | 'engine_options_diverges_from_broker'
       | 'broker_realized_without_cell_pnl'
