@@ -358,6 +358,7 @@ export function auditLiveCellSource(input: LiveCellSourceInput): LiveCellSourceV
   const onset = input.liveOptionsOnsetDate;
   if (
     typeof onset === 'string'
+    && input.pnlSource !== 'realized-backfill' // FIFO-from-broker-fills: engine onset says nothing about provenance (07-01/07-08 tie to broker)
     && input.reportDate < onset
     && Math.abs(input.optionsPnl) > TOLERANCE_USD
   ) {

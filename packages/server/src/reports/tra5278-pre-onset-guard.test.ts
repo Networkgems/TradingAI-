@@ -58,6 +58,16 @@ describe('TRA-5278 onset guard', () => {
     expect(v.status).not.toBe('pre_onset_demo_option_pnl');
   });
 
+  // NEGATIVE CONTROL (CEO review): a broker-reconstructed cell before onset is real money.
+  it('does not flag a pre-onset realized-backfill cell (07-01 / 07-08 tie to the broker)', () => {
+    for (const [d, v] of [['2026-07-01', -116.48], ['2026-07-08', -106.24]] as const) {
+      const r = auditLiveCellSource(
+        cell({ reportDate: d, pnlSource: 'realized-backfill', optionsPnl: v, combinedPnl: v, broker: { known: true, realizedUsd: v } }),
+      );
+      expect(r.status, d).toBe('ok');
+    }
+  });
+
   it('does not flag a pre-onset cell carrying no option P&L', () => {
     expect(auditLiveCellSource(cell({ reportDate: '2026-07-20' })).status).toBe('ok');
   });
