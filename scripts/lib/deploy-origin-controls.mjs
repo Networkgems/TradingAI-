@@ -516,6 +516,41 @@ function runCallSite() {
     assert.equal(r.code, EXIT.CLEAN, r.out.slice(-1200));
     assert.match(r.out, /VERDICT = CLEAN/);
     assert.ok(r.out.includes('dep-daj21q7qj5pc73bvbul0'), 'an ACKED bypass is still PRINTED — an ack clears the exit code, never the record');
+    // TRA-5267 — the BANNER must say WHICH KIND of CLEAN this is. This arm passed for weeks
+    // while the closing line read "all N deploy(s) in the window were created by REST", which
+    // here is FALSE: four of them were not, they were adjudicated. An adjudicated green and a
+    // genuinely clean history printing the same sentence is this detector's own
+    // pass-reads-like-fail bug, and an exit-code-only assertion cannot see it. Assert the TEXT,
+    // in both directions (the negative partner is ARM 0b-neg below).
+    assert.match(r.out, /CLEAN BY ADJUDICATION/, 'an acked CLEAN must announce itself as adjudicated');
+    assert.ok(
+      !/all \d+ deploy\(s\) in the window were created by REST/.test(r.out),
+      'an acked CLEAN must NOT claim every deploy was created by REST — four of these were not',
+    );
+    assert.match(
+      r.out,
+      /window still CONTAINS the acked rows/,
+      'the banner must distinguish adjudication from the rows ageing out of the window',
+    );
+  });
+
+  check('ARM 0b-neg — an all-REST history ⇒ PLAIN CLEAN, and NOT the adjudication banner (one variable: the bypasses)', () => {
+    const tmp = path.join(os.tmpdir(), `acks-none-0bneg-${Date.now()}.json`);
+    fs.writeFileSync(tmp, JSON.stringify({ acks: [] }), 'utf8');
+    const allRest = fixture.deploys.map((row) => ({ ...row, deploy: { ...row.deploy, trigger: 'api' } }));
+    // `events: []` deliberately, as TRA-5239 ARM B does. Flipping `deploy.trigger` to `api`
+    // while leaving the REAL events (which say `manual: true`) makes the two legs DISAGREE and
+    // the detector correctly answers BLIND rather than CLEAN — the instrument working, but not
+    // the variable this arm isolates.
+    const r = spawnArm({ stub: { deploys: [synthLive, ...allRest], events: [], health }, args: [...WIN, `--acks=${tmp}`] });
+    fs.rmSync(tmp, { force: true });
+    assert.equal(r.code, EXIT.CLEAN, r.out.slice(-1200));
+    assert.match(
+      r.out,
+      /all \d+ deploy\(s\) in the window were created by REST/,
+      'a genuinely clean history keeps the strong sentence',
+    );
+    assert.ok(!/CLEAN BY ADJUDICATION/.test(r.out), 'with zero acked bypasses the adjudication banner must NOT fire');
   });
 
   check('ARM 0c — --no-acks over ARM 0b\'s ledger ⇒ BYPASS again', () => {

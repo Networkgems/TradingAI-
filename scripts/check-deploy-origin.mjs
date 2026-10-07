@@ -1034,6 +1034,40 @@ async function main() {
   if (state.vacuous) {
     log('[deploy-origin] CLEAN — but VACUOUS: the window holds ZERO deploys. That is a denominator,');
     log('[deploy-origin] not a pass. Widen --days if you meant to grade a period that had deploys in it.');
+  } else if (state.counts.acked > 0) {
+    // ⛔ A CLEAN THAT CAME OUT OF THE ACK LEDGER MUST NOT PRINT THE SENTENCE A CLEAN HISTORY
+    // PRINTS (TRA-5267). This branch used to emit "all N deploy(s) in the window were created
+    // by REST", which on an adjudicated run is simply FALSE: on 2026-10-07 it would have
+    // claimed 130/130 REST over a window holding EIGHT Render-labelled non-REST deploys.
+    // Two materially different states — nobody walked around the gates, versus somebody did
+    // and we dispositioned each one — rendered as the same reassuring line. That is the
+    // pass-reads-identically-to-fail class this whole detector exists to break, reproduced
+    // inside the detector's own report.
+    //
+    // It also answers IN BAND the question every closing comment on one of these rows has had
+    // to re-derive by hand: is this green ADJUDICATION, or did the rows simply age out of the
+    // window? The oldest acked row's timestamp is printed next to the window so a reader can
+    // see for themselves that the window still contains it.
+    const ackedRows = state.rows.filter((r) => r.kind === 'bypass' && r.ack);
+    const oldest = ackedRows.reduce(
+      (acc, r) => (acc == null || r.createdAt < acc ? r.createdAt : acc),
+      null,
+    );
+    log(
+      `[deploy-origin] CLEAN BY ADJUDICATION — ${state.counts.n} deploy(s) in the window, of which ` +
+        `${state.counts.sanctioned} were created by REST and ${state.counts.acked} were NOT: those are ` +
+        `Render-labelled non-REST deploys, each acknowledged by deploy id in the ledger graded here ` +
+        `(${ledger.label}) and printed in full above.`,
+    );
+    log('[deploy-origin] This is NOT "no deploy walked around the gates". It is "every deploy that did');
+    log('[deploy-origin] has been dispositioned on a ticket". The gate-free paths are still OPEN.');
+    if (oldest) {
+      log(
+        `[deploy-origin] The window still CONTAINS the acked rows (oldest ${oldest}), so this green is ` +
+          `adjudication,`,
+      );
+      log('[deploy-origin] not the rows ageing out of the window. --no-acks prints the raw truth.');
+    }
   } else {
     log(`[deploy-origin] CLEAN — all ${state.counts.n} deploy(s) in the window were created by REST.`);
   }
