@@ -6701,6 +6701,9 @@ export interface EodReport {
    */
   pnlUnreconciled?: {
     /**
+     * - `pre_onset_demo_option_pnl` (TRA-5278) — option P&L on a date before the
+     *   book's `liveOptionsOnsetDate`: the book held no live option, so the figure
+     *   is demo-mode P&L wearing a live label. Outranks every arm below.
      * - `engine_close_without_broker_fill` — engine options P&L booked on a date
      *   the broker shows no realized options P&L for. Not money that moved.
      * - `engine_options_diverges_from_broker` — both non-zero and they disagree;
@@ -6715,6 +6718,7 @@ export interface EodReport {
      *   comparison could not be made. Blind, not agreed; both fail closed.
      */
     reason:
+      | 'pre_onset_demo_option_pnl'
       | 'engine_close_without_broker_fill'
       | 'engine_options_diverges_from_broker'
       | 'broker_realized_without_cell_pnl'

@@ -210,6 +210,12 @@ export type BalanceGrade = 'graded' | 'ungraded_fifo_basis' | 'ungraded_no_broke
 
 export type LiveCellSourceStatus =
   | 'ok'
+  /**
+   * TRA-5278 — option P&L dated BEFORE the book's `liveOptionsOnsetDate`. The book
+   * held zero live options then, so the figure is its own DEMO-mode P&L booked
+   * into a live cell, whatever label or header the row carries.
+   */
+  | 'pre_onset_demo_option_pnl'
   /** A broker-tagged row whose stored figure contradicts the broker figure it states. */
   | 'broker_figure_overwritten'
   /**
@@ -259,6 +265,12 @@ export interface LiveCellSourceInput {
   markdown: string | undefined;
   /** Broker realized options P&L for the date. Omit only on a non-live book. */
   broker: BrokerDayEvidence;
+  /**
+   * TRA-5278 — ET date the book first opened a LIVE option. `undefined` = the
+   * caller did not supply it (arm skipped); `null` = supplied but the book has no
+   * recorded onset, which is UNMEASURED for this arm, never "clean".
+   */
+  liveOptionsOnsetDate?: string | null;
 }
 
 /** Dollar tolerance. Both sides are rounded currency, so a cent is the floor. */
@@ -338,6 +350,28 @@ export function auditLiveCellSource(input: LiveCellSourceInput): LiveCellSourceV
   // load; it makes no claim about a closed day, so there is nothing to reconcile.
   if (sourceClass === 'intraday') {
     return ok(input, sourceClass, 'Intraday running cell — not a settled claim about the day.');
+  }
+
+  // TRA-5278 — the onset guard. Outranks the label: a `tradier-balance` row whose
+  // figure equals its engine options figure (07-15/17/21) is graded here before the
+  // header-vs-figure arm can wave it through. A null onset skips the arm (UNMEASURED).
+  const onset = input.liveOptionsOnsetDate;
+  if (
+    typeof onset === 'string'
+    && input.reportDate < onset
+    && Math.abs(input.optionsPnl) > TOLERANCE_USD
+  ) {
+    return {
+      status: 'pre_onset_demo_option_pnl',
+      sourceClass,
+      renderedPnl: input.combinedPnl,
+      engineOptionsPnl: input.optionsPnl,
+      brokerPnl: input.broker.known ? input.broker.realizedUsd : null,
+      detail:
+        `${input.reportDate} carries ${signed(input.optionsPnl)} of options P&L but this book's first live `
+        + `option opened ${onset}. The book held no live option on this date, so the figure is its own `
+        + `DEMO-mode P&L booked into a live cell — not money that moved.`,
+    };
   }
 
   if (sourceClass === 'broker') {

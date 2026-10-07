@@ -3546,7 +3546,23 @@ async function stampBrokerSourceAudit(
   const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
   try {
     const totals = await readTradierDailyTotalsForEvidence(ctx, env);
+    // TRA-5278 — same scoping as the reconciliation route (`journalRowsForBook`
+    // with the identity epoch). A journal we cannot read leaves the onset null:
+    // the arm is UNMEASURED, never clean.
+    let liveOptionsOnsetDate: string | null = null;
+    try {
+      liveOptionsOnsetDate = liveOptionsOnsetEtDate(
+        journalRowsForBook(await listOptionTradeJournal(), ctx.username, accountDeletedAt(ctx.username)),
+        (ts: number) => etDateString(new Date(ts)),
+      );
+    } catch (err) {
+      log.warn('TRA-5278 onset read failed — pre-onset arm UNMEASURED', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
     const verdict = auditLiveCellSource({
+      liveOptionsOnsetDate,
       reportDate: report.date,
       pnlSource: report.pnlSource,
       combinedPnl: report.combinedPnl,
