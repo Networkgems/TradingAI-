@@ -83,6 +83,7 @@ import {
   isOptionLiveDirectionalEnabled,
   isOptionLiveOtmEnabled,
   isOptionLiveRvLongEnabled,
+  resolveLiveOptionTestAggregateCapUsd,
 } from './option-exec-flag.js';
 import { isOptionMakerTelemetryEnabled } from './option-maker-fill-ledger.js';
 import { isExplorationAllowanceFlagOn } from './directional-exploration-allowance.js';
@@ -414,6 +415,28 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
         ),
       );
     },
+  },
+  {
+    // TRA-5279 (Q2) — `A`, the fleet aggregate premium-at-risk authorization the
+    // OTM order site (`aggregate_cap`/`fleet_reachable_bound`) and the
+    // `aggregateFleetBound` grade both resolve. Undeclared until now: live read
+    // $400 with `envIntent` naming 14 levers and 0 mismatches, so the cap was
+    // resolving from a lever no instrument graded — exactly the class of
+    // undeclared lever `env-drift` is blind to.
+    key: 'LIVE_OPTION_TEST_AGGREGATE_CAP_USD',
+    intended: '400',
+    provenance:
+      'TRA-5279 (Q2). Resolver: resolveLiveOptionTestAggregateCapUsd (option-exec-flag.ts) — code ' +
+      'default AND ceiling are $750 (the board\'s original TRA-3384 "max $750 total"); a stored ' +
+      'value clamps DOWN only. Live bqb1 stores 400. The board-ratified figure is $500 (restore ' +
+      'stamp 5fc18af7, TRA-4988), so the live posture is $100 TIGHTER by a write nobody attributed ' +
+      '— risk-reducing, needs no sign-off (capRatification on /api/health/live-options-fee-slippage ' +
+      'already publishes the mismatch as "Live is TIGHTER"). This row pins the posture IN FORCE: a ' +
+      'silent restore to 500, any raise, or a WIPE (absence resolves to the $750 default — wider ' +
+      'than the ratified 500) is now a named mismatch instead of invisible. Raising it requires a ' +
+      'board card superseding 5fc18af7. ⚠️ SCOPE (TRA-5279 Q1): this cap binds the OTM admission ' +
+      'site only; directional/RV live entries do not consult it.',
+    resolve: (env) => String(resolveLiveOptionTestAggregateCapUsd(env)),
   },
   {
     key: 'TRADIER_ENV',

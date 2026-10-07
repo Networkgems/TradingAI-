@@ -32,6 +32,10 @@ const RULED_PROD_ENV: NodeJS.ProcessEnv = {
   LIVE_LEARNING_BUDGET_MAX_LOSS_USD: '800',
   LIVE_LEARNING_BUDGET_PER_OPEN_USD: '150',
   LIVE_LEARNING_BUDGET_MAX_OPENS: '40',
+  // TRA-5279 (Q2) — the fleet aggregate authorization A. Live bqb1 stores 400
+  // (tighter than the ratified 500, stamp 5fc18af7); absence would resolve to
+  // the $750 code default, which is WIDER than ratified and must mismatch.
+  LIVE_OPTION_TEST_AGGREGATE_CAP_USD: '400',
   // ENABLE_ORDER_QUOTE_GUARD / ENABLE_OPTION_LIVE_RV_LONG absent: their intent
   // is `off` and their code default is off — absence MATCHES.
 };
@@ -110,6 +114,32 @@ describe('summarizeEnvIntent (TRA-4474)', () => {
       present: false,
       effective: '300',
       intended: '800',
+      matches: false,
+    });
+  });
+
+  it('TRA-5279: the fleet aggregate cap A is graded — a wipe widens to the $750 default and mismatches', () => {
+    // The lever this ticket found resolving from nowhere any instrument graded.
+    // A WIPE is the loud direction: absence resolves to the $750 code default,
+    // WIDER than both the live 400 and the ratified 500.
+    const { LIVE_OPTION_TEST_AGGREGATE_CAP_USD: _gone, ...wipedEnv } = RULED_PROD_ENV;
+    const wiped = graded(wipedEnv);
+    expect(wiped.ok).toBe(false);
+    expect(wiped.levers.find((l) => l.key === 'LIVE_OPTION_TEST_AGGREGATE_CAP_USD')).toMatchObject({
+      present: false,
+      effective: '750',
+      intended: '400',
+      matches: false,
+    });
+    // A silent restore to the ratified 500 is STILL a mismatch: the row pins the
+    // posture in force, and moving it is a board act, not a store write.
+    const restored = graded({ ...RULED_PROD_ENV, LIVE_OPTION_TEST_AGGREGATE_CAP_USD: '500' });
+    expect(restored.mismatches).toContain('LIVE_OPTION_TEST_AGGREGATE_CAP_USD');
+    // Past the ceiling: the consumer clamps 2000 -> 750; the row grades the
+    // clamped value the order site obeys, not the stored string.
+    const clamped = graded({ ...RULED_PROD_ENV, LIVE_OPTION_TEST_AGGREGATE_CAP_USD: '2000' });
+    expect(clamped.levers.find((l) => l.key === 'LIVE_OPTION_TEST_AGGREGATE_CAP_USD')).toMatchObject({
+      effective: '750',
       matches: false,
     });
   });

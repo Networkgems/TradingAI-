@@ -2955,13 +2955,22 @@ export interface LiveOtmFleetBoundGrade {
    */
   sumAdmissibleEntryUsd: number | null;
   /**
-   * TRA-3911 — is this build's order path enforcing the reachable bound?
+   * TRA-3911 — is this build's OTM order path enforcing the reachable bound?
    *
    * `true` iff every gate-open row publishes an `admissibleEntryUsd` whose
    * `boundBy` shows the fleet term was CONSIDERED (`fleet_reachable`, `both`, or
    * a `book`/`none` resolved against a readable `Σ_j atRisk_j`). ⭐ Graded on the
    * ROWS, never on ancestry: a deploy order's commit is a lower bound on content,
    * not an expected reading (TRA-3660).
+   *
+   * ⚠️ TRA-5279 — SCOPE. This attests the `single_leg_otm` admission site ONLY
+   * (`runOtmScan`'s `aggregate_cap`/`fleet_reachable_bound` pair). Directional
+   * and RV live entries pass the shared `mirrorLiveOptionOpen` seam, which
+   * consults NEITHER gate — measured 2026-10-06: two directional fills, both
+   * gates `evaluated: 0` on the day while `canary_ceiling`/`sleeve_stand_down`
+   * read 2. `true` here must never be read as "no live entry can take
+   * Σ atRisk past A"; whether A should bind directional is a board question
+   * (TRA-5279 follow-up), not a reading this flag can carry.
    */
   reachableBoundEnforced: boolean;
 }
@@ -3344,8 +3353,9 @@ export function gradeLiveOtmFleetBound(
         + 'so this verdict is about Σ B_i — unspent BUDGET — and not about the quantity A bounds (TRA-3911)'
       : ` [reachable = Σ atRisk $${(fleetAtRiskUsd as number).toFixed(2)} + Σ admissible `
         + `$${(sumAdmissibleEntryUsd as number).toFixed(2)}; Σ B_i $${sumBookCapUsd.toFixed(2)}; `
-        + `grandfathered excess $${(grandfatheredExcessUsd as number).toFixed(2)}; order path `
-        + `${reachableBoundEnforced ? 'ENFORCING' : 'NOT enforcing'} the reachable bound]`;
+        + `grandfathered excess $${(grandfatheredExcessUsd as number).toFixed(2)}; OTM order path `
+        + `${reachableBoundEnforced ? 'ENFORCING' : 'NOT enforcing'} the reachable bound — `
+        + 'directional/RV live entries do NOT consult it (TRA-5279)]';
 
   let verdict: LiveOtmFleetBoundVerdict;
   let reason: string;
@@ -3378,10 +3388,12 @@ export function gradeLiveOtmFleetBound(
       + 'above a book\'s own cap because the cap tightened underneath an already-open position, which '
       + 'Σ B_i omits exactly because a budget cannot go negative. '
       + (reachableBoundEnforced
-        ? 'The order path IS enforcing min(cap_i − atRisk_i, A − Σ_j atRisk_j), so no NEW entry can '
-          + 'widen this; it closes when the open position does — see TRA-3911.'
-        : 'The order path is NOT enforcing the reachable bound (rows publish no admissibleEntryUsd) — '
-          + 'the next entry can widen this. TRA-3911 AC1 is the fix.')
+        ? 'The OTM order path IS enforcing min(cap_i − atRisk_i, A − Σ_j atRisk_j), so no new OTM '
+          + 'entry can widen this; a directional or RV live entry does NOT consult this bound and '
+          + 'still can (TRA-5279). It closes when the open position does — see TRA-3911.'
+        : 'The OTM order path is NOT enforcing the reachable bound (rows publish no admissibleEntryUsd) — '
+          + 'the next OTM entry can widen this (TRA-3911 AC1 is the fix), and directional/RV live '
+          + 'entries never consult this bound either way (TRA-5279).')
       + reachableSuffix;
   } else {
     verdict = 'breach';
