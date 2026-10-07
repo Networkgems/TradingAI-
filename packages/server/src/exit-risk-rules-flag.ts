@@ -157,6 +157,37 @@ export function resolveOtmMispricingModelOpts(
   return out;
 }
 
+// Greeks freshness for the OTM theo (both books).
+//
+// Tradier's greeks/IV come from ORATS, refreshed HOURLY in production and absent
+// in sandbox. The theo was priced off `smv_vol` with no look at its age, so an
+// up-to-an-hour-old surface was compared against a live quote — a "mispricing"
+// that is just the market having moved since ORATS last fitted it.
+//  - OTM_MAX_GREEKS_AGE_MIN (default 90; `none` = legacy, age ignored): vendor
+//    greeks older than this — or with no stamp at all — are not used; σ is
+//    solved from the neighbours' CURRENT mids instead.
+//  - OTM_THEO_IV_SOURCE = `vendor` (default) | `live`: `live` always uses the
+//    locally solved σ.
+// This is a data-correctness fix, not a risk loosening: it never admits a row
+// the gates downstream would refuse; it only changes which σ prices theo.
+export const OTM_MAX_GREEKS_AGE_MIN_VAR = 'OTM_MAX_GREEKS_AGE_MIN';
+export const OTM_THEO_IV_SOURCE_VAR = 'OTM_THEO_IV_SOURCE';
+export const OTM_MAX_GREEKS_AGE_MIN_DEFAULT = 90;
+
+export function resolveOtmTheoFreshnessOpts(
+  env: NodeJS.ProcessEnv = process.env,
+): { maxGreeksAgeMs?: number; ivSource?: 'live' } {
+  const out: { maxGreeksAgeMs?: number; ivSource?: 'live' } = {};
+  const raw = (env[OTM_MAX_GREEKS_AGE_MIN_VAR] ?? '').trim().toLowerCase();
+  if (raw !== 'none') {
+    const n = Number(raw);
+    const minutes = raw !== '' && Number.isFinite(n) && n > 0 ? n : OTM_MAX_GREEKS_AGE_MIN_DEFAULT;
+    out.maxGreeksAgeMs = minutes * 60_000;
+  }
+  if ((env[OTM_THEO_IV_SOURCE_VAR] ?? '').trim().toLowerCase() === 'live') out.ivSource = 'live';
+  return out;
+}
+
 // TRA-1670 (TRA-1647B, parent TRA-1647) — the OTHER half of the band: a
 // per-structure entry-delta CEILING.
 //

@@ -314,6 +314,7 @@ import { bindHardControlsToEngines } from './hard-controls-bridge.js'; // TRA-46
 import { registerPaperTradingRoutes } from './paper-trading-routes.js'; // TRA-4657
 import { registerLifecycleRoutes } from './lifecycle-routes.js'; // TRA-4813
 import { createTradierStreamService, registerTradierStreamRoutes } from './tradier-stream-status.js'; // TRA-4707
+import { resolveChainMarketDataRoute, resolveOtmScanMaxExpirations } from './tradier-chain-routing.js';
 import { registerDecisionAuditRoutes } from './decision-audit-routes.js'; // TRA-4658
 import { auditIntervention, queryDecisionAudit } from './decision-audit-log.js'; // TRA-4658 / TRA-4653
 import { buildPostTradeReviews } from './post-trade-review.js'; // TRA-4653
@@ -1038,7 +1039,7 @@ import { isTestAccount as isTestAccountName } from './test-accounts.js';
 import type { TradierEnv } from '@trading-app/shared';
 // TRA-3068 — the split calendar, read at the EOD report's generation path.
 import type { CorporateAction } from '@trading-app/shared';
-import { fetchQuotes, fetchDailyCandles, fetchShortInterestFundamentals, fetchRecentSplits } from './yahoo-feed.js';
+import { fetchQuotes, fetchDailyCandles, fetchShortInterestFundamentals, fetchRecentSplits, applyStreamTickToQuoteCache, getStreamOverlayCounters } from './yahoo-feed.js';
 import {
   runFirstBootMigration,
   runTra237OptionsReset,
@@ -1337,17 +1338,19 @@ await ensureStrategyRegistered('supertrend_confluence').catch(err =>
 // Reports `no_credentials` when the resolved pair is empty — the engine
 // then simply skips options scanning, equity trading is unaffected.
 const tradierEnv = (process.env['TRADIER_ENV'] as 'sandbox' | 'production') ?? 'sandbox';
-const tradierApiToken = tradierEnv === 'production'
-  ? process.env['TRADIER_API_TOKEN']
-  : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']);
-const tradierAccountId = tradierEnv === 'production'
-  ? process.env['TRADIER_ACCOUNT_ID']
-  : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']);
+// Chains are read-only market data, so they no longer have to follow the
+// ORDER environment: with `TRADIER_MARKET_DATA_TOKEN` set, a sandbox (paper)
+// host reads real-time production chains WITH greeks instead of the 15-minute
+// delayed, greek-less sandbox feed. See `tradier-chain-routing.ts`.
+const chainRoute = resolveChainMarketDataRoute(process.env);
 
 const relativeValueScannerService = new TradierRelativeValueScannerService({
-  tradierApiToken,
-  tradierAccountId,
-  tradierEnv,
+  tradierApiToken: chainRoute.apiToken,
+  tradierAccountId: chainRoute.accountId,
+  tradierEnv: chainRoute.env,
+  chainCallBudgetPerMin: chainRoute.chainCallBudgetPerMin,
+  otmMaxExpirations: resolveOtmScanMaxExpirations(process.env),
+  marketDataSource: chainRoute.source,
   fetchSpot: async (symbol) => {
     // TRA-552 — the RV scanner only needs an underlying spot for options
     // mispricing math, which tolerates a few seconds of staleness. Reuse a
@@ -1392,6 +1395,9 @@ log.info('rv-scanner initialized', {
   // choke point so a mis-set value can never be written to the (persisted) logs;
   // routing itself still uses the raw `tradierEnv` const above, unchanged.
   env: redactTradierEnvLabel(tradierEnv),
+  chainsEnv: chainRoute.env,
+  chainsSource: chainRoute.source,
+  chainBudgetPerMin: chainRoute.chainCallBudgetPerMin,
   configured: relativeValueScannerService.diagnostics().configured,
 });
 
@@ -17481,6 +17487,11 @@ registerLifecycleRoutes(app, {
 // whenever the feed is not running.
 const tradierStream = createTradierStreamService({
   resolveSymbols: () => getAllUserContexts().flatMap((ctx) => ctx.engine.getActiveSymbols()),
+  // Stream ticks refresh the shared quote cache in real time (sub-second for
+  // the subscribed set) instead of the ~30s REST cadence. Opt out with
+  // TRADIER_STREAM_FEEDS_QUOTES=0.
+  onTick: (symbol, tick) => { applyStreamTickToQuoteCache(symbol, tick); },
+  overlayCounters: () => ({ ...getStreamOverlayCounters() }),
 });
 tradierStream.start();
 registerTradierStreamRoutes(app, { requireAuth, service: tradierStream });

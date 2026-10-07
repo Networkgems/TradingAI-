@@ -1,5 +1,5 @@
 import type { OptionType } from '@trading-app/shared';
-import { blackScholesPrice, blackScholesDelta, daysToExpiration } from './black-scholes.js';
+import { blackScholesPrice, blackScholesDelta, bsImpliedVolatility, daysToExpiration } from './black-scholes.js';
 import { pavaMonotone } from './monotone-theo.js';
 
 /**
@@ -43,6 +43,12 @@ export interface OptionChainRow {
    * column is built on. Falls back to averaged neighbour `midIv` when missing.
    */
   smvVol?: number;
+  /**
+   * When the vendor last recomputed `smvVol`/`midIv` (ms epoch). Tradier
+   * refreshes greeks hourly in production and sends none in sandbox. Absent ⇒
+   * unknown age.
+   */
+  greeksUpdatedMs?: number;
 }
 
 export type Mispricing = 'expensive' | 'cheap' | 'fair';
@@ -82,6 +88,13 @@ export interface OtmMispricingCandidate {
 
   /** σ used to compute theo (smvVol if available, else smoothed midIv). */
   ivUsed: number;
+  /**
+   * Which σ priced this row: vendor `smv_vol`, vendor neighbour `mid_iv`, or
+   * `live_smoothed` (solved from current neighbour mids). Absent on legacy rows.
+   */
+  ivSource?: 'vendor_smv' | 'vendor_mid_smoothed' | 'live_smoothed';
+  /** now − vendor `greeks.updated_at`, ms. Absent when the vendor sent no stamp. */
+  greeksAgeMs?: number;
   /** Sign-adjusted Black-Scholes delta of the OTM contract. */
   delta: number;
   /**
@@ -230,6 +243,22 @@ export interface OtmScannerOptions {
    *    paying the spread.
    */
   mispricingBasis?: 'mid' | 'executable';
+  /**
+   * Where theo's σ comes from.
+   *  - `vendor` (default, legacy): Tradier/ORATS `smv_vol`, else neighbour `mid_iv`.
+   *  - `live`: σ solved locally from the CURRENT mids of the ±`ivSmoothingWindow`
+   *    neighbour strikes (the row itself excluded, so a row cannot price itself
+   *    fair by construction). Uses only the quotes in hand, so it can never be
+   *    an hour older than the quote it is compared against.
+   */
+  ivSource?: 'vendor' | 'live';
+  /**
+   * Vendor greeks older than this (ms, measured from `greeksUpdatedMs`) are not
+   * used; the row falls back to the `live` σ. Rows with NO vendor stamp are
+   * treated as stale too once this is finite. Default `Infinity` (legacy: age
+   * ignored). Tradier refreshes greeks hourly, so ~75–90 min is the sane value.
+   */
+  maxGreeksAgeMs?: number;
   /** Override of `Date.now()` — test seam. */
   now?: number;
   /**
@@ -253,6 +282,8 @@ const DEFAULTS: Required<Omit<OtmScannerOptions, 'now' | 'onAdmission'>> = {
   mispricingThresholdPct: 0.15,
   ivSmoothingWindow: 3,
   minAbsDelta: 0,
+  ivSource: 'vendor',
+  maxGreeksAgeMs: Number.POSITIVE_INFINITY,
 };
 
 function classify(mispricingPct: number, threshold: number): Mispricing {
@@ -338,6 +369,45 @@ function smoothedIv(
     if (i === targetIdx) continue;
     const iv = sortedSameTypeRows[i].midIv;
     if (typeof iv === 'number' && iv > 0) {
+      sum += iv;
+      count += 1;
+    }
+  }
+  return count > 0 ? sum / count : null;
+}
+
+/**
+ * σ solved from the CURRENT two-sided mids of the ±`window` same-type,
+ * same-expiration neighbours (the target row excluded), averaged. Uses only the
+ * quotes in hand, so — unlike the hourly vendor surface — it cannot be older
+ * than the quote it is compared with. Null when no neighbour solves.
+ */
+export function liveSmoothedIv(
+  sortedSameTypeRows: OptionChainRow[],
+  targetIdx: number,
+  window: number,
+  ctx: { spot: number; timeToExpiryYears: number; riskFreeRate: number; dividendYield: number },
+): number | null {
+  const lo = Math.max(0, targetIdx - window);
+  const hi = Math.min(sortedSameTypeRows.length - 1, targetIdx + window);
+  let sum = 0;
+  let count = 0;
+  for (let i = lo; i <= hi; i += 1) {
+    if (i === targetIdx) continue;
+    const r = sortedSameTypeRows[i];
+    const bid = r.bid ?? 0;
+    const ask = r.ask ?? 0;
+    if (!(bid > 0 && ask >= bid)) continue;
+    const iv = bsImpliedVolatility({
+      spot: ctx.spot,
+      strike: r.strike,
+      timeToExpiryYears: ctx.timeToExpiryYears,
+      riskFreeRate: ctx.riskFreeRate,
+      dividendYield: ctx.dividendYield,
+      optionType: r.optionType,
+      marketPrice: (bid + ask) / 2,
+    });
+    if (iv != null && iv > 0.01 && iv < 5) {
       sum += iv;
       count += 1;
     }
@@ -464,19 +534,43 @@ export function findMispricedOtmContracts(
       continue;
     }
 
-    // Theo IV: smvVol > smoothed neighbour midIv > skip.
-    let ivUsed = row.smvVol && row.smvVol > 0 ? row.smvVol : null;
+    const carry = carryFor(row.expiration, dte);
+
+    // Theo IV. Vendor path (legacy): smvVol > smoothed neighbour midIv. The
+    // vendor surface is refreshed hourly (absent in sandbox), so when it is too
+    // old — or `ivSource: 'live'` — σ is solved from the neighbours' CURRENT mids.
+    const greeksAgeMs = typeof row.greeksUpdatedMs === 'number' ? now - row.greeksUpdatedMs : undefined;
+    const vendorUsable =
+      opts.ivSource === 'vendor' &&
+      (!Number.isFinite(opts.maxGreeksAgeMs) ||
+        (greeksAgeMs !== undefined && greeksAgeMs <= opts.maxGreeksAgeMs));
+    const bucket = sortedByType.get(`${row.expiration}|${row.optionType}`)!;
+    const idx = bucket.indexOf(row);
+    let ivUsed: number | null = null;
+    let ivSource: OtmMispricingCandidate['ivSource'];
+    if (vendorUsable) {
+      if (row.smvVol && row.smvVol > 0) {
+        ivUsed = row.smvVol;
+        ivSource = 'vendor_smv';
+      } else {
+        ivUsed = smoothedIv(bucket, idx, opts.ivSmoothingWindow);
+        if (ivUsed != null) ivSource = 'vendor_mid_smoothed';
+      }
+    }
     if (ivUsed == null) {
-      const bucket = sortedByType.get(`${row.expiration}|${row.optionType}`)!;
-      const idx = bucket.indexOf(row);
-      ivUsed = smoothedIv(bucket, idx, opts.ivSmoothingWindow);
+      ivUsed = liveSmoothedIv(bucket, idx, opts.ivSmoothingWindow, {
+        spot: underlyingPrice,
+        timeToExpiryYears: dte / 365,
+        riskFreeRate: opts.riskFreeRate,
+        dividendYield: carry.q,
+      });
+      if (ivUsed != null) ivSource = 'live_smoothed';
     }
     if (ivUsed == null) {
       emit?.('no_iv');
       continue;
     }
 
-    const carry = carryFor(row.expiration, dte);
     const theo = blackScholesPrice({
       spot: underlyingPrice,
       strike: row.strike,
@@ -532,6 +626,8 @@ export function findMispricedOtmContracts(
       openInterest,
       volume: row.volume ?? 0,
       ivUsed,
+      ivSource,
+      ...(greeksAgeMs === undefined ? {} : { greeksAgeMs }),
       delta,
       carryUsed: carry.q,
       carrySource: carry.source,

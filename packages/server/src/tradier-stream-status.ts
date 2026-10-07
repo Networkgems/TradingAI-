@@ -157,6 +157,12 @@ export function isTradierStreamEnabled(env: NodeJS.ProcessEnv = process.env): bo
   return v === '1' || v === 'true' || v === 'yes' || v === 'on';
 }
 
+/** `TRADIER_STREAM_FEEDS_QUOTES` — default ON while the stream runs; `0`/`false`/`off` keeps it status-only. */
+export function streamFeedsQuotes(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = (env['TRADIER_STREAM_FEEDS_QUOTES'] ?? '').trim().toLowerCase();
+  return !(v === '0' || v === 'false' || v === 'no' || v === 'off');
+}
+
 export function resolveTradierStreamToken(env: NodeJS.ProcessEnv = process.env): string {
   return ((env['TRADIER_MARKET_DATA_TOKEN'] ?? '').trim() || (env['TRADIER_API_TOKEN'] ?? '').trim());
 }
@@ -289,6 +295,14 @@ export interface TradierStreamServiceDeps {
   env?: NodeJS.ProcessEnv;
   /** Symbols the stocks/options books watch — read once, at start(). */
   resolveSymbols: () => readonly string[];
+  /**
+   * Called for every stream quote/trade so the engine's quote cache can be
+   * refreshed in real time (see `applyStreamTickToQuoteCache`). Wired only when
+   * `TRADIER_STREAM_FEEDS_QUOTES` is not `0`.
+   */
+  onTick?: (symbol: string, tick: { bid?: number; ask?: number; bidSize?: number; askSize?: number; last?: number; eventTime: number }) => void;
+  /** What the quote overlay actually did — published on the stream route. */
+  overlayCounters?: () => Record<string, unknown>;
   /** Test seam: build the feed. Defaults to a production `TradierStreamFeed`. */
   createFeed?: (opts: TradierStreamFeedOptions) => Pick<TradierStreamFeed, 'start' | 'stop' | 'getStatus' | 'on'>;
   now?: () => number;
@@ -333,6 +347,13 @@ export function createTradierStreamService(deps: TradierStreamServiceDeps): Trad
       // operator reading the box's logs sees the same thing the route does.
       feed.on('error', (err) => log.warn('tradier stream error', { error: err.message }));
       feed.on('state', (next, prev) => log.info('tradier stream state', { from: prev, to: next }));
+      if (deps.onTick && streamFeedsQuotes(env)) {
+        const onTick = deps.onTick;
+        feed.on('quote', (q) => onTick(q.symbol, {
+          bid: q.bidPrice, ask: q.askPrice, bidSize: q.bidSize, askSize: q.askSize, eventTime: q.eventTime,
+        }));
+        feed.on('trade', (t) => onTick(t.symbol, { last: t.price, eventTime: t.timestamp }));
+      }
       feed.start();
       log.info('tradier stream started', {
         symbols: subscribed.length,
@@ -360,7 +381,13 @@ export function createTradierStreamService(deps: TradierStreamServiceDeps): Trad
           symbolLimitError: symbolLimit.error,
         };
       }
-      return buildTradierStreamPayload(feed.getStatus(), subscribed, t, selection, symbolLimit);
+      const payload = buildTradierStreamPayload(feed.getStatus(), subscribed, t, selection, symbolLimit);
+      return {
+        ...payload,
+        // Config fact (named as one) + the overlay's measured outcome counters.
+        feedsQuotesConfigured: Boolean(deps.onTick) && streamFeedsQuotes(env),
+        quoteOverlay: deps.overlayCounters ? deps.overlayCounters() : null,
+      };
     },
   };
 }

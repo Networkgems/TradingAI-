@@ -186,6 +186,8 @@ export {
   InMemoryOrderIntentJournal,
   __resetUnknownIntentBreakerForTest,
   TradierOptionsClient,
+  parseGreeksUpdatedAt,
+  resolveGreeksUpdatedAtZone,
   TradierStocksClient,
   tradierBaseUrl,
   underlyingFromOcc,
@@ -507,7 +509,7 @@ export type {
   PortfolioGreeksGateInput,
   PortfolioGreeksGateVerdict,
 } from './options/portfolio-greeks-gate.js';
-export { findMispricedOtmContracts, parityImpliedCarry } from './options/otm-mispricing.js';
+export { findMispricedOtmContracts, parityImpliedCarry, liveSmoothedIv } from './options/otm-mispricing.js';
 export type {
   OptionChainRow,
   OtmMispricingCandidate,
