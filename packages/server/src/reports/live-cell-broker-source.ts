@@ -279,11 +279,11 @@ const TOLERANCE_USD = 0.011;
 /**
  * TRA-5270 — tolerance for a `tradier-balance` cell vs broker realized. NOT the
  * 0.011 above: that is right for header-vs-figure self-consistency (same number,
- * two renderings). A balance delta and a sidecar realized figure are different
- * measures over different spans (commissions/fees, rounding across several
- * legs, intraday MTM drift), so small gaps are measurement noise. Measured on
- * the live store, the sidecar-backed gaps under $5 are 1.11 and 1.16. $5 clears
- * those and still catches the shape this ticket is about (+74.30, +168.15).
+ * two renderings). The cell's options leg is GROSS (round dollars) and the sidecar
+ * figure is NET of commissions, so a systematic cents-level basis gap exists on
+ * every cell with option activity. Measured on the live store, those gaps are
+ * 0.24–3.11; $5 clears them and still catches the material ones (08-04 −157.75,
+ * 08-21 −121.30, 08-24 +84.72).
  */
 const BALANCE_VS_REALIZED_TOLERANCE_USD = 5;
 
@@ -449,8 +449,13 @@ export function auditLiveCellSource(input: LiveCellSourceInput): LiveCellSourceV
         'ungraded_fifo_basis',
       );
     }
+    // Graded on the OPTIONS leg, like every other arm: `broker.realizedUsd` is the broker's
+    // realized OPTIONS P&L (see `BrokerDayEvidence`), while a balance delta (`combinedPnl`) also
+    // carries the equity leg and MTM — 14 of the 26 cells the first draft flipped tied to the
+    // cent on the options leg and differed only by equity.
     const brokerRealized = input.broker.realizedUsd;
-    if (Math.abs(input.combinedPnl - brokerRealized) > BALANCE_VS_REALIZED_TOLERANCE_USD) {
+    const optionsGap = input.optionsPnl - brokerRealized;
+    if (Math.abs(optionsGap) > BALANCE_VS_REALIZED_TOLERANCE_USD) {
       return {
         status: 'balance_cell_off_broker_realized',
         sourceClass,
@@ -460,14 +465,15 @@ export function auditLiveCellSource(input: LiveCellSourceInput): LiveCellSourceV
         brokerEvidenceSource: ev,
         balanceGrade: 'graded',
         detail:
-          `${input.reportDate} renders ${signed(input.combinedPnl)} from a broker balance delta, `
-          + `but the broker's realized P&L for the date is ${signed(brokerRealized)}, a gap of `
-          + `${usd(input.combinedPnl - brokerRealized)} (tolerance ${usd(BALANCE_VS_REALIZED_TOLERANCE_USD)}). `
-          + `Its own header agrees with the rendered figure, so the header check could not see it.`,
+          `${input.reportDate} is a broker balance-delta cell (renders ${signed(input.combinedPnl)}), `
+          + `but its options leg is ${signed(input.optionsPnl)} against the broker's realized options P&L of `
+          + `${signed(brokerRealized)}, a gap of ${usd(optionsGap)} (tolerance ${usd(BALANCE_VS_REALIZED_TOLERANCE_USD)}). `
+          + `Its own header agrees with the rendered figure, so the header check could not see it. `
+          + `Equity realized is not graded here.`,
       };
     }
     return withGrade(
-      ok(input, sourceClass, `${headerOk} Ties to broker realized (${signed(brokerRealized)}).`),
+      ok(input, sourceClass, `${headerOk} Options leg ties to broker realized options P&L (${signed(brokerRealized)}); equity leg not graded.`),
       'graded',
     );
   }

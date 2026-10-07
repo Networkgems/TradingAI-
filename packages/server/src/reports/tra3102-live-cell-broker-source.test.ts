@@ -238,12 +238,12 @@ describe('a broker-tagged cell whose figure its own header contradicts', () => {
 
 describe('TRA-5270 — a tradier-balance cell off sidecar-backed broker realized', () => {
   const SIDECAR = (realizedUsd: number): BrokerDayEvidence => ({ known: true, realizedUsd, source: 'sidecar' });
-  const balanceCell = (date: string, rendered: number, broker: BrokerDayEvidence) =>
+  const balanceCell = (date: string, rendered: number, broker: BrokerDayEvidence, optionsPnl = 0) =>
     cell({
       reportDate: date,
       pnlSource: 'tradier-balance',
       combinedPnl: rendered,
-      optionsPnl: 0,
+      optionsPnl,
       // The row's own header agrees with its figure — the only thing the old arm checked.
       markdown: tra359Header(date, '468.58', '2026-06-30', '510.76', (rendered >= 0 ? '+' : '') + rendered.toFixed(2)),
       broker,
@@ -261,26 +261,36 @@ describe('TRA-5270 — a tradier-balance cell off sidecar-backed broker realized
       expect(v.status).toBe('balance_cell_off_broker_realized');
       expect(v.brokerPnl).toBe(row.broker);
       expect(v.balanceGrade).toBe('graded');
-      expect(v.detail).toContain(row.gap.toFixed(2));
+      expect(v.detail).toContain(Math.abs(row.broker).toFixed(2));
       expect(isUnreconciled(v)).toBe(true);
     });
   }
 
   it('does NOT flag a cell that ties to broker realized, and says it was graded', () => {
-    const v = auditLiveCellSource(balanceCell('2026-07-01', -116.48, SIDECAR(-116.48)));
+    const v = auditLiveCellSource(balanceCell('2026-07-01', -116.48, SIDECAR(-116.48), -116.48));
     expect(v.status).toBe('ok');
     expect(v.balanceGrade).toBe('graded');
-    expect(v.detail).toContain('Ties to broker realized');
+    expect(v.detail).toContain('ties to broker realized');
   });
 
   it('own tolerance: a $1.16 cross-measure gap is noise, a $6.81 gap is not (not the 0.011 self-consistency bar)', () => {
-    expect(auditLiveCellSource(balanceCell('2026-08-28', -57.4, SIDECAR(-56.24))).status).toBe('ok');
-    expect(auditLiveCellSource(balanceCell('2026-08-25', 7.57, SIDECAR(0.76))).status).toBe('balance_cell_off_broker_realized');
+    expect(auditLiveCellSource(balanceCell('2026-08-28', -57.4, SIDECAR(-56.24), -57.4)).status).toBe('ok');
+    expect(auditLiveCellSource(balanceCell('2026-08-25', 7.57, SIDECAR(0.76), 7.57)).status).toBe('balance_cell_off_broker_realized');
   });
 
-  it('is NOT gated on open-position count: the live 2026-08-05 row (openPositionCount 0) is graded and flags', () => {
-    const v = auditLiveCellSource(balanceCell('2026-08-05', -240.64, SIDECAR(-427.11)));
-    expect(v.status).toBe('balance_cell_off_broker_realized');
+  it('2026-08-05 is a POSITIVE case: options leg -424.00 vs broker -427.11 is a $3.11 gross-vs-net gap, graded ok', () => {
+    // combined -240.64 is the balance delta (equity + MTM included) — NOT the graded quantity.
+    const v = auditLiveCellSource(balanceCell('2026-08-05', -240.64, SIDECAR(-427.11), -424));
+    expect(v.status).toBe('ok');
+    expect(v.balanceGrade).toBe('graded');
+  });
+
+  it('an EQUITY-only gap is not flagged: options leg ties the broker to the cent, combined differs by equity', () => {
+    for (const [d, combined] of [['2026-08-17', -197.36], ['2026-07-09', -178.11]] as const) {
+      const v = auditLiveCellSource(balanceCell(d, combined, SIDECAR(0), 0));
+      expect(v.status).toBe('ok');
+      expect(v.balanceGrade).toBe('graded');
+    }
   });
 
   it('a fifo_row basis is UNGRADED — a reconstructed 0.00 is an absence, not a broker zero', () => {
@@ -307,7 +317,7 @@ describe('TRA-5270 — a tradier-balance cell off sidecar-backed broker realized
   });
 
   it('ok-graded and ok-ungraded never share bytes (the house bug)', () => {
-    const graded = auditLiveCellSource(balanceCell('2026-07-01', -116.48, SIDECAR(-116.48)));
+    const graded = auditLiveCellSource(balanceCell('2026-07-01', -116.48, SIDECAR(-116.48), -116.48));
     const ungraded = auditLiveCellSource(
       balanceCell('2026-07-01', -116.48, { known: true, realizedUsd: -116.48, source: 'fifo_row' }),
     );
@@ -343,36 +353,32 @@ describe('TRA-5270 — a tradier-balance cell off sidecar-backed broker realized
     expect(s.balanceGrade).toBe('graded');
   });
 
-  // BLAST RADIUS AS DATA — the 52 `ok` tradier-balance cells on live 5c936c11 whose verdict the
-  // first draft changed (26), read off the wire by the CEO. Replayed through the shipped
-  // function: how many still flip under the re-keyed rule.
-  it('blast radius: of the 26 cells the first draft flipped, which still flip', () => {
-    const TABLE: Array<[string, number, number, 'sidecar' | 'fifo_row']> = [
-      ['2026-06-30', -88.04, 0, 'fifo_row'], ['2026-07-02', -0.08, 0, 'fifo_row'],
-      ['2026-07-09', -178.11, 0, 'fifo_row'], ['2026-07-10', -0.04, 0, 'fifo_row'],
-      ['2026-08-04', -22.93, 155.75, 'sidecar'], ['2026-08-05', -240.64, -427.11, 'sidecar'],
-      ['2026-08-06', -59.09, -20.86, 'sidecar'], ['2026-08-09', -63.54, 0, 'fifo_row'],
-      ['2026-08-10', -16.47, 0, 'fifo_row'], ['2026-08-11', -0.42, -16.86, 'sidecar'],
-      ['2026-08-12', -0.1, 0, 'fifo_row'], ['2026-08-17', -197.36, 0, 'fifo_row'],
-      ['2026-08-18', -196.44, -393.92, 'sidecar'], ['2026-08-19', -0.12, 0, 'fifo_row'],
-      ['2026-08-20', -71.36, 0, 'fifo_row'], ['2026-08-21', -26.53, -17.7, 'sidecar'],
-      ['2026-08-24', -34.59, -99.72, 'sidecar'], ['2026-08-25', 7.57, 0.76, 'sidecar'],
-      ['2026-08-26', -20.17, -7.24, 'sidecar'], ['2026-08-27', -0.13, -1.24, 'sidecar'],
-      ['2026-08-28', -57.4, -56.24, 'sidecar'], ['2026-08-31', -66.1, 0, 'fifo_row'],
-      ['2026-09-01', -49, 0, 'fifo_row'], ['2026-09-02', 5.73, -130.72, 'sidecar'],
-      ['2026-09-03', -10.12, 0, 'fifo_row'], ['2026-10-05', -10, 0, 'fifo_row'],
+  // BLAST RADIUS AS DATA — the 26 `tradier-balance` cells the first draft (combined-vs-broker)
+  // flipped on live 5c936c11, read off the wire by the CFO. [date, combined, cellOptions, brokerRealized, source].
+  // Replayed through the shipped function: only the three genuine options-leg failures still flip.
+  it('blast radius: of the 26 cells the first draft flipped, only the 3 material options-leg gaps still flip', () => {
+    const TABLE: Array<[string, number, number, number, 'sidecar' | 'fifo_row']> = [
+      ['2026-06-30', -88.04, 0, 0, 'fifo_row'], ['2026-07-02', -0.08, 0, 0, 'fifo_row'],
+      ['2026-07-09', -178.11, 0, 0, 'fifo_row'], ['2026-07-10', -0.04, 0, 0, 'fifo_row'],
+      ['2026-08-04', -22.93, -2, 155.75, 'sidecar'], ['2026-08-05', -240.64, -424, -427.11, 'sidecar'],
+      ['2026-08-06', -59.09, -20, -20.86, 'sidecar'], ['2026-08-09', -63.54, 0, 0, 'fifo_row'],
+      ['2026-08-10', -16.47, 0, 0, 'fifo_row'], ['2026-08-11', -0.42, -16, -16.86, 'sidecar'],
+      ['2026-08-12', -0.1, 0, 0, 'fifo_row'], ['2026-08-17', -197.36, 0, 0, 'fifo_row'],
+      ['2026-08-18', -196.44, -393, -393.92, 'sidecar'], ['2026-08-19', -0.12, 0, 0, 'fifo_row'],
+      ['2026-08-20', -71.36, 0, 0, 'fifo_row'], ['2026-08-21', -26.53, -139, -17.7, 'sidecar'],
+      ['2026-08-24', -34.59, -15, -99.72, 'sidecar'], ['2026-08-25', 7.57, 1, 0.76, 'sidecar'],
+      ['2026-08-26', -20.17, -7, -7.24, 'sidecar'], ['2026-08-27', -0.13, -1, -1.24, 'sidecar'],
+      ['2026-08-28', -57.4, -56, -56.24, 'sidecar'], ['2026-08-31', -66.1, 0, 0, 'fifo_row'],
+      ['2026-09-01', -49, 0, 0, 'fifo_row'], ['2026-09-02', 5.73, -129.5, -130.72, 'sidecar'],
+      ['2026-09-03', -10.12, 0, 0, 'fifo_row'], ['2026-10-05', -10, 0, 0, 'fifo_row'],
     ];
-    const out = TABLE.map(([d, r, b, src]) => {
-      const v = auditLiveCellSource(balanceCell(d, r, { known: true, realizedUsd: b, source: src }));
+    const out = TABLE.map(([d, r, o, b, src]) => {
+      const v = auditLiveCellSource(balanceCell(d, r, { known: true, realizedUsd: b, source: src }, o));
       return { d, status: v.status, grade: v.balanceGrade };
     });
     const flagged = out.filter(o => o.status === 'balance_cell_off_broker_realized').map(o => o.d);
-    // every fifo_row cell (14) is ungraded; only sidecar-backed gaps > $5 flip (10 of 12)
     expect(out.filter(o => o.grade === 'ungraded_fifo_basis').length).toBe(14);
-    expect(flagged).toEqual([
-      '2026-08-04', '2026-08-05', '2026-08-06', '2026-08-11', '2026-08-18',
-      '2026-08-21', '2026-08-24', '2026-08-25', '2026-08-26', '2026-09-02',
-    ]);
+    expect(flagged).toEqual(['2026-08-04', '2026-08-21', '2026-08-24']);
   });
 });
 
@@ -399,8 +405,9 @@ describe('healthy real rows are NOT flagged', () => {
     const graded = auditLiveCellSource(
       cell({ ...base, broker: { known: true, realizedUsd: -427.11, source: 'sidecar' } }),
     );
-    expect(graded.status).toBe('balance_cell_off_broker_realized');
-    expect(isUnreconciled(graded)).toBe(true);
+    // options leg -424 vs broker -427.11 = $3.11 gross-vs-net gap, inside tolerance.
+    expect(graded.status).toBe('ok');
+    expect(graded.balanceGrade).toBe('graded');
   });
 
   it('2026-08-04 — no broker figure: ungraded, and the verdict says so', () => {
