@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 import type { TradierCashEvent } from '@trading-app/engine';
+import type { AccountSettings } from '@trading-app/shared';
 
 import {
   parseRebuildIntent,
@@ -330,8 +331,13 @@ describe('TRA-3595 a fetch that never reached the broker is BLIND, not REFUSED',
   });
 
   it('the host fetcher reports missing credentials rather than returning zero events ok', async () => {
-    const fetcher = buildHostCashEventFetcher({} as NodeJS.ProcessEnv);
-    const out = await fetcher('2026-01-01', '2026-09-16');
+    const fetcher = buildHostCashEventFetcher({
+      env: 'production',
+      loadSettings: async () => ({}) as AccountSettings,
+      isOperator: () => true,
+      procEnv: {} as NodeJS.ProcessEnv,
+    });
+    const out = await fetcher('2026-01-01', '2026-09-16', 'admin');
     expect(out.ok).toBe(false);
     expect(out.events).toEqual([]);
     expect(out.detail).toMatch(/TRADIER_API_TOKEN/);
@@ -550,5 +556,171 @@ describe('TRA-3595 the rebuild is bounded by the record`s own span', () => {
     expect(result.books[0]!.applied).toBe(false);
     expect(result.books[0]!.storedSpan).toBeNull();
     expect(readFileSync(bookPath('admin'), 'utf-8')).toBe(before);
+  });
+});
+
+// ── 9. TRA-5262 — the fetch reads EACH BOOK's OWN broker account ─────────────
+//
+// Measured on live bqb1 (dry run #2, 2026-09-18): `v0nni`'s v1 record holds a
+// single date, 2026-08-05, stored +$400 — and the rebuild read `eventsInSpan: 0`
+// and REFUSED. The record is fine. The fetch was aimed at the wrong account:
+// the deployment-level TRADIER_ACCOUNT_ID (the operator's ***0154), on the
+// stale TRA-3081 premise that one shared account backs every book. `v0nni` is
+// the ratified SECOND production account (***9652, TRA-3703) and its record was
+// minted by the recording path from its OWN saved creds. The guard caught a
+// wrong-account replay exactly as designed; the defect was upstream of it.
+
+/** v0nni's real shape: one funding deposit, on ITS OWN account's history. */
+const V0NNI_STORED_V1 = { netByDate: { '2026-08-05': 400 }, seenIds: ['dep1'] };
+const V0NNI_EVENTS: TradierCashEvent[] = [
+  { date: '2026-08-05', type: 'ach', amount: 400, transactionId: 'dep1' },
+];
+
+describe('TRA-5262 per-book history replay', () => {
+  // THE INCIDENT, resolved: with the fetch keyed by book, each record is graded
+  // against its own account's history and both books pass.
+  it('a book on a SECOND account reproduces its own history and reads CLEAN', async () => {
+    seedBook('admin', STORED_V1);
+    seedBook('v0nni', V0NNI_STORED_V1);
+    const result = await runCashFlowRebuild({
+      dataDir: root,
+      env: 'production',
+      intent: parseRebuildIntent('dry-run'),
+      fetchCashEvents: async (_s, _e, username) =>
+        ({ ok: true, events: username === 'v0nni' ? [...V0NNI_EVENTS] : [...EVENTS], detail: '' }),
+    });
+    expect(result.verdict).toBe('CLEAN');
+    const v0nni = result.books.find(b => b.username === 'v0nni')!;
+    expect(v0nni.outcome).toBe('CLEAN');
+    expect(v0nni.reproductionOk).toBe(true);
+    expect(v0nni.eventsInSpan).toBe(1);
+    // An ACH deposit is NOT reclassified by TRA-2906 — the migration must not
+    // move this book's calendar at all.
+    expect(v0nni.movedDates).toEqual([]);
+    expect(v0nni.totalPnlShiftUsd).toBe(0);
+    expect(result.books.find(b => b.username === 'admin')!.outcome).toBe('CLEAN');
+  });
+
+  // THE MUTATION — the pre-TRA-5262 behaviour: one shared fetch serving the
+  // OPERATOR's history to every book. v0nni must refuse, reproducing the live
+  // 09-18 refusal byte-for-byte in direction and date. If this passed, the
+  // per-book fetch above would be decorative.
+  it('replaying the OPERATOR`s history against the second book still REFUSES', async () => {
+    seedBook('v0nni', V0NNI_STORED_V1);
+    const before = readFileSync(bookPath('v0nni'), 'utf-8');
+    const result = await runCashFlowRebuild({
+      dataDir: root,
+      env: 'production',
+      intent: parseRebuildIntent('apply:v0nni'),
+      fetchCashEvents: okFetch(), // the operator's events — nothing on 2026-08-05
+    });
+    expect(result.verdict).toBe('REFUSED');
+    const v0nni = result.books[0]!;
+    expect(v0nni.applied).toBe(false);
+    expect(v0nni.eventsInSpan).toBe(0);
+    expect(v0nni.mismatches).toEqual([
+      { date: '2026-08-05', stored: 400, rebuilt: 0, delta: -400 },
+    ]);
+    expect(readFileSync(bookPath('v0nni'), 'utf-8')).toBe(before);
+  });
+
+  // The apply this diagnosis unblocks: `apply:v0nni` against its own history
+  // writes v2, backs up v1, and the typed record carries the deposit.
+  it('apply:v0nni against its OWN history writes the typed deposit', async () => {
+    seedBook('v0nni', V0NNI_STORED_V1);
+    const result = await runCashFlowRebuild({
+      dataDir: root,
+      env: 'production',
+      intent: parseRebuildIntent('apply:v0nni'),
+      fetchCashEvents: async (_s, _e, username) =>
+        ({ ok: true, events: username === 'v0nni' ? [...V0NNI_EVENTS] : [], detail: '' }),
+      now: new Date('2026-10-07T02:00:00Z'),
+    });
+    expect(result.verdict).toBe('CLEAN');
+    expect(result.books[0]!.applied).toBe(true);
+    const written = JSON.parse(readFileSync(bookPath('v0nni'), 'utf-8')) as {
+      events: TradierCashEvent[];
+    };
+    expect(written.events).toEqual(V0NNI_EVENTS);
+    expect(JSON.parse(readFileSync(`${bookPath('v0nni')}.v1-backup-2026-10-07`, 'utf-8')).netByDate)
+      .toEqual(V0NNI_STORED_V1.netByDate);
+  });
+});
+
+describe('TRA-5262 host fetcher credential scoping', () => {
+  const SETTINGS: Record<string, AccountSettings> = {
+    admin: {
+      liveApiKeyOptionsProduction: 'tok-admin',
+      liveAccountIdOptionsProduction: 'VA000154',
+    } as AccountSettings,
+    v0nni: {
+      liveApiKeyOptionsProduction: 'tok-v0nni',
+      liveAccountIdOptionsProduction: 'VA009652',
+    } as AccountSettings,
+    twin: {
+      liveApiKeyOptionsProduction: 'tok-admin',
+      liveAccountIdOptionsProduction: 'VA000154',
+    } as AccountSettings,
+    blank: {} as AccountSettings,
+  };
+
+  function mockHttp(calls: { url: string; auth: string }[]): typeof fetch {
+    return (async (url: unknown, init?: { headers?: Record<string, string> }) => {
+      calls.push({ url: String(url), auth: init?.headers?.['Authorization'] ?? '' });
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({ history: null }),
+      };
+    }) as unknown as typeof fetch;
+  }
+
+  function fetcher(calls: { url: string; auth: string }[], procEnv: NodeJS.ProcessEnv = {}) {
+    return buildHostCashEventFetcher({
+      env: 'production',
+      loadSettings: async (u) => SETTINGS[u] ?? ({} as AccountSettings),
+      isOperator: (u) => u === 'admin',
+      procEnv,
+      httpFetch: mockHttp(calls),
+    });
+  }
+
+  it('each book`s history is fetched from ITS OWN account with ITS OWN token', async () => {
+    const calls: { url: string; auth: string }[] = [];
+    const fetchFor = fetcher(calls);
+    await fetchFor('2026-01-01', '2026-10-06', 'admin');
+    await fetchFor('2026-01-01', '2026-10-06', 'v0nni');
+    expect(calls).toHaveLength(2);
+    expect(calls[0]!.url).toContain('/accounts/VA000154/history');
+    expect(calls[0]!.auth).toBe('Bearer tok-admin');
+    expect(calls[1]!.url).toContain('/accounts/VA009652/history');
+    expect(calls[1]!.auth).toBe('Bearer tok-v0nni');
+  });
+
+  // The pre-TRA-5262 behaviour made concrete, and refused: a non-operator book
+  // with blank saved creds must NOT be served the shared env pair's history.
+  // That silent lend IS the wrong-account replay. BLIND, with the pin named,
+  // and the broker never contacted.
+  it('a non-operator book with blank creds reads BLIND — never the env fallback', async () => {
+    const calls: { url: string; auth: string }[] = [];
+    const fetchFor = fetcher(calls, {
+      TRADIER_API_TOKEN: 'tok-operator',
+      TRADIER_ACCOUNT_ID: 'VA000154',
+    } as NodeJS.ProcessEnv);
+    const out = await fetchFor('2026-01-01', '2026-10-06', 'blank');
+    expect(out.ok).toBe(false);
+    expect(out.detail).toMatch(/operator-pinned/);
+    expect(out.detail).toMatch(/TRA-5262/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('books SHARING an account share one fetch; a different account fetches again', async () => {
+    const calls: { url: string; auth: string }[] = [];
+    const fetchFor = fetcher(calls);
+    await fetchFor('2026-01-01', '2026-10-06', 'admin');
+    await fetchFor('2026-01-01', '2026-10-06', 'twin');
+    await fetchFor('2026-01-01', '2026-10-06', 'v0nni');
+    expect(calls.map(c => /accounts\/([^/]+)\//.exec(c.url)?.[1])).toEqual(['VA000154', 'VA009652']);
   });
 });

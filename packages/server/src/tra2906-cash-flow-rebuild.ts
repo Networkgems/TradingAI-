@@ -96,8 +96,10 @@ import { join } from 'path';
 
 import { parseTradierCashEvents } from '@trading-app/engine';
 import type { TradierCashEvent, TradierEnv } from '@trading-app/engine';
+import type { AccountSettings } from '@trading-app/shared';
 
 import { deriveNetByDateFromEvents } from './reports/tradier-reconcile.js';
+import { resolveTradierAccountCreds } from './tradier-client-scope.js';
 
 /** The env var that arms this. Unset on every ordinary boot. */
 export const TRA2906_REBUILD_ENV_VAR = 'TRA2906_CASH_FLOW_REBUILD';
@@ -452,8 +454,20 @@ export interface RebuildDeps {
   dataDir: string;
   env: TradierEnv;
   intent: RebuildIntent;
-  /** `[start, end]` inclusive; the caller widens `start` to cover the record. */
-  fetchCashEvents: (start: string, end: string) => Promise<FetchCashEventsResult>;
+  /**
+   * `[start, end]` inclusive; the caller widens `start` to cover the record.
+   *
+   * TRA-5262 — the fetch takes the BOOK's username, because the premise behind
+   * a single shared fetch ("one shared broker account backs every book",
+   * TRA-3081) was falsified when `v0nni` was ratified as the SECOND production
+   * account (***9652, TRA-3703). Each book's v1 record was minted from ITS OWN
+   * account's history — the recording path (`reconcileTradierLiveCalendar`)
+   * builds a per-book client from the book's saved creds — so the replay must
+   * read the same account. Replaying the operator's account (***0154) against
+   * `v0nni`'s record read `stored +$400 / rebuilt $0` on 2026-08-05 and the
+   * book REFUSED for a reason that had nothing to do with its data.
+   */
+  fetchCashEvents: (start: string, end: string, username: string) => Promise<FetchCashEventsResult>;
   now?: Date;
   /** Earliest date the fetch window may start at. Records older than this read USAGE. */
   windowStart?: string;
@@ -528,18 +542,19 @@ export async function runCashFlowRebuild(deps: RebuildDeps): Promise<RebuildRunR
     };
   }
 
-  // Fetch ONCE. One shared broker account backs every book (TRA-3081), so the
-  // event history is identical per book; each record's own control then decides
-  // whether that history reproduces ITS stored totals.
-  let fetched: FetchCashEventsResult | null = null;
-  const fetchOnce = async (): Promise<FetchCashEventsResult> => {
-    if (!fetched) fetched = await deps.fetchCashEvents(start, end);
-    return fetched;
-  };
+  // Fetched PER BOOK (TRA-5262). The original single shared fetch assumed one
+  // broker account backs every book (TRA-3081); the ratified second production
+  // account (`v0nni` ***9652, TRA-3703) falsified that, and a shared fetch then
+  // replays the WRONG account's history against every non-operator record.
+  // Each record's own control still decides whether ITS account's history
+  // reproduces ITS stored totals; the host fetcher memoizes per accountId, so
+  // books that genuinely share an account still cost one broker call.
+  const fetchFor = (username: string): Promise<FetchCashEventsResult> =>
+    deps.fetchCashEvents(start, end, username);
 
   const books: BookResult[] = [];
   for (const book of inventory.books) {
-    books.push(await processBook(book, { apply, requested, end, fetchOnce }));
+    books.push(await processBook(book, { apply, requested, end, fetchFor }));
   }
 
   const graded = books.filter((b) => b.outcome !== 'SKIPPED').map((b) => b.outcome);
@@ -563,7 +578,7 @@ async function processBook(
     apply: boolean;
     requested: string[] | null;
     end: string;
-    fetchOnce: () => Promise<FetchCashEventsResult>;
+    fetchFor: (username: string) => Promise<FetchCashEventsResult>;
   },
 ): Promise<BookResult> {
   const blank = {
@@ -620,7 +635,7 @@ async function processBook(
   }
   const storedSpan = { first: storedDates[0]!, last: storedDates[storedDates.length - 1]! };
 
-  const fetchResult = await opts.fetchOnce();
+  const fetchResult = await opts.fetchFor(book.username);
   if (!fetchResult.ok) {
     // BLIND, never REFUSED. "We could not reach the broker" must not be reported
     // as "the broker disagrees with our record".
@@ -729,54 +744,106 @@ async function processBook(
 
 // ── The default host fetch ───────────────────────────────────────────────────
 
+export interface HostCashEventFetcherDeps {
+  env: TradierEnv;
+  /** `loadSettings` from `account-settings.ts` — the same store the recording path reads. */
+  loadSettings: (username: string) => Promise<AccountSettings>;
+  /** `isLiveBrokerOperator` — whether the shared env fallback may complete the pair (TRA-3112). */
+  isOperator: (username: string) => boolean;
+  procEnv?: NodeJS.ProcessEnv;
+  /** Test seam — the credential scoping below is untestable against the real broker. */
+  httpFetch?: typeof fetch;
+}
+
 /**
- * Status-preserving history fetch against the PRODUCTION Tradier account, using
- * the deployment-level `TRADIER_API_TOKEN` / `TRADIER_ACCOUNT_ID`.
+ * Status-preserving history fetch against EACH BOOK's own Tradier account.
  *
- * Those are the same credentials `envFallbackCreds` resolves for `production`,
- * and the same pair `scripts/tra2906-rebuild-cash-flow.mjs` requires. Using the
- * deployment creds rather than a per-book saved pair is correct HERE and is not
- * the TRA-3112 leak: one shared broker account backs every book (TRA-3081), the
- * fetch is read-only, and nothing it returns is shown to a user — it is compared
- * against each book's own stored totals and then discarded or persisted as that
- * book's own record.
+ * TRA-5262 — the previous version fetched the deployment-level
+ * `TRADIER_API_TOKEN` / `TRADIER_ACCOUNT_ID` for every book, on the premise
+ * that "one shared broker account backs every book (TRA-3081)". That premise
+ * was falsified when `v0nni` was ratified as the SECOND production account
+ * (***9652, TRA-3703): `v0nni`'s v1 record was minted by the recording path
+ * from ITS OWN saved creds (`reconcileTradierLiveCalendar` builds a per-book
+ * client), so replaying the operator's account (***0154) against it read
+ * `stored +$400 / rebuilt $0` on 2026-08-05 and REFUSED — the guard correctly
+ * catching a wrong-account replay, not a data defect.
+ *
+ * Credentials resolve exactly as on the recording path:
+ * `resolveTradierAccountCreds` with the TRA-3112 operator pin. A book whose
+ * creds do not resolve reads BLIND ("we could not reach ITS broker account"),
+ * in BOTH refusal cases — silently falling back to the shared operator pair
+ * here would reintroduce the wrong-account replay this function exists to
+ * remove, and `operator_pinned` is the TRA-3112 pin doing its job.
+ *
+ * Memoized per ACCOUNT id: books that genuinely share a broker account cost
+ * one history fetch, while books on different accounts can no longer be served
+ * each other's history.
  *
  * `limit=10000` on a single window rather than the server's rolling 250/1000:
  * the reproduction control needs the COMPLETE history, and a page boundary is
  * exactly the truncation the control exists to catch.
  */
 export function buildHostCashEventFetcher(
-  procEnv: NodeJS.ProcessEnv = process.env,
-): (start: string, end: string) => Promise<FetchCashEventsResult> {
-  return async (start: string, end: string): Promise<FetchCashEventsResult> => {
-    const token = (procEnv['TRADIER_API_TOKEN'] ?? '').trim();
-    const accountId = (procEnv['TRADIER_ACCOUNT_ID'] ?? '').trim();
-    if (!token || !accountId) {
-      return {
-        ok: false,
-        events: [],
-        detail: 'TRADIER_API_TOKEN and TRADIER_ACCOUNT_ID must both be set on the host.',
-      };
-    }
-    const url = `https://api.tradier.com/v1/accounts/${encodeURIComponent(accountId)}/history`
-      + `?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=10000`;
+  deps: HostCashEventFetcherDeps,
+): (start: string, end: string, username: string) => Promise<FetchCashEventsResult> {
+  const procEnv = deps.procEnv ?? process.env;
+  const httpFetch = deps.httpFetch ?? fetch;
+  const byAccount = new Map<string, Promise<FetchCashEventsResult>>();
+
+  return async (start: string, end: string, username: string): Promise<FetchCashEventsResult> => {
+    let settings: AccountSettings;
     try {
-      const resp = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-      });
-      if (!resp.ok) {
-        // The status is the whole point of not using `getJson` here.
-        return { ok: false, events: [], detail: `Tradier history HTTP ${resp.status} ${resp.statusText}` };
-      }
-      const body = (await resp.json()) as Parameters<typeof parseTradierCashEvents>[0];
-      return { ok: true, events: parseTradierCashEvents(body), detail: '' };
+      settings = await deps.loadSettings(username);
     } catch (err) {
       return {
         ok: false,
         events: [],
-        detail: err instanceof Error ? err.message : String(err),
+        detail: `could not load settings for book ${JSON.stringify(username)}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
       };
     }
+    const resolved = resolveTradierAccountCreds(settings, deps.env, deps.isOperator(username), procEnv);
+    if (!resolved.ok) {
+      return {
+        ok: false,
+        events: [],
+        detail: resolved.reason === 'operator_pinned'
+          ? `book ${JSON.stringify(username)} has no complete saved ${deps.env} Tradier creds and the `
+            + 'shared TRADIER_* pair is operator-pinned (TRA-3112). Replaying the operator\'s account '
+            + 'against this book\'s record is the TRA-5262 wrong-account defect, so the fetch refuses '
+            + 'instead of borrowing.'
+          : `no ${deps.env} Tradier credentials resolve for book ${JSON.stringify(username)} — neither `
+            + 'saved creds nor TRADIER_API_TOKEN/TRADIER_ACCOUNT_ID on the host.',
+      };
+    }
+    const { apiToken, accountId } = resolved.creds;
+    const key = `${accountId}\u0000${start}\u0000${end}`;
+    let pending = byAccount.get(key);
+    if (!pending) {
+      pending = (async (): Promise<FetchCashEventsResult> => {
+        const url = `https://api.tradier.com/v1/accounts/${encodeURIComponent(accountId)}/history`
+          + `?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=10000`;
+        try {
+          const resp = await httpFetch(url, {
+            headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
+          });
+          if (!resp.ok) {
+            // The status is the whole point of not using `getJson` here.
+            return { ok: false, events: [], detail: `Tradier history HTTP ${resp.status} ${resp.statusText}` };
+          }
+          const body = (await resp.json()) as Parameters<typeof parseTradierCashEvents>[0];
+          return { ok: true, events: parseTradierCashEvents(body), detail: '' };
+        } catch (err) {
+          return {
+            ok: false,
+            events: [],
+            detail: err instanceof Error ? err.message : String(err),
+          };
+        }
+      })();
+      byAccount.set(key, pending);
+    }
+    return pending;
   };
 }
 

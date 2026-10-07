@@ -20612,7 +20612,15 @@ void (async () => {
       dataDir: DATA_DIR,
       env: 'production',
       intent,
-      fetchCashEvents: buildHostCashEventFetcher(),
+      // TRA-5262 — per-book credential resolution, matching the recording path
+      // (`reconcileTradierLiveCalendar`). The old deployment-cred fetch replayed
+      // the operator's account against every book and refused `v0nni` (***9652),
+      // whose record was minted from its own account's history.
+      fetchCashEvents: buildHostCashEventFetcher({
+        env: 'production',
+        loadSettings,
+        isOperator: (username) => isLiveBrokerOperator(username),
+      }),
     });
     setLastRebuildRun(result);
     // Logged at WARN even on a clean run: this is a one-shot against financial
