@@ -19,7 +19,7 @@ import {
 // TRA-1977 — the PURE wheel selector + cycle planner that routes the observe-only
 // short-premium scan (TRA-1292) into the TRA-1966/1976 wheel primitives under the
 // SHADOW/paper flag. These prove the decision logic in isolation: the routing
-// full-pass gate (finite ivRank >= 50, in-universe), CSP/CC leg extraction, the
+// full-pass gate (finite ivPercentile >= 50 since TRA-5280, in-universe), CSP/CC leg extraction, the
 // cost-basis floor, expiry settlement (assign vs worthless), and the TRA-1322
 // tail guards — no account, no engine.
 
@@ -60,12 +60,12 @@ function ladder(underlying: string): OptionChainRow[] {
   return strikes.flatMap((k) => [row(underlying, k, 'put'), row(underlying, k, 'call')]);
 }
 
-/** A full-pass in-universe scan result (finite ivRank >= 50, VRP-positive, candidates present). */
-function scan(underlying: string, ivRank: number | null): ShortPremiumScanResult {
+/** A full-pass in-universe scan result (finite ivPercentile >= 50, VRP-positive, candidates present). */
+function scan(underlying: string, ivPercentile: number | null): ShortPremiumScanResult {
   return scanShortPremiumFromSnapshot(
     { symbol: underlying, spot: SPOT, expiration: EXP, rows: ladder(underlying) },
     CALM_CLOSES,
-    ivRank,
+    ivPercentile,
     { now: NOW },
   );
 }
@@ -94,7 +94,7 @@ describe('wheel-router — CSP selection (routing full-pass gate)', () => {
     expect(csp!.optionSymbol).toContain('AAPL');
   });
 
-  it('never routes the honest-unknown observe-only case (ivRank null)', () => {
+  it('never routes the honest-unknown observe-only case (ivPercentile null)', () => {
     // The scan still surfaces candidates (observe-only), but routing requires the
     // finite >= 50 full pass — the "live emits only on full pass" half of SHADOW.
     const result = scan('AAPL', null);
@@ -102,8 +102,8 @@ describe('wheel-router — CSP selection (routing full-pass gate)', () => {
     expect(selectWheelCsp(result)).toBeNull();
   });
 
-  it('never routes a sub-floor rank', () => {
-    // A finite rank below 50 stands the scan down entirely (no candidates).
+  it('never routes a sub-floor percentile', () => {
+    // A finite percentile below 50 stands the scan down entirely (no candidates).
     expect(selectWheelCsp(scan('AAPL', 40))).toBeNull();
   });
 
@@ -126,7 +126,7 @@ describe('wheel-router — covered-call selection (cost-basis floor)', () => {
     expect(selectWheelCoveredCall(scan('MSFT', 60), 1_000)).toBeNull();
   });
 
-  it('does not route a covered call on the unknown-rank observe case', () => {
+  it('does not route a covered call on the unknown-percentile observe case', () => {
     expect(selectWheelCoveredCall(scan('MSFT', null), 90)).toBeNull();
   });
 });

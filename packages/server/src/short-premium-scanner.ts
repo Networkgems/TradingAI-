@@ -29,11 +29,17 @@ import { recordShortPremiumArrival } from './short-premium-arrival-ledger.js';
 // store below, which backs the read-only `GET /api/health/short-premium`
 // diagnostics surface.
 //
-// The desk gate is ivRank >= 50 (elevated IV) + VRP-positive (IV/RV >= 1) +
-// short-strike delta ~0.15–0.30. A FINITE rank below the floor stands the scan
-// down here with a discriminating `reason`; an unknown rank (thin IV store on a
+// The desk gate is ivPercentile >= 50 (elevated IV) + VRP-positive (IV/RV >= 1)
+// + short-strike delta ~0.15–0.30. TRA-5280 (the TRA-5173 item 1 ruling): the
+// elevated-IV floor keys on the trailing-window IV PERCENTILE (TRA-2028), not
+// the IV rank — percentile wins on lift (+0.2416 vs +0.2218 mean log-ratio),
+// throughput (~1.7x) and robustness (rank is defined by two extreme order
+// statistics over 366 days, so one vol spike sets the denominator for a year).
+// The rank is RETIRED as a gate statistic and kept only as a published
+// diagnostic. A FINITE percentile below the floor stands the scan down here
+// with a discriminating `reason`; an unknown percentile (thin IV store on a
 // fresh demo, TRA-1114) is allowed to surface OBSERVE-ONLY candidates so the
-// forward sample can accrue while the store warms — the >= 50 rank gate is
+// forward sample can accrue while the store warms — the >= 50 floor is
 // re-asserted as a hard LIVE-promotion gate, not an observe gate. Live promotion
 // stays gated on TRA-382 regardless.
 //
@@ -43,16 +49,21 @@ import { recordShortPremiumArrival } from './short-premium-arrival-ledger.js';
 // evaluated. Fail-open is still correct under record-first-gate-later (TRA-2045),
 // but it must be VISIBLE: the scan record now carries `atmIv`, `ivSampleDepth`
 // and an `ivRankCoverage` code, and the summary publishes the measured/unknown
-// split per code. Nothing here gates on the new fields — whether the IVR floor
-// should bind is QuantTrader's call on the accrued sample.
+// split per code. Nothing here gates on the coverage fields — and the ruling on
+// which statistic the floor keys on landed as TRA-5173 item 1 / TRA-5280: the
+// PERCENTILE, with the rank retired to a diagnostic.
 //
 // In-memory (not the on-disk option journal) by design: these are transient,
 // observe-only candidates the board watches to decide thresholds — not trade
 // outcomes — so nothing here needs to survive a restart. Per-symbol latest-wins,
 // capped so it can't grow without bound.
 
-/** The elevated-IV floor (mirrors the engine default) — the desk's sell gate. */
-export const SHORT_PREMIUM_MIN_IV_RANK = 50;
+/**
+ * The elevated-IV floor (mirrors the engine default) — the desk's sell gate.
+ * Keys on the trailing-window IV PERCENTILE since TRA-5280; the same `>= 50`
+ * value the retired rank floor carried, applied to the more robust statistic.
+ */
+export const SHORT_PREMIUM_MIN_IV_PERCENTILE = 50;
 
 /** Why a scan produced (or did not produce) structures — surfaced for diagnosis. */
 export type ShortPremiumScanReason =
@@ -60,7 +71,7 @@ export type ShortPremiumScanReason =
   | 'no_chain'
   | 'no_spot'
   | 'no_realized_vol'
-  | 'ivrank_low'
+  | 'iv_percentile_low'
   | 'no_candidates';
 
 export interface ShortPremiumScanResult {
@@ -71,8 +82,18 @@ export interface ShortPremiumScanResult {
   realizedVol: number | null;
   /** Number of daily closes the realised-vol estimate was built from. */
   dailyCloseCount: number;
-  /** Trailing-year IV-rank (TRA-1153), or null when the store is thin/uncovered. */
+  /**
+   * Trailing-year IV-rank (TRA-1153), or null when the store is thin/uncovered.
+   * DIAGNOSTIC ONLY since TRA-5280 — the gate keys on `ivPercentile`; the rank
+   * stays published so the TRA-4917 coverage instrument keeps its series.
+   */
   ivRank: number | null;
+  /**
+   * TRA-5280 — the trailing-window IV percentile (TRA-2028) the elevated-IV
+   * floor keys on, computed off the SAME store read as `ivRank`. Null = honest
+   * unknown; the floor fails open on it (the TRA-5170 ruling).
+   */
+  ivPercentile: number | null;
   /**
    * TRA-4917 — the ATM IV the rank was (or would have been) ranked against.
    * `null` here is the `no_atm_iv` branch: extraction off the chain failed, which
@@ -92,17 +113,19 @@ export interface ShortPremiumScanResult {
 }
 
 /**
- * TRA-4917 — what the caller knows about this pass's IV-rank read. The `number |
- * null` form is the legacy shape (the rank alone, no diagnostic): it stamps
- * `not_evaluated` and leaves `atmIv`/`ivSampleDepth` null rather than fabricating
- * a branch, so an unclassified row is visible as unclassified.
+ * TRA-4917 — what the caller knows about this pass's IV read. The `number |
+ * null` form is the legacy shape (the GATE statistic alone, no diagnostic) —
+ * since TRA-5280 that bare number is the IV PERCENTILE, because the percentile
+ * is what the floor keys on. It stamps `not_evaluated` and leaves
+ * `atmIv`/`ivSampleDepth`/`ivRank` null rather than fabricating a branch, so an
+ * unclassified row is visible as unclassified.
  */
 export type ShortPremiumIvRankInput = number | null | IvRankCoverageReading;
 
 function normalizeIvRankInput(input: ShortPremiumIvRankInput): IvRankCoverageReading {
   if (input === null || typeof input === 'number') {
-    const ivRank = typeof input === 'number' && Number.isFinite(input) ? input : null;
-    return { ivRank, atmIv: null, ivSampleDepth: null, coverage: 'not_evaluated' };
+    const ivPercentile = typeof input === 'number' && Number.isFinite(input) ? input : null;
+    return { ivRank: null, ivPercentile, atmIv: null, ivSampleDepth: null, coverage: 'not_evaluated' };
   }
   return input;
 }
@@ -117,7 +140,8 @@ export interface ShortPremiumSnapshotInput {
 /**
  * Run the short-premium engine over a chain snapshot the caller already holds.
  * `dailyCloses` is the underlying's closed daily-bar close series (realised vol
- * is derived from it); `ivRank` is the trailing-year IV-rank the caller stamped.
+ * is derived from it); `ivInput` carries the IV percentile the floor keys on
+ * (TRA-5280) plus the rank-coverage diagnostics the caller stamped.
  * Pure — no I/O, no orders. Returns an empty candidate list with a discriminating
  * `reason` when a precondition fails so the diagnostics surface can explain a
  * quiet scan.
@@ -132,16 +156,17 @@ export function scanShortPremiumFromSnapshot(
   lookbackDays = 20,
 ): ShortPremiumScanResult {
   const symbol = snap.symbol.trim().toUpperCase();
-  const minIvRank = options.minIvRank ?? SHORT_PREMIUM_MIN_IV_RANK;
+  const minIvPercentile = options.minIvPercentile ?? SHORT_PREMIUM_MIN_IV_PERCENTILE;
   const reading = normalizeIvRankInput(ivRankInput);
-  const ivRank = reading.ivRank;
+  const ivPercentile = reading.ivPercentile;
   const base: Omit<ShortPremiumScanResult, 'candidates' | 'reason'> = {
     symbol,
     spot: Number.isFinite(snap.spot) && snap.spot > 0 ? snap.spot : null,
     expiration: snap.expiration || null,
     realizedVol: null,
     dailyCloseCount: dailyCloses.length,
-    ivRank: ivRank ?? null,
+    ivRank: reading.ivRank ?? null,
+    ivPercentile: ivPercentile ?? null,
     atmIv: reading.atmIv,
     ivSampleDepth: reading.ivSampleDepth,
     ivRankCoverage: reading.coverage,
@@ -150,10 +175,15 @@ export function scanShortPremiumFromSnapshot(
   if (base.spot == null) return { ...base, candidates: [], reason: 'no_spot' };
   if (snap.rows.length === 0) return { ...base, candidates: [], reason: 'no_chain' };
 
-  // Faithful desk gate: a KNOWN rank below the floor stands the scan down. An
-  // unknown rank (null) defers to observe-only so the forward sample can accrue.
-  if (typeof ivRank === 'number' && Number.isFinite(ivRank) && ivRank < minIvRank) {
-    return { ...base, candidates: [], reason: 'ivrank_low' };
+  // Faithful desk gate (TRA-5280: percentile-keyed; the rank must NOT bind): a
+  // KNOWN percentile below the floor stands the scan down. An unknown
+  // percentile (null) defers to observe-only so the forward sample can accrue.
+  if (
+    typeof ivPercentile === 'number' &&
+    Number.isFinite(ivPercentile) &&
+    ivPercentile < minIvPercentile
+  ) {
+    return { ...base, candidates: [], reason: 'iv_percentile_low' };
   }
 
   const realizedVol = realizedVolFromDailyCloses(dailyCloses, lookbackDays);
@@ -163,8 +193,8 @@ export function scanShortPremiumFromSnapshot(
 
   const candidates = findShortPremiumStructures(snap.rows, base.spot, realizedVol, {
     ...options,
-    minIvRank,
-    ivRank,
+    minIvPercentile,
+    ivPercentile,
   });
   return {
     ...base,
@@ -222,7 +252,10 @@ export interface ShortPremiumScanView {
   expiration: string | null;
   realizedVol: number | null;
   dailyCloseCount: number;
+  /** Diagnostic only since TRA-5280 — the TRA-4917 coverage instrument's series. */
   ivRank: number | null;
+  /** TRA-5280 — the trailing-window IV percentile the elevated-IV floor keys on. */
+  ivPercentile: number | null;
   /** TRA-4917 — the ATM IV behind `ivRank`; null ⇒ the `no_atm_iv` branch. */
   atmIv: number | null;
   /** TRA-4917 — usable in-window trailing samples; null ⇒ not supplied. */
@@ -247,7 +280,13 @@ export interface ShortPremiumScanView {
     ivRvRatio: number;
     impliedVol: number;
     realizedVol: number;
+    /**
+     * Echo of the scan's diagnostic `ivRank` (candidates always echoed the
+     * scan-level value by construction — TRA-4917's wire identity is kept).
+     */
     ivRank: number | null;
+    /** TRA-5280 — echo of the percentile the structure was gated on. */
+    ivPercentile: number | null;
     score: number;
     reason: string;
     legs: ShortPremiumCandidate['legs'];
@@ -302,13 +341,23 @@ export interface ShortPremiumIvRankCoverageRollup {
   /** `ivRankUnknown + candidateIvRankUnknown`. Sums with the above to `wireRowCount`. */
   wireRowsUnknown: number;
   /**
-   * The desk's documented floor. Published so a reader can see the floor AND
+   * The desk's documented floor VALUE. Retained wire key (TRA-5173's grade
+   * reads this block); since TRA-5280 the floor keys on `ivPercentile`, not the
+   * rank — see `floorStatistic`. Published so a reader can see the floor AND
    * `gateEvaluable` in one read instead of inferring the gate binds.
    */
   ivRankFloor: number;
-  /** Scans where the `ivRank >= floor` comparison actually evaluated (== `ivRankMeasured`). */
+  /** TRA-5280 — the same floor value under its honest name. */
+  ivPercentileFloor: number;
+  /** TRA-5280 — which statistic the floor compares against. Self-describing wire. */
+  floorStatistic: 'ivPercentile';
+  /**
+   * Scans where the floor comparison actually evaluated — finite `ivPercentile`
+   * since TRA-5280. (No longer == `ivRankMeasured`: the percentile is defined on
+   * a flat window where the rank is not, so this can exceed it.)
+   */
   gateEvaluable: number;
-  /** Scans where the floor was INERT because the rank was null (fails open, by design). */
+  /** Scans where the floor was INERT because the percentile was null (fails open, by design). */
   gateInert: number;
   /** The sample floor a trailing window must clear before any rank is emitted. */
   minSamples: number;
@@ -367,12 +416,14 @@ function buildIvRankCoverageRollup(
   const byCode = zeroByCode();
   const unknownByCode = zeroByCode();
   let ivRankMeasured = 0;
+  let ivPercentileMeasured = 0;
   let candidateCount = 0;
   let candidateIvRankMeasured = 0;
   for (const v of views) {
     byCode[v.ivRankCoverage] = (byCode[v.ivRankCoverage] ?? 0) + 1;
     if (finite(v.ivRank)) ivRankMeasured++;
     else unknownByCode[v.ivRankCoverage] = (unknownByCode[v.ivRankCoverage] ?? 0) + 1;
+    if (finite(v.ivPercentile)) ivPercentileMeasured++;
     candidateCount += v.candidates.length;
     for (const c of v.candidates) if (finite(c.ivRank)) candidateIvRankMeasured++;
   }
@@ -423,9 +474,11 @@ function buildIvRankCoverageRollup(
     candidateIvRankUnknown,
     wireRowsMeasured: ivRankMeasured + candidateIvRankMeasured,
     wireRowsUnknown: ivRankUnknown + candidateIvRankUnknown,
-    ivRankFloor: SHORT_PREMIUM_MIN_IV_RANK,
-    gateEvaluable: ivRankMeasured,
-    gateInert: ivRankUnknown,
+    ivRankFloor: SHORT_PREMIUM_MIN_IV_PERCENTILE,
+    ivPercentileFloor: SHORT_PREMIUM_MIN_IV_PERCENTILE,
+    floorStatistic: 'ivPercentile',
+    gateEvaluable: ivPercentileMeasured,
+    gateInert: scanCount - ivPercentileMeasured,
     minSamples: MIN_IV_SAMPLES,
     partitionOk: populated ? mismatches.length === 0 : null,
     partitionMismatch: !populated
@@ -465,7 +518,10 @@ export function summarizeShortPremiumScans(now: number = Date.now()): ShortPremi
       ivRvRatio: c.ivRvRatio,
       impliedVol: c.impliedVol,
       realizedVol: c.realizedVol,
-      ivRank: c.ivRank,
+      // The scan-level diagnostic rank, echoed — identical to the pre-TRA-5280
+      // wire (the engine always stamped the value the scan handed it).
+      ivRank: r.ivRank,
+      ivPercentile: c.ivPercentile,
       score: c.score,
       reason: c.reason,
       legs: c.legs,
@@ -479,6 +535,7 @@ export function summarizeShortPremiumScans(now: number = Date.now()): ShortPremi
         realizedVol: r.realizedVol,
         dailyCloseCount: r.dailyCloseCount,
         ivRank: r.ivRank,
+        ivPercentile: r.ivPercentile,
         atmIv: r.atmIv,
         ivSampleDepth: r.ivSampleDepth,
         ivRankCoverage: r.ivRankCoverage,

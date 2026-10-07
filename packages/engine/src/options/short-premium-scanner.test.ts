@@ -67,7 +67,7 @@ function byStructure(out: ShortPremiumCandidate[], s: ShortPremiumCandidate['str
 
 describe('findShortPremiumStructures', () => {
   it('builds a defined-risk put credit spread with an in-band short delta', () => {
-    const out = findShortPremiumStructures(ladder(), SPOT, RV, { now: NOW, ivRank: 70 });
+    const out = findShortPremiumStructures(ladder(), SPOT, RV, { now: NOW, ivPercentile: 70 });
     const put = byStructure(out, 'put_credit_spread');
     expect(put).toBeDefined();
     // short strike is OTM (below spot) and its wing is further OTM.
@@ -89,7 +89,7 @@ describe('findShortPremiumStructures', () => {
   });
 
   it('builds a bear call credit spread and an iron condor', () => {
-    const out = findShortPremiumStructures(ladder(), SPOT, RV, { now: NOW, ivRank: 70 });
+    const out = findShortPremiumStructures(ladder(), SPOT, RV, { now: NOW, ivPercentile: 70 });
     const call = byStructure(out, 'call_credit_spread');
     const condor = byStructure(out, 'iron_condor');
     expect(call).toBeDefined();
@@ -107,34 +107,42 @@ describe('findShortPremiumStructures', () => {
     expect(condor!.netCredit).toBeGreaterThan(call!.netCredit);
   });
 
-  it('suppresses the scan when a finite IV-rank below the floor is passed', () => {
-    const out = findShortPremiumStructures(ladder(), SPOT, RV, { now: NOW, ivRank: 40 });
+  it('suppresses the scan when a finite IV percentile below the floor is passed', () => {
+    const out = findShortPremiumStructures(ladder(), SPOT, RV, { now: NOW, ivPercentile: 40 });
     expect(out).toHaveLength(0);
   });
 
-  it('does not gate on rank when IV-rank is unknown (null)', () => {
-    const out = findShortPremiumStructures(ladder(), SPOT, RV, { now: NOW, ivRank: null });
+  it('passes a finite IV percentile AT the floor — the boundary is >=, not > (TRA-5280)', () => {
+    const out = findShortPremiumStructures(ladder(), SPOT, RV, { now: NOW, ivPercentile: 50 });
     expect(out.length).toBeGreaterThan(0);
-    expect(out.every((c) => c.ivRank === null)).toBe(true);
+    expect(out.every((c) => c.ivPercentile === 50)).toBe(true);
+  });
+
+  it('does not gate when the IV percentile is unknown — the TRA-5170 fail-open null branch', () => {
+    // Asserted on an EXPLICIT null, not an omitted field: a fixture that merely
+    // omitted `ivPercentile` would pass this vacuously if the option were dropped.
+    const out = findShortPremiumStructures(ladder(), SPOT, RV, { now: NOW, ivPercentile: null });
+    expect(out.length).toBeGreaterThan(0);
+    expect(out.every((c) => c.ivPercentile === null)).toBe(true);
   });
 
   it('produces nothing when VRP is negative (IV below realised vol)', () => {
     // RV well above the 0.40 chain IV ⇒ IV/RV < 1 ⇒ no short-premium edge.
-    const out = findShortPremiumStructures(ladder(), SPOT, 0.6, { now: NOW, ivRank: 70 });
+    const out = findShortPremiumStructures(ladder(), SPOT, 0.6, { now: NOW, ivPercentile: 70 });
     expect(out).toHaveLength(0);
   });
 
   it('rejects a spread whose credit is too thin relative to its width', () => {
     const out = findShortPremiumStructures(ladder(), SPOT, RV, {
       now: NOW,
-      ivRank: 70,
+      ivPercentile: 70,
       minCreditToWidth: 0.99, // impossibly rich requirement
     });
     expect(out).toHaveLength(0);
   });
 
   it('sorts candidates by score (best expected-value-per-risk first)', () => {
-    const out = findShortPremiumStructures(ladder(), SPOT, RV, { now: NOW, ivRank: 70 });
+    const out = findShortPremiumStructures(ladder(), SPOT, RV, { now: NOW, ivPercentile: 70 });
     for (let i = 1; i < out.length; i++) {
       expect(out[i - 1]!.score).toBeGreaterThanOrEqual(out[i]!.score);
     }

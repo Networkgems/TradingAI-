@@ -10,7 +10,7 @@ import {
   recordShortPremiumScan,
   summarizeShortPremiumScans,
   clearShortPremiumScans,
-  SHORT_PREMIUM_MIN_IV_RANK,
+  SHORT_PREMIUM_MIN_IV_PERCENTILE,
 } from './short-premium-scanner.js';
 import { MIN_IV_SAMPLES, type IvRankCoverageReading } from './iv-rank-store.js';
 
@@ -18,9 +18,10 @@ import { MIN_IV_SAMPLES, type IvRankCoverageReading } from './iv-rank-store.js';
 // pure short-premium engine, plus the in-memory store backing
 // /api/health/short-premium. The engine math itself is exhaustively covered in
 // short-premium-scanner.test.ts (engine); here we prove the integration:
-// realised vol is derived from the daily closes, the IV-rank gate short-circuits,
-// candidates flow through, the reasons are correct, and the store folds into the
-// redacted diagnostics shape.
+// realised vol is derived from the daily closes, the elevated-IV gate
+// (percentile-keyed since TRA-5280) short-circuits, candidates flow through,
+// the reasons are correct, and the store folds into the redacted diagnostics
+// shape.
 
 const NOW = Date.parse('2024-01-15T15:00:00Z');
 const EXP = '2024-02-15'; // ~31 DTE
@@ -71,7 +72,10 @@ describe('scanShortPremiumFromSnapshot', () => {
     expect(out.symbol).toBe('TEST'); // upper-cased
     expect(out.reason).toBe('ok');
     expect(out.realizedVol).toBeCloseTo(realizedVolFromDailyCloses(CALM_CLOSES, 20)!, 10);
-    expect(out.ivRank).toBe(70);
+    // The legacy bare-number input is the GATE statistic — the percentile since
+    // TRA-5280. It must never be mistaken for a measured rank.
+    expect(out.ivPercentile).toBe(70);
+    expect(out.ivRank).toBeNull();
     expect(out.candidates.length).toBeGreaterThan(0);
     // every structure is VRP-positive, in the delta band, and defined risk.
     for (const c of out.candidates) {
@@ -84,16 +88,25 @@ describe('scanShortPremiumFromSnapshot', () => {
     }
   });
 
-  it('stands the scan down with ivrank_low when a finite rank below 50 is passed', () => {
-    const out = scanShortPremiumFromSnapshot(snap(ladder()), CALM_CLOSES, SHORT_PREMIUM_MIN_IV_RANK - 1);
-    expect(out.reason).toBe('ivrank_low');
+  it('stands the scan down with iv_percentile_low when a finite percentile below 50 is passed', () => {
+    const out = scanShortPremiumFromSnapshot(snap(ladder()), CALM_CLOSES, SHORT_PREMIUM_MIN_IV_PERCENTILE - 1);
+    expect(out.reason).toBe('iv_percentile_low');
     expect(out.candidates).toHaveLength(0);
-    expect(out.ivRank).toBe(SHORT_PREMIUM_MIN_IV_RANK - 1);
+    expect(out.ivPercentile).toBe(SHORT_PREMIUM_MIN_IV_PERCENTILE - 1);
   });
 
-  it('defers to observe-only (does not rank-gate) when IV-rank is unknown', () => {
+  it('passes a percentile exactly AT the floor — the boundary is >=, not > (TRA-5280)', () => {
+    const out = scanShortPremiumFromSnapshot(snap(ladder()), CALM_CLOSES, SHORT_PREMIUM_MIN_IV_PERCENTILE, { now: NOW });
+    expect(out.reason).toBe('ok');
+    expect(out.ivPercentile).toBe(SHORT_PREMIUM_MIN_IV_PERCENTILE);
+    expect(out.candidates.length).toBeGreaterThan(0);
+  });
+
+  it('defers to observe-only (does not gate) when the IV percentile is unknown', () => {
+    // EXPLICIT null, not an omitted field — the TRA-5170 fail-open branch.
     const out = scanShortPremiumFromSnapshot(snap(ladder()), CALM_CLOSES, null, { now: NOW });
     expect(out.reason).toBe('ok');
+    expect(out.ivPercentile).toBeNull();
     expect(out.ivRank).toBeNull();
     expect(out.candidates.length).toBeGreaterThan(0);
   });
@@ -140,6 +153,7 @@ describe('IV-rank coverage stamp + rollup (TRA-4917)', () => {
 
   const reading = (over: Partial<IvRankCoverageReading> = {}): IvRankCoverageReading => ({
     ivRank: null,
+    ivPercentile: null,
     atmIv: 0.4,
     ivSampleDepth: 3,
     coverage: 'insufficient_history',
@@ -150,11 +164,12 @@ describe('IV-rank coverage stamp + rollup (TRA-4917)', () => {
     const out = scanShortPremiumFromSnapshot(
       snap(ladder()),
       CALM_CLOSES,
-      reading({ ivRank: 70, ivSampleDepth: 240, coverage: 'covered' }),
+      reading({ ivRank: 70, ivPercentile: 85, ivSampleDepth: 240, coverage: 'covered' }),
       { now: NOW },
     );
     expect(out.reason).toBe('ok');
     expect(out.ivRank).toBe(70);
+    expect(out.ivPercentile).toBe(85);
     expect(out.atmIv).toBe(0.4);
     expect(out.ivSampleDepth).toBe(240);
     expect(out.ivRankCoverage).toBe('covered');
@@ -163,13 +178,14 @@ describe('IV-rank coverage stamp + rollup (TRA-4917)', () => {
   it('the legacy number|null form stamps not_evaluated and does NOT fabricate 0-depth', () => {
     const out = scanShortPremiumFromSnapshot(snap(ladder()), CALM_CLOSES, null, { now: NOW });
     expect(out.ivRank).toBeNull();
+    expect(out.ivPercentile).toBeNull();
     expect(out.ivRankCoverage).toBe('not_evaluated');
     // 0 / 0.0 here would read identically to a genuine `uncovered` / `no_atm_iv`.
     expect(out.ivSampleDepth).toBeNull();
     expect(out.atmIv).toBeNull();
   });
 
-  it('a null rank still fails OPEN — the diagnostic changes nothing about the gate', () => {
+  it('a null percentile still fails OPEN — the diagnostic changes nothing about the gate', () => {
     for (const code of ['no_atm_iv', 'uncovered', 'insufficient_history', 'flat_window'] as const) {
       const out = scanShortPremiumFromSnapshot(
         snap(ladder()),
@@ -179,17 +195,42 @@ describe('IV-rank coverage stamp + rollup (TRA-4917)', () => {
       );
       expect(out.reason).toBe('ok');
       expect(out.candidates.length).toBeGreaterThan(0);
-      expect(out.ivRank).toBeNull();
+      expect(out.ivPercentile).toBeNull();
       expect(out.ivRankCoverage).toBe(code);
     }
-    // …and a FINITE low rank still stands the scan down, unchanged.
+    // …and a FINITE low percentile stands the scan down.
     const low = scanShortPremiumFromSnapshot(
       snap(ladder()),
       CALM_CLOSES,
-      reading({ ivRank: SHORT_PREMIUM_MIN_IV_RANK - 1, coverage: 'covered' }),
+      reading({ ivRank: 70, ivPercentile: SHORT_PREMIUM_MIN_IV_PERCENTILE - 1, coverage: 'covered' }),
       { now: NOW },
     );
-    expect(low.reason).toBe('ivrank_low');
+    expect(low.reason).toBe('iv_percentile_low');
+  });
+
+  it('TRA-5280: the floor must NOT bind on the rank — a sub-floor rank alone never gates', () => {
+    // The TRA-5173 item 1 ruling, asserted in the dangerous direction: a finite
+    // rank below 50 beside an unknown percentile is an OBSERVE-ONLY pass, and a
+    // rank below 50 beside an at/above-floor percentile scans normally. The two
+    // statistics disagree on the >=50 side 19.3% of the time, so this is a real
+    // behavioural claim, not a relabel.
+    const rankLowOnly = scanShortPremiumFromSnapshot(
+      snap(ladder()),
+      CALM_CLOSES,
+      reading({ ivRank: SHORT_PREMIUM_MIN_IV_PERCENTILE - 10, ivPercentile: null, coverage: 'covered' }),
+      { now: NOW },
+    );
+    expect(rankLowOnly.reason).toBe('ok');
+    expect(rankLowOnly.candidates.length).toBeGreaterThan(0);
+
+    const disagree = scanShortPremiumFromSnapshot(
+      snap(ladder()),
+      CALM_CLOSES,
+      reading({ ivRank: 40, ivPercentile: 55, coverage: 'covered' }),
+      { now: NOW },
+    );
+    expect(disagree.reason).toBe('ok');
+    expect(disagree.candidates.length).toBeGreaterThan(0);
   });
 
   it('reproduces the incident shape: the counters partition the whole wire payload', () => {
@@ -213,7 +254,7 @@ describe('IV-rank coverage stamp + rollup (TRA-4917)', () => {
     const covered = scanShortPremiumFromSnapshot(
       snap(ladder()),
       CALM_CLOSES,
-      reading({ ivRank: 70, ivSampleDepth: 240, coverage: 'covered' }),
+      reading({ ivRank: 70, ivPercentile: 70, ivSampleDepth: 240, coverage: 'covered' }),
       { now: NOW },
     );
     recordShortPremiumScan({ ...covered, symbol: 'DDD' }, NOW);
@@ -248,8 +289,11 @@ describe('IV-rank coverage stamp + rollup (TRA-4917)', () => {
     expect(cov.candidateIvRankMeasured).toBe(covered.candidates.length);
     expect(cov.candidateIvRankUnknown).toBe(cov.candidateCount - covered.candidates.length);
 
-    // The gate's reach, published rather than inferred.
-    expect(cov.ivRankFloor).toBe(SHORT_PREMIUM_MIN_IV_RANK);
+    // The gate's reach, published rather than inferred. The floor keys on the
+    // percentile since TRA-5280; `ivRankFloor` is the retained wire key.
+    expect(cov.ivRankFloor).toBe(SHORT_PREMIUM_MIN_IV_PERCENTILE);
+    expect(cov.ivPercentileFloor).toBe(SHORT_PREMIUM_MIN_IV_PERCENTILE);
+    expect(cov.floorStatistic).toBe('ivPercentile');
     expect(cov.gateEvaluable).toBe(1);
     expect(cov.gateInert).toBe(3);
     expect(cov.minSamples).toBe(MIN_IV_SAMPLES);
@@ -325,7 +369,7 @@ describe('IV-rank coverage stamp + rollup (TRA-4917)', () => {
     const covered = scanShortPremiumFromSnapshot(
       snap(ladder()),
       CALM_CLOSES,
-      reading({ ivRank: 70, ivSampleDepth: 240, coverage: 'covered' }),
+      reading({ ivRank: 70, ivPercentile: 70, ivSampleDepth: 240, coverage: 'covered' }),
       { now: NOW },
     );
     recordShortPremiumScan({ ...covered, symbol: 'GGG' }, NOW);

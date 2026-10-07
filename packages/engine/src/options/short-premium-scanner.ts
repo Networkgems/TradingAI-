@@ -14,8 +14,12 @@ import type { OptionChainRow } from './otm-mispricing.js';
  * paid.
  *
  * It reuses the two engines the task names:
- *   • the IV-Rank feed (TRA-1153) — passed in as `ivRank`, the >= 50 "elevated
- *     IV" gate that says premium is rich enough to sell; and
+ *   • the trailing-IV store (TRA-1153/TRA-2028) — passed in as `ivPercentile`,
+ *     the >= 50 "elevated IV" gate that says premium is rich enough to sell.
+ *     TRA-5280 (the TRA-5173 item 1 ruling): the floor keys on the IV
+ *     PERCENTILE, not the IV rank — percentile wins on lift, throughput and
+ *     robustness (rank is defined by two extreme order statistics, so one vol
+ *     spike sets the denominator for a year); and
  *   • the IV-vs-RV / VRP read (TRA-1155) — computed here per short strike as
  *     `impliedVol / realizedVol`, the >= 1 "VRP positive" gate.
  *
@@ -33,7 +37,7 @@ import type { OptionChainRow } from './otm-mispricing.js';
  * finishes between the strikes ≈ 60% of the time. That delta→PoP map is the
  * whole point of the band, so the engine surfaces `estPoP` explicitly.
  *
- * It is PURE — `chain`, `spot`, `realizedVol` and `ivRank` are whatever the
+ * It is PURE — `chain`, `spot`, `realizedVol` and `ivPercentile` are whatever the
  * caller supplies (live Tradier snapshot, fixture, or backtest slice); it places
  * NO orders and touches no account. Quotes are marked at the mid on every leg,
  * matching the convention the sibling {@link findIvRvMispricings} scanner uses.
@@ -94,8 +98,8 @@ export interface ShortPremiumCandidate {
   impliedVol: number;
   /** Underlying's annualised realised vol used as the VRP baseline. */
   realizedVol: number;
-  /** Trailing-year IV-rank stamped by the caller (TRA-1153), or null if unknown. */
-  ivRank: number | null;
+  /** Trailing-window IV percentile stamped by the caller (TRA-2028), or null if unknown. */
+  ivPercentile: number | null;
 
   /** Expected value per unit of risk: estPoP·returnOnRisk − (1 − estPoP). */
   score: number;
@@ -131,10 +135,10 @@ export interface ShortPremiumScannerOptions {
   /** IV/RV ratio at the short strike at or above which VRP is "positive" (default 1.0). */
   minIvRvRatio?: number;
 
-  /** IV-rank gate — structures are suppressed when a finite rank below this is passed (default 50). */
-  minIvRank?: number;
-  /** Trailing-year IV-rank for the underlying (TRA-1153). null/undefined ⇒ engine does not gate on rank. */
-  ivRank?: number | null;
+  /** Elevated-IV gate — structures are suppressed when a finite IV percentile below this is passed (default 50). */
+  minIvPercentile?: number;
+  /** Trailing-window IV percentile for the underlying (TRA-2028). null/undefined ⇒ engine does not gate on it. */
+  ivPercentile?: number | null;
 
   /** Target protective-wing width as a fraction of spot (default 0.05 = 5%). */
   targetWidthPct?: number;
@@ -147,7 +151,7 @@ export interface ShortPremiumScannerOptions {
   now?: number;
 }
 
-const DEFAULTS: Required<Omit<ShortPremiumScannerOptions, 'now' | 'ivRank'>> = {
+const DEFAULTS: Required<Omit<ShortPremiumScannerOptions, 'now' | 'ivPercentile'>> = {
   riskFreeRate: 0.045,
   dividendYield: 0,
   minOpenInterest: 500,
@@ -159,13 +163,13 @@ const DEFAULTS: Required<Omit<ShortPremiumScannerOptions, 'now' | 'ivRank'>> = {
   minShortDelta: 0.15,
   maxShortDelta: 0.3,
   minIvRvRatio: 1.0,
-  minIvRank: 50,
+  minIvPercentile: 50,
   targetWidthPct: 0.05,
   minCreditToWidth: 0.1,
   includeIronCondor: true,
 };
 
-type Opts = Required<Omit<ShortPremiumScannerOptions, 'now' | 'ivRank'>>;
+type Opts = Required<Omit<ShortPremiumScannerOptions, 'now' | 'ivPercentile'>>;
 
 /** A chain row enriched with the derived numbers the structure builder needs. */
 interface PricedLeg {
@@ -263,7 +267,7 @@ function buildCreditSpread(
   priced: PricedLeg[],
   spot: number,
   realizedVol: number,
-  ivRank: number | null,
+  ivPercentile: number | null,
   opts: Opts,
 ): ShortPremiumCandidate | null {
   const isPut = side === 'put';
@@ -327,7 +331,7 @@ function buildCreditSpread(
       ivRvRatio,
       impliedVol: shortLeg.impliedVol,
       realizedVol,
-      ivRank,
+      ivPercentile,
       score,
       reason:
         `${isPut ? 'Bull put' : 'Bear call'} ${shortLeg.row.strike}/${longLeg.row.strike} ` +
@@ -350,7 +354,7 @@ function buildCreditSpread(
 function buildIronCondor(
   putSpread: ShortPremiumCandidate,
   callSpread: ShortPremiumCandidate,
-  ivRank: number | null,
+  ivPercentile: number | null,
 ): ShortPremiumCandidate {
   const netCredit = putSpread.netCredit + callSpread.netCredit;
   const width = Math.max(putSpread.width, callSpread.width);
@@ -379,7 +383,7 @@ function buildIronCondor(
     ivRvRatio,
     impliedVol,
     realizedVol: putSpread.realizedVol,
-    ivRank,
+    ivPercentile,
     score,
     reason:
       `Iron condor ${putSpread.legs[0]!.strike}/${putSpread.legs[1]!.strike}p ` +
@@ -391,14 +395,19 @@ function buildIronCondor(
 
 /**
  * Scan an option chain for DEFINED-RISK short-premium structures. `realizedVol`
- * is the underlying's annualised historical vol (the VRP baseline); `ivRank` is
- * the trailing-year IV-rank (TRA-1153) used for the elevated-IV gate. Returns
- * the assembled put/call credit spreads and iron condor per usable expiration,
- * sorted by `score` (best expected-value-per-risk first).
+ * is the underlying's annualised historical vol (the VRP baseline);
+ * `ivPercentile` is the trailing-window IV percentile (TRA-2028) used for the
+ * elevated-IV gate (percentile-keyed since TRA-5280 — the rank is retired as a
+ * gate statistic). Returns the assembled put/call credit spreads and iron
+ * condor per usable expiration, sorted by `score` (best
+ * expected-value-per-risk first).
  *
- * When a FINITE `ivRank` below `minIvRank` is passed the scan returns `[]`
- * (premium is not rich enough to sell); a null/undefined `ivRank` does NOT gate
- * here — the caller (which owns the honest-unknown IV-rank policy) decides.
+ * When a FINITE `ivPercentile` below `minIvPercentile` is passed the scan
+ * returns `[]` (premium is not rich enough to sell); a null/undefined
+ * `ivPercentile` does NOT gate here — the caller (which owns the
+ * honest-unknown policy, TRA-5170) decides. That fail-open asymmetry is a
+ * ruling and must survive edits: it is the only thing keeping a thin IV store
+ * from suppressing 100% of credit structures.
  */
 export function findShortPremiumStructures(
   chain: OptionChainRow[],
@@ -410,10 +419,15 @@ export function findShortPremiumStructures(
   if (!Number.isFinite(realizedVol) || realizedVol <= 0) return [];
 
   const opts: Opts = { ...DEFAULTS, ...options };
-  const ivRank = options.ivRank ?? null;
-  // Elevated-IV gate: only sell premium when the trailing-year rank says it's
-  // rich. A finite rank below the floor stands the scan down; unknown defers.
-  if (typeof ivRank === 'number' && Number.isFinite(ivRank) && ivRank < opts.minIvRank) {
+  const ivPercentile = options.ivPercentile ?? null;
+  // Elevated-IV gate: only sell premium when the trailing-window percentile
+  // says it's rich. A finite value below the floor stands the scan down;
+  // unknown (null) defers — the TRA-5170 fail-open branch, preserved verbatim.
+  if (
+    typeof ivPercentile === 'number' &&
+    Number.isFinite(ivPercentile) &&
+    ivPercentile < opts.minIvPercentile
+  ) {
     return [];
   }
 
@@ -434,13 +448,13 @@ export function findShortPremiumStructures(
     const puts = legs.filter((p) => p.row.optionType === 'put');
     const calls = legs.filter((p) => p.row.optionType === 'call');
 
-    const putSpread = buildCreditSpread('put', puts, spot, realizedVol, ivRank, opts);
-    const callSpread = buildCreditSpread('call', calls, spot, realizedVol, ivRank, opts);
+    const putSpread = buildCreditSpread('put', puts, spot, realizedVol, ivPercentile, opts);
+    const callSpread = buildCreditSpread('call', calls, spot, realizedVol, ivPercentile, opts);
 
     if (putSpread) out.push(putSpread);
     if (callSpread) out.push(callSpread);
     if (opts.includeIronCondor && putSpread && callSpread) {
-      out.push(buildIronCondor(putSpread, callSpread, ivRank));
+      out.push(buildIronCondor(putSpread, callSpread, ivPercentile));
     }
   }
 

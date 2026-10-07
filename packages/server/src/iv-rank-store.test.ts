@@ -279,6 +279,37 @@ describe('readIvRankCoverageSync (TRA-4917) — the five null branches are separ
     }
   });
 
+  it('TRA-5280: the percentile it reports is byte-identical to ivPercentileSync, off the same window', async () => {
+    await seed('AAA', ramp(MIN_IV_SAMPLES));
+    await initIvRankStore();
+    for (const iv of [0.1, 0.15, 0.29, 0.4]) {
+      expect(readIvRankCoverageSync('AAA', iv, asOf).ivPercentile).toBe(
+        ivPercentileSync('AAA', iv, asOf),
+      );
+    }
+  });
+
+  it('TRA-5280: a flat window carries a FINITE percentile beside the null rank', async () => {
+    await seed('FLAT', Array.from({ length: MIN_IV_SAMPLES + 3 }, () => 0.3));
+    await initIvRankStore();
+    const r = readIvRankCoverageSync('FLAT', 0.3, asOf);
+    // The rank is undefined on max === min; the percentile is not (nothing sits
+    // strictly below 0.3, so it reads 0). The reading must keep them separable.
+    expect(r.coverage).toBe('flat_window');
+    expect(r.ivRank).toBeNull();
+    expect(r.ivPercentile).toBe(0);
+  });
+
+  it('TRA-5280: the null branches carry a null percentile, never a fabricated one', async () => {
+    const unloaded = readIvRankCoverageSync('AAA', 0.3, asOf);
+    expect(unloaded.coverage).toBe('store_unloaded');
+    expect(unloaded.ivPercentile).toBeNull();
+    await seed('AAA', ramp(MIN_IV_SAMPLES));
+    await initIvRankStore();
+    expect(readIvRankCoverageSync('AAA', null, asOf).ivPercentile).toBeNull();
+    expect(readIvRankCoverageSync('ZZZ', 0.3, asOf).ivPercentile).toBeNull();
+  });
+
   it('every code the classifier can emit is in the published vocabulary', async () => {
     await seed('AAA', ramp(MIN_IV_SAMPLES));
     await seed('THIN', ramp(3));

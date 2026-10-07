@@ -18692,7 +18692,8 @@ export class SignalEngine {
    * structures into the store backing `GET /api/health/short-premium`.
    *
    * Purely observe-only: it NEVER routes into the paper book — the desk gate is
-   * ivRank >= 50 + VRP-positive + short-strike delta ~0.15–0.30, and any demo
+   * ivPercentile >= 50 (percentile-keyed since TRA-5280; the rank is a retired
+   * diagnostic) + VRP-positive + short-strike delta ~0.15–0.30, and any demo
    * routing / graduation is a separate board decision. Defense-in-depth: re-checks
    * the flag + demo mode + scanner so a direct unit-test call also no-ops with the
    * flag off. Live promotion stays gated on TRA-382 regardless.
@@ -18762,10 +18763,13 @@ export class SignalEngine {
         // read: two reads can disagree about which window they saw, and the whole
         // point is that the reason and the value describe the same window.
         const ivReading = readIvRankCoverageSync(sym, atmIv, asOf);
-        // TRA-2028 — the IV-PERCENTILE the wheel entry filter gates on, off the
-        // SAME mid-mark ATM-IV surface. `markKind:'stale'` when no usable mid IV
+        // TRA-2028/TRA-5280 — the IV-PERCENTILE the wheel entry filter AND the
+        // short-premium elevated-IV floor gate on, off the SAME mid-mark ATM-IV
+        // surface — taken from the SAME single store read as the rank/coverage
+        // above, so the gate value and its coverage code can never disagree
+        // about which window they saw. `markKind:'stale'` when no usable mid IV
         // this pass (fail-loud), so the filter never gates on a proxy.
-        const ivPercentile = atmIv != null ? ivPercentileSync(sym, atmIv, asOf) : null;
+        const ivPercentile = ivReading.ivPercentile;
         const markKind: WheelIvMarkKind = atmIv != null ? 'mid' : 'stale';
 
         const result = scanShortPremiumFromSnapshot(

@@ -613,6 +613,16 @@ export type IvRankCoverageCode = (typeof IV_RANK_COVERAGE_CODES)[number];
 export interface IvRankCoverageReading {
   /** Trailing-window IV-rank, or null. Never fabricated — no `?? 0`. */
   ivRank: number | null;
+  /**
+   * TRA-5280 — the trailing-window IV PERCENTILE ({@link computeIvPercentile},
+   * TRA-2028) over the SAME single window read as `ivRank`, so the gate value
+   * and the coverage code can never disagree about which window they saw. This
+   * is the statistic the short-premium elevated-IV floor keys on (the TRA-5173
+   * item 1 ruling); the rank stays as the diagnostic the coverage CODE
+   * classifies. Note the percentile is defined on a `flat_window` (where the
+   * rank is not), so a finite value here can sit beside a null `ivRank`.
+   */
+  ivPercentile: number | null;
   /** The ATM IV the rank was (or would have been) computed against. */
   atmIv: number | null;
   /**
@@ -650,19 +660,21 @@ export function readIvRankCoverageSync(
 ): IvRankCoverageReading {
   const iv = atmIv != null && Number.isFinite(atmIv) && atmIv > 0 ? atmIv : null;
   if (!cache) {
-    return { ivRank: null, atmIv: iv, ivSampleDepth: null, coverage: 'store_unloaded' };
+    return { ivRank: null, ivPercentile: null, atmIv: iv, ivSampleDepth: null, coverage: 'store_unloaded' };
   }
   const samples = cache.get(symbol.trim().toUpperCase()) ?? [];
   const usable = windowFor(samples, asOf).filter((s) => Number.isFinite(s.iv) && s.iv > 0);
   const depth = usable.length;
   if (iv == null) {
-    return { ivRank: null, atmIv: null, ivSampleDepth: depth, coverage: 'no_atm_iv' };
+    return { ivRank: null, ivPercentile: null, atmIv: null, ivSampleDepth: depth, coverage: 'no_atm_iv' };
   }
+  // TRA-5280 — both statistics off the ONE `usable` window resolved above.
+  const ivPercentile = computeIvPercentile(usable, iv);
   const ivRank = computeIvRank(usable, iv);
   if (ivRank != null) {
-    return { ivRank, atmIv: iv, ivSampleDepth: depth, coverage: 'covered' };
+    return { ivRank, ivPercentile, atmIv: iv, ivSampleDepth: depth, coverage: 'covered' };
   }
   const coverage: IvRankCoverageCode =
     depth === 0 ? 'uncovered' : depth < MIN_IV_SAMPLES ? 'insufficient_history' : 'flat_window';
-  return { ivRank: null, atmIv: iv, ivSampleDepth: depth, coverage };
+  return { ivRank: null, ivPercentile, atmIv: iv, ivSampleDepth: depth, coverage };
 }

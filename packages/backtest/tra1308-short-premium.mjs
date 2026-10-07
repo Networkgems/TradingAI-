@@ -179,10 +179,16 @@ for (let i = 0; i < days.length; i++) {
     }
     symbolDaysScanned++;
 
-    const cands = findShortPremiumStructures(snap.rows, spot, realizedVol, {
-      ivRank,
-      now: snap.recordedAt ?? toDate(day.date),
-    });
+    // TRA-5280: the engine floor is percentile-keyed now and no longer takes an
+    // `ivRank` option. This HISTORICAL experiment was defined on the recorded
+    // RANK, so its >=50 gate is applied explicitly here to keep the replay
+    // byte-identical to the original TRA-1308 run (the engine used to return []
+    // for the whole symbol on a finite sub-50 rank).
+    const cands = ivRank < 50
+      ? []
+      : findShortPremiumStructures(snap.rows, spot, realizedVol, {
+          now: snap.recordedAt ?? toDate(day.date),
+        });
     if (cands.length === 0) continue;
     symbolDaysWithCandidate++;
 
@@ -239,7 +245,7 @@ for (let i = 0; i < days.length; i++) {
         estPoP: cand.estPoP,
         shortDelta: cand.shortDelta,
         ivRvRatio: cand.ivRvRatio,
-        ivRank: cand.ivRank,
+        ivRank, // the recorded rank the day was gated on (engine no longer stamps it, TRA-5280)
         width: cand.width,
         makerCredit,
         takerCredit: tkCredit,

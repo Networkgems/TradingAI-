@@ -995,9 +995,10 @@ export function isOptionIvRvScannerEnabled(env: NodeJS.ProcessEnv = process.env)
 // contract → theta-negative). This flag turns on an OBSERVE-ONLY demo pass that,
 // per tick, pulls the SAME warm selector chain the directional/IV-RV passes
 // already fetched, computes realised vol from the underlying's daily closes,
-// stamps the trailing-year IV-rank (TRA-1153), and runs the short-premium engine
-// (`findShortPremiumStructures`) — assembling put/call credit spreads and iron
-// condors gated on ivRank >= 50 + VRP-positive (IV/RV >= 1) + short-strike delta
+// stamps the trailing-window IV percentile (TRA-2028), and runs the short-premium
+// engine (`findShortPremiumStructures`) — assembling put/call credit spreads and
+// iron condors gated on ivPercentile >= 50 (percentile-keyed since TRA-5280) +
+// VRP-positive (IV/RV >= 1) + short-strike delta
 // ~0.15–0.30. Results are recorded to an in-memory store surfaced read-only at
 // `GET /api/health/short-premium`.
 //
@@ -1042,7 +1043,7 @@ export function isSwingSignalScannerEnabled(env: NodeJS.ProcessEnv = process.env
 // (`openCashSecuredPut` → assignment → `openCoveredCall` → called-away /
 // liquidation, with the TRA-1322 guards). This sub-flag turns on a DEMO-ONLY
 // pass that feeds the SAME observe-only short-premium candidates (already gated
-// on ivRank >= 50 + VRP-positive + short-strike |Δ| 0.15–0.30) into those
+// on ivPercentile >= 50 (TRA-5280) + VRP-positive + short-strike |Δ| 0.15–0.30) into those
 // primitives on the `WHEEL_QUALITY_UNIVERSE` names, and drives the put→stock→call
 // cycle in the tick (hold-to-expiry settlement, assignment → covered call, the
 // stock-stop / max-window liquidation guards).

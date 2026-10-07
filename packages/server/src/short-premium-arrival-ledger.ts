@@ -12,7 +12,8 @@ import { logger } from './observability/logger.js';
 // TRA-5176 — the durable, dated SHORT-PREMIUM candidate-ARRIVAL ledger.
 //
 // ── WHY THIS EXISTS ──────────────────────────────────────────────────────────
-// TRA-5173 item 2 grades the IVR>=50 floor on the candidate-arrival DENOMINATOR
+// TRA-5173 item 2 grades the elevated-IV floor (ivPercentile>=50 since
+// TRA-5280; IVR>=50 at the time of the grade design) on the candidate-arrival DENOMINATOR
 // over >= 10 sessions, and that series existed nowhere: the only surface that
 // publishes `candidateCount` is `/api/health/short-premium`, which serves a live
 // snapshot the next scan cycle overwrites (and the next boot erases — bqb1
@@ -48,7 +49,7 @@ import { logger } from './observability/logger.js';
 // the exact defect TRA-5172 fixed in the IV store).
 //
 // Observe-only, same posture as TRA-5171: no flag, no gate change, no touch to
-// `SHORT_PREMIUM_MIN_IV_RANK` or the fail-open branch. Nothing here ever gates.
+// `SHORT_PREMIUM_MIN_IV_PERCENTILE` or the fail-open branch. Nothing here ever gates.
 
 const log = logger.child({ module: 'short-premium-arrival-ledger' });
 

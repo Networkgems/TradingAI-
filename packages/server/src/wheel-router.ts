@@ -1,5 +1,5 @@
 import { dteFromExpiration } from '@trading-app/shared';
-import { SHORT_PREMIUM_MIN_IV_RANK, type ShortPremiumScanResult } from './short-premium-scanner.js';
+import { SHORT_PREMIUM_MIN_IV_PERCENTILE, type ShortPremiumScanResult } from './short-premium-scanner.js';
 
 // TRA-1977 — PURE wheel selector + cycle planner. This module owns the decision
 // logic that routes the observe-only short-premium scanner (TRA-1292) into the
@@ -12,7 +12,8 @@ import { SHORT_PREMIUM_MIN_IV_RANK, type ShortPremiumScanResult } from './short-
 // Everything here is a pure function of its inputs so the wheel's entry/roll/
 // assignment/liquidation branches are unit-testable without the whole engine,
 // exactly as the TRA-1322 backtest state machine (`wheel-recovery.ts`) is. The
-// selectors reuse the scanner's ALREADY-GATED candidates (ivRank >= 50 +
+// selectors reuse the scanner's ALREADY-GATED candidates (ivPercentile >= 50,
+// percentile-keyed since TRA-5280, +
 // VRP-positive + short-strike |Δ| 0.15–0.30 at 7–60 DTE); the CSP is the short
 // PUT leg of the best put-credit-spread, the covered call the short CALL leg of
 // the best call-credit-spread (the protective wing is dropped — a wheel write is
@@ -67,15 +68,16 @@ export interface WheelWriteLeg {
 
 /**
  * The full-pass gate for PAPER routing: unlike the observe-only ledger (which
- * accrues the honest-unknown `ivRank === null` warming case, TRA-1114), routing
- * requires the SAME finite `ivRank >= 50` elevated-IV pass the scanner asserts as
- * the hard LIVE-promotion gate — the "live method emits only on the full pass,
- * never a near-miss" half of the SHADOW pattern. A null/sub-floor rank never
- * routes.
+ * accrues the honest-unknown `ivPercentile === null` warming case, TRA-1114),
+ * routing requires the SAME finite `ivPercentile >= 50` elevated-IV pass the
+ * scanner asserts as the hard LIVE-promotion gate (percentile-keyed since
+ * TRA-5280 — the floor must not bind on the retired rank) — the "live method
+ * emits only on the full pass, never a near-miss" half of the SHADOW pattern.
+ * A null/sub-floor percentile never routes.
  */
 function passesRoutingGate(result: ShortPremiumScanResult): boolean {
-  const r = result.ivRank;
-  if (!(typeof r === 'number' && Number.isFinite(r) && r >= SHORT_PREMIUM_MIN_IV_RANK)) return false;
+  const r = result.ivPercentile;
+  if (!(typeof r === 'number' && Number.isFinite(r) && r >= SHORT_PREMIUM_MIN_IV_PERCENTILE)) return false;
   if (result.spot == null || !(result.spot > 0)) return false;
   return isWheelUniverseSymbol(result.symbol);
 }
