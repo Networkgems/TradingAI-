@@ -13246,6 +13246,22 @@ app.get('/api/health/options-live', async (_req, res) => {
       // `multiHeld` is the overlap. Same fleet/book caveat as its neighbours —
       // this folds `getAllUserContexts()` and `/api/state` serves one book.
       //
+      // ⚠️ TRA-5297 — **"when will anything act on this" is `actionableAt`, NOT
+      // `nextHoldReleaseAt`.** This payload carried one timestamp called
+      // `releasesAt` until 2026-10-07, and it was the EARLIEST gate release
+      // across held rows — i.e. when the next gate lifts, not when the row can
+      // be acted on. On a row held by two gates those are different instants,
+      // and the field reported the permissive one. 2026-10-07T13:0xZ, pid 76:
+      // two real-money rows under `opening_range_hold` (13:45Z) AND
+      // `daily_close_hold` (19:30Z) published `releasesAt: 13:45Z` with
+      // `multiHeld: 2` beside it; nothing could act until 19:30Z, and the 5h45m
+      // gap reached TRA-5296's description as fact. The three horizons are now
+      // named for what they measure: `nextHoldReleaseAt` (when to look again),
+      // `actionableAt` (when the FIRST held row is actionable),
+      // `fullyReleasesAt` (when the LAST one is — `null` while anything is held
+      // indefinitely). All three are scoped to HELD rows; a `no_stop_written`
+      // row has no gate to lift and `nothingWillAct` is the union.
+      //
       // Counts, gate names and cause classes only. No OCC symbols (TRA-2163).
       liveStopGovernance: (() => {
         try {

@@ -1316,3 +1316,130 @@ describe('deduplicated aggregates exclude the synthetic history_import twin (TRA
     expect(summarizeLiveOptionsFeeSlippage().coverageVacuous).toBe(false);
   });
 });
+
+describe('totalFees says when it is a LOWER BOUND (TRA-5297 AC3)', () => {
+  // THE LIVE READ, bqb1 2026-10-07: `totalFees: 0.35` / `feesMeasured: 1`
+  // against `opens: 2`. The `v0nni`/NU fill (order 149502608) carried 0.35 from
+  // `history_commission`; the `admin`/SOFI fill (order 149507369) carried
+  // `fees: null` / `feeSource: null`. The field is named like a total and was
+  // read as one, so any cost-per-trade figure folded off it that day understated
+  // by whatever the unmeasured leg cost.
+  //
+  // The sibling `slippage` block has published its own denominator since
+  // TRA-2959 (`nMeasured` / `nTotal` / `excludedNoAskQuote`); this is that
+  // pattern one key over. A prose "do NOT read totalFees as complete" has been
+  // in the docblock since TRA-1929 and is not readable by a consumer.
+  const NU_OPEN = {
+    ts: Date.parse('2026-10-07T13:36:00.000Z'),
+    etDay: '2026-10-07',
+    sleeve: 'single_leg_otm',
+    optionSymbol: 'NU261016C00016000',
+    side: 'buy_to_open',
+    contracts: 1,
+    filledPrice: 0.6,
+    fees: 0.35,
+    feeSource: 'history_commission',
+    orderId: 149502608,
+  } as const;
+  /** The leg with no measured commission — the whole reason the scalar is partial. */
+  const SOFI_OPEN = {
+    ts: Date.parse('2026-10-07T13:41:00.000Z'),
+    etDay: '2026-10-07',
+    sleeve: 'single_leg_otm',
+    optionSymbol: 'SOFI261016C00030000',
+    side: 'buy_to_open',
+    contracts: 1,
+    filledPrice: 1.0,
+    fees: null,
+    orderId: 149507369,
+  } as const;
+
+  it('flags the 10-07 read: 2 opens, 1 measured fee, totalFees 0.35 = LOWER BOUND', () => {
+    clearLiveOptionsFeeSlippageLedger();
+    recordLiveOptionFill(NU_OPEN);
+    recordLiveOptionFill(SOFI_OPEN);
+    const s = summarizeLiveOptionsFeeSlippage();
+    expect(s.n).toBe(2);
+    expect(s.opens).toBe(2);
+    expect(s.totalFees).toBeCloseTo(0.35, 6);
+    expect(s.feesMeasured).toBe(1);
+    // THE REGRESSION — both keys absent before this cut.
+    expect(s.feesLowerBound).toBe(true);
+    expect(s.feesUnmeasured).toBe(1);
+    // `coverageVacuous` cannot carry this: n is 2, so it reads false either way.
+    expect(s.coverageVacuous).toBe(false);
+  });
+
+  it('is false once every fill carries a measured fee — the flag discriminates', () => {
+    clearLiveOptionsFeeSlippageLedger();
+    recordLiveOptionFill(NU_OPEN);
+    recordLiveOptionFill({ ...SOFI_OPEN, fees: 0.35, feeSource: 'history_commission' });
+    const s = summarizeLiveOptionsFeeSlippage();
+    expect(s.feesMeasured).toBe(2);
+    expect(s.feesLowerBound).toBe(false);
+    expect(s.feesUnmeasured).toBe(0);
+    expect(s.totalFees).toBeCloseTo(0.7, 6);
+  });
+
+  it('is false at n=0, where totalFees is already null and nothing is understated', () => {
+    clearLiveOptionsFeeSlippageLedger();
+    const s = summarizeLiveOptionsFeeSlippage();
+    expect(s.totalFees).toBeNull();
+    expect(s.feesLowerBound).toBe(false);
+    expect(s.feesUnmeasured).toBe(0);
+    // …and `coverageVacuous` is the key that names THAT state (TRA-5028).
+    expect(s.coverageVacuous).toBe(true);
+  });
+
+  it('the deduplicated block keys the flag on its OWN denominator, not the raw n', () => {
+    // TRA-5028's rule is that a reader folding fee totals must read
+    // `deduplicated`, so the flag has to exist there too — and a synthetic row
+    // excluded from both numerator and denominator is NOT an unmeasured fee.
+    // Keyed on `fills.length` the dedup flag would read `true` here and accuse
+    // a complete block of being partial.
+    clearLiveOptionsFeeSlippageLedger();
+    const close = {
+      etDay: '2026-09-02',
+      sleeve: 'single_leg_otm',
+      optionSymbol: 'NOK261002C00010500',
+      side: 'sell_to_close',
+      contracts: 1,
+      filledPrice: 0.11,
+      fees: 0.13,
+      feeSource: 'gainloss_derived',
+      orderId: null,
+    } as const;
+    recordLiveOptionFill({ ...close, ts: Date.parse('2026-09-02T17:00:00.000Z'), origin: 'history_import' });
+    recordLiveOptionFill({ ...close, ts: Date.parse('2026-09-02T17:35:37.046Z') });
+    const s = summarizeLiveOptionsFeeSlippage();
+    expect(s.deduplicated.syntheticRowsExcluded).toBe(1);
+    expect(s.deduplicated.n).toBe(1);
+    expect(s.deduplicated.feesMeasured).toBe(1);
+    expect(s.deduplicated.feesLowerBound).toBe(false);
+    expect(s.deduplicated.feesUnmeasured).toBe(0);
+    // The raw block is complete too here — both rows carry a fee.
+    expect(s.feesLowerBound).toBe(false);
+  });
+
+  it('a synthetic row with no fee still makes the deduplicated block complete', () => {
+    // The direction that proves the denominator is the dedup one: the ONLY
+    // unmeasured row is synthetic, so the raw block is a lower bound and the
+    // de-duplicated block is not.
+    clearLiveOptionsFeeSlippageLedger();
+    recordLiveOptionFill(NU_OPEN);
+    recordLiveOptionFill({
+      ...NU_OPEN,
+      ts: Date.parse('2026-10-07T17:00:00.000Z'),
+      side: 'sell_to_close',
+      fees: null,
+      origin: 'history_import',
+    });
+    const s = summarizeLiveOptionsFeeSlippage();
+    expect(s.n).toBe(2);
+    expect(s.feesLowerBound).toBe(true);
+    expect(s.feesUnmeasured).toBe(1);
+    expect(s.deduplicated.n).toBe(1);
+    expect(s.deduplicated.feesLowerBound).toBe(false);
+    expect(s.deduplicated.feesUnmeasured).toBe(0);
+  });
+});

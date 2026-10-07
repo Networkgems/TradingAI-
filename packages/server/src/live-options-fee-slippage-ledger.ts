@@ -3783,6 +3783,33 @@ export interface LiveOptionsFeeSlippageSummary {
   totalFees: number | null;
   feesMeasured: number;
   /**
+   * ⭐ TRA-5297 — **`totalFees` is a LOWER BOUND whenever this is `true`**, i.e.
+   * whenever `feesMeasured < n`. The field is named like a total and was read as
+   * one: 2026-10-07, bqb1 pid 76, `totalFees: 0.35` / `feesMeasured: 1` against
+   * `opens: 2` — the `v0nni`/NU fill (order 149502608) carried `0.35` from
+   * `history_commission` and the `admin`/SOFI fill (order 149507369) carried
+   * `fees: null` / `feeSource: null`. Any cost-per-trade number folded off the
+   * scalar that day understated by whatever the unmeasured leg cost.
+   *
+   * The docblock above has said "do NOT read `totalFees` as complete" since
+   * TRA-1929, and a prose note is not readable by a consumer. This is the same
+   * remedy the sibling `slippage` block has carried since TRA-2959 — it
+   * publishes `nMeasured` / `nTotal` / `excludedNoAskQuote` rather than a bare
+   * mean — moved one key over.
+   *
+   * `false` at `n === 0`: `totalFees` serializes `null` there and nothing is
+   * understated. Read `coverageVacuous` for that state.
+   */
+  feesLowerBound: boolean;
+  /**
+   * TRA-5297 — the named count behind the flag: `n - feesMeasured`, fills whose
+   * commission `totalFees` does NOT include. Mirrors
+   * `slippage.excludedNoAskQuote`. Per-reason splits of WHY a fee is still
+   * unmeasured (pending / awaiting-close / aged) are
+   * `autoReconcile.unmeasured*` on the health route.
+   */
+  feesUnmeasured: number;
+  /**
    * TRA-2850 — `feesMeasured` split by WHO measured it. A pre-2850 build counted
    * rows whose fee "happened to equal 0" as measured; every counted row now has
    * a provenance (`history_commission` join or `gainloss_derived`), so the sum
@@ -3805,6 +3832,15 @@ export interface LiveOptionsFeeSlippageSummary {
     closes: number;
     totalFees: number | null;
     feesMeasured: number;
+    /**
+     * TRA-5297 — the same lower-bound flag over THIS block's own denominator
+     * (`deduplicated.n`). It has to exist here too: TRA-5028's rule is that a
+     * reader folding fee totals must read the de-duplicated figures, so a flag
+     * published only on the raw aggregates would be missing from the surface
+     * the correct consumer is told to use.
+     */
+    feesLowerBound: boolean;
+    feesUnmeasured: number;
     feesBySource: { historyCommission: number; gainlossDerived: number };
     /** Rows the block above excluded (`tsSynthetic === true`). */
     syntheticRowsExcluded: number;
@@ -3904,6 +3940,12 @@ export function summarizeLiveOptionsFeeSlippage(): LiveOptionsFeeSlippageSummary
     },
     totalFees: feeValues.length > 0 ? round(feeValues.reduce((s, v) => s + v, 0), 2) : null,
     feesMeasured: feeValues.length,
+    // TRA-5297 — the scalar above omits every fill with a null fee, so it is a
+    // LOWER BOUND whenever one exists. Derived here rather than left to each
+    // reader: `feesMeasured < n` is a two-field comparison and the live miss was
+    // a reader taking the one-field scalar at face value.
+    feesLowerBound: feeValues.length < fills.length,
+    feesUnmeasured: fills.length - feeValues.length,
     feesBySource: { historyCommission: feesFromCommission, gainlossDerived: feesFromGainLoss },
     deduplicated: {
       n: fills.length - syntheticRows,
@@ -3911,6 +3953,10 @@ export function summarizeLiveOptionsFeeSlippage(): LiveOptionsFeeSlippageSummary
       closes: dedupCloses,
       totalFees: dedupFeeValues.length > 0 ? round(dedupFeeValues.reduce((s, v) => s + v, 0), 2) : null,
       feesMeasured: dedupFeeValues.length,
+      // Against THIS block's denominator, never `fills.length` — a synthetic row
+      // excluded from both numerator and denominator is not an unmeasured fee.
+      feesLowerBound: dedupFeeValues.length < fills.length - syntheticRows,
+      feesUnmeasured: fills.length - syntheticRows - dedupFeeValues.length,
       feesBySource: {
         historyCommission: dedupFeesFromCommission,
         gainlossDerived: dedupFeesFromGainLoss,

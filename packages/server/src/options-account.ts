@@ -3264,10 +3264,21 @@ function gateRecoveryPath(
  *      be held by several and only one of them refused it today.
  *   3. **Release is a taxonomy, not a timestamp.** See {@link LiveStopRecoveryPath}.
  *
+ * ## The three horizons (TRA-5297)
+ *
+ * A held row has a release EVENT and an ACTIONABILITY instant, and on a
+ * multi-held row they are different instants. This fold published only the
+ * first, under the name `releasesAt`, and a reader took it for the second —
+ * see {@link LiveStopGovernanceSummary.nextHoldReleaseAt} for the measurement.
+ * The three fields are `nextHoldReleaseAt` (min over gates — when the next
+ * thing changes), `actionableAt` (min over rows of max over gates — when the
+ * first row can be acted on) and `fullyReleasesAt` (max — when the last one
+ * can). `nextHoldReleaseAt <= actionableAt <= fullyReleasesAt`.
+ *
  * ## Disclosure
  *
- * Counts, gate names, cause classes and two timestamps. **Never OCC symbols** —
- * same no-auth `/api/health/options-live`, same TRA-2163 standing as its
+ * Counts, gate names, cause classes and three timestamps. **Never OCC symbols**
+ * — same no-auth `/api/health/options-live`, same TRA-2163 standing as its
  * neighbours.
  */
 export type LiveStopGovernanceClass =
@@ -3340,8 +3351,63 @@ export interface LiveStopGovernanceSummary {
   };
   /** Held rows by the hardest recovery path any of their gates requires. */
   recovery: Record<LiveStopRecoveryPath, number>;
-  /** Earliest instant any held row's gate lifts on a clock. */
-  releasesAt: string | null;
+  /**
+   * TRA-5297 — the next release EVENT: the earliest instant ANY gate on ANY held
+   * row lifts on a clock. `null` when no held gate carries a clock.
+   *
+   * ⚠️ **This is NOT when anything will act on a row**, and it was called
+   * `releasesAt` until 2026-10-07, which is how it got read as one. A row held by
+   * two gates becomes actionable when the LAST of them lifts; this field reports
+   * the FIRST. The two coincide on a singly-held row and diverge exactly when
+   * `multiHeld > 0` — so the old name read correct whenever it was easy and
+   * permissive whenever it mattered.
+   *
+   * Measured on bqb1 pid 76 (sha `73c7f495`) 2026-10-07T13:0xZ: two real-money
+   * rows held by `opening_range_hold` (13:45Z) AND `daily_close_hold` (19:30Z),
+   * `multiHeld: 2`. The field published 13:45Z; nothing could act on either row
+   * until 19:30Z. The 5h45m gap reached TRA-5296's description as "nothing will
+   * act on them until 13:45Z" and scoped an acceptance criterion around it.
+   *
+   * It is kept (under the honest name) because it IS the instant the pile starts
+   * unwinding, which is the right answer to a different question: it is when the
+   * NEXT thing changes, i.e. when a reader should look again. Read
+   * {@link LiveStopGovernanceSummary.actionableAt} for actionability.
+   */
+  nextHoldReleaseAt: string | null;
+  /**
+   * TRA-5297 — **the actionability instant**: the earliest instant any held row
+   * actually becomes actionable, i.e. `min` over held rows of `max` over that
+   * row's gate releases. A row carrying even one gate with no clock
+   * (`held_indefinite`) contributes NOTHING here — there is no instant at which
+   * it becomes actionable.
+   *
+   * `null` ⇔ `byClass.held_with_release === 0`: either nothing is held, or every
+   * held row is indefinite. Both readings are "no row is scheduled to become
+   * actionable", which is the CONSERVATIVE direction for a hold — an un-updated
+   * reader coercing a missing key renders "no release scheduled", i.e. worse than
+   * the truth, never better.
+   *
+   * Invariant, whenever all three are non-null:
+   * `nextHoldReleaseAt <= actionableAt <= fullyReleasesAt`.
+   */
+  actionableAt: string | null;
+  /**
+   * TRA-5297 — the instant by which EVERY held row is actionable: `max` over
+   * held rows of `max` over their gate releases. Adopts its name and its null
+   * convention verbatim from the sibling surface `liveStopActionability`, which
+   * has published `releasesAt` + `fullyReleasesAt` since TRA-3822 — this fold
+   * had only the one timestamp, which is the whole defect.
+   *
+   * `null` when nothing is held, or when `byClass.held_indefinite > 0`: no such
+   * instant exists then, and publishing the clocked one anyway would read as
+   * "all clear by then".
+   *
+   * ⚠️ All three timestamps are scoped to HELD rows. A `no_stop_written` row is
+   * never actionable by any gate and its remedy is `liveUnmanagedRisk`'s
+   * (TRA-2820), not a clock's — `nothingWillAct` is the union for a reader who
+   * wants the whole exposed population.
+   */
+  fullyReleasesAt: string | null;
 }
 
 const EMPTY_CAUSE_COUNTS = (): Record<ExitBreakerCauseClass, number> => ({
@@ -3385,6 +3451,10 @@ export function summarizeLiveStopGovernance(
   let firstTrippedAt: number | null = null;
   let lastTrippedAt: number | null = null;
   let earliestRelease: number | null = null;
+  // TRA-5297 — the two ACTIONABILITY extremes, which are folds of a PER-ROW max
+  // and therefore cannot be derived from `earliestRelease` afterwards.
+  let earliestActionable: number | null = null;
+  let latestActionable: number | null = null;
 
   for (const opt of positions) {
     if ((opt.mode ?? 'demo') !== 'live') continue;
@@ -3431,13 +3501,32 @@ export function summarizeLiveStopGovernance(
 
     let clocked = true;
     let hardest: LiveStopRecoveryPath = 'automatic';
+    // TRA-5297 — the LAST of this row's gates to lift. That instant, not the
+    // first, is when the exit pass can reach this row.
+    let rowActionableAt: number | null = null;
     for (const gate of reading.held) {
       heldBy[gate] = (heldBy[gate] ?? 0) + 1;
       const release = reading.releaseAt[gate];
       if (release === undefined) clocked = false;
-      else if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
+      else {
+        if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
+        if (rowActionableAt === null || release > rowActionableAt) rowActionableAt = release;
+      }
       const path = gateRecoveryPath(gate, opt, reading);
       if (RECOVERY_RANK[path] > RECOVERY_RANK[hardest]) hardest = path;
+    }
+    // Only a row whose EVERY gate is clocked has an actionability instant at
+    // all; one unclocked gate means there is no such instant, and folding its
+    // clocked siblings' max in anyway is the permissive direction this ticket
+    // exists to close. (`clocked` ⇒ `rowActionableAt !== null`, since
+    // `reading.held` is non-empty here; the null check is the type narrowing.)
+    if (clocked && rowActionableAt !== null) {
+      if (earliestActionable === null || rowActionableAt < earliestActionable) {
+        earliestActionable = rowActionableAt;
+      }
+      if (latestActionable === null || rowActionableAt > latestActionable) {
+        latestActionable = rowActionableAt;
+      }
     }
     byClass[clocked ? 'held_with_release' : 'held_indefinite'] += 1;
     recovery[hardest] += 1;
@@ -3460,7 +3549,15 @@ export function summarizeLiveStopGovernance(
       lastTrippedAt: lastTrippedAt === null ? null : new Date(lastTrippedAt).toISOString(),
     },
     recovery,
-    releasesAt: earliestRelease === null ? null : new Date(earliestRelease).toISOString(),
+    nextHoldReleaseAt: earliestRelease === null ? null : new Date(earliestRelease).toISOString(),
+    actionableAt: earliestActionable === null ? null : new Date(earliestActionable).toISOString(),
+    // No such instant exists while an indefinitely-held row is outstanding, and
+    // publishing the clocked one anyway would read as "all clear by then" — the
+    // sibling surface's convention, verbatim (TRA-3822, see TRA-5297).
+    fullyReleasesAt:
+      byClass.held_indefinite > 0 || latestActionable === null
+        ? null
+        : new Date(latestActionable).toISOString(),
   };
 }
 
@@ -3468,11 +3565,24 @@ export function summarizeLiveStopGovernance(
  * TRA-4225 — fold the per-book partitions into the fleet figure the no-auth
  * route publishes.
  *
- * Counts sum; `releasesAt` extremises to the EARLIEST (when the pile starts
- * unwinding, same convention as its neighbour); the two trip instants extremise
- * outward, so `firstTrippedAt` is the fleet's first trip and `lastTrippedAt` its
- * most recent. A `null` from a book with nothing stamped contributes nothing
- * rather than nulling the fold.
+ * Counts sum; the two trip instants extremise outward, so `firstTrippedAt` is
+ * the fleet's first trip and `lastTrippedAt` its most recent. A `null` from a
+ * book with nothing stamped contributes nothing rather than nulling the fold.
+ *
+ * TRA-5297 — the three horizons extremise per their own definitions, and the
+ * directions are NOT all the same:
+ *
+ *   • `nextHoldReleaseAt` — EARLIEST across books (when the pile starts
+ *     unwinding, same convention as its neighbour).
+ *   • `actionableAt` — EARLIEST across books. It is already a per-row max, so
+ *     the fleet figure is still "the first row anywhere to become actionable";
+ *     a book that contributes `null` has no such row and contributes nothing,
+ *     which must not null the fold.
+ *   • `fullyReleasesAt` — LATEST across books, and nulled the moment ANY book
+ *     holds an indefinite row. Keyed on the merged `byClass.held_indefinite`
+ *     rather than on a separate flag (the sibling needs one because its
+ *     `indefinite` is not reconstructible from its other published counts;
+ *     here the class count sums and IS the predicate).
  */
 export function mergeLiveStopGovernance(
   summaries: Iterable<LiveStopGovernanceSummary>,
@@ -3494,8 +3604,13 @@ export function mergeLiveStopGovernance(
       lastTrippedAt: null,
     },
     recovery: EMPTY_RECOVERY_COUNTS(),
-    releasesAt: null,
+    nextHoldReleaseAt: null,
+    actionableAt: null,
+    fullyReleasesAt: null,
   };
+  // TRA-5297 — accumulated separately from `out.fullyReleasesAt` so the
+  // indefinite-nulling is applied ONCE, after every book's class counts are in.
+  let latestActionable: string | null = null;
   for (const s of summaries) {
     out.rows += s.rows;
     for (const k of Object.keys(out.byClass) as LiveStopGovernanceClass[]) {
@@ -3519,10 +3634,22 @@ export function mergeLiveStopGovernance(
       out.recovery[k] += s.recovery[k];
     }
     if (
-      s.releasesAt !== null
-      && (out.releasesAt === null || s.releasesAt < out.releasesAt)
+      s.nextHoldReleaseAt !== null
+      && (out.nextHoldReleaseAt === null || s.nextHoldReleaseAt < out.nextHoldReleaseAt)
     ) {
-      out.releasesAt = s.releasesAt;
+      out.nextHoldReleaseAt = s.nextHoldReleaseAt;
+    }
+    if (
+      s.actionableAt !== null
+      && (out.actionableAt === null || s.actionableAt < out.actionableAt)
+    ) {
+      out.actionableAt = s.actionableAt;
+    }
+    if (
+      s.fullyReleasesAt !== null
+      && (latestActionable === null || s.fullyReleasesAt > latestActionable)
+    ) {
+      latestActionable = s.fullyReleasesAt;
     }
     if (
       s.breakerLatched.firstTrippedAt !== null
@@ -3539,6 +3666,9 @@ export function mergeLiveStopGovernance(
       out.breakerLatched.lastTrippedAt = s.breakerLatched.lastTrippedAt;
     }
   }
+  // TRA-5297 — one indefinitely-held row ANYWHERE in the fleet means no instant
+  // exists by which every held row is actionable.
+  out.fullyReleasesAt = out.byClass.held_indefinite > 0 ? null : latestActionable;
   return out;
 }
 
@@ -3563,7 +3693,9 @@ export function blindLiveStopGovernance(): BlindLiveStopGovernance {
     multiHeld: null,
     breakerLatched: null,
     recovery: null,
-    releasesAt: null,
+    nextHoldReleaseAt: null,
+    actionableAt: null,
+    fullyReleasesAt: null,
   };
 }
 

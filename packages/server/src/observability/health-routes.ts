@@ -6820,6 +6820,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       slippage: summary.slippage,
       totalFees: summary.totalFees,
       feesMeasured: summary.feesMeasured,
+      // ⭐ TRA-5297 — `totalFees` is a LOWER BOUND whenever `feesLowerBound` is
+      // true, and the name does not say so. Live 2026-10-07: `totalFees: 0.35`
+      // / `feesMeasured: 1` against `opens: 2` — one of the two real-money fills
+      // carried `fees: null` / `feeSource: null`, so any cost-per-trade figure
+      // folded off the scalar understated by whatever that leg cost. The
+      // sibling `slippage` block has published its own denominator since
+      // TRA-2959 (`nMeasured` / `nTotal` / `excludedNoAskQuote`); these two keys
+      // are that pattern one field over. `feesUnmeasured` is the count; the
+      // per-reason split of WHY is `autoReconcile.unmeasured*` below.
+      feesLowerBound: summary.feesLowerBound,
+      feesUnmeasured: summary.feesUnmeasured,
       // TRA-2850 — who measured each counted fee (history commission join vs
       // gainloss derivation). Sums to feesMeasured; a fee with no provenance no
       // longer counts (the pre-2850 `fees: 0` poison reads unmeasured again).

@@ -513,7 +513,7 @@ describe('TRA-4225 AC4 — "no automated release" is not "no way out"', () => {
   });
 
   it('a PROBING latch is `automatic` — the retest is the release', () => {
-    // TRA-4266 — this was `manual_restage` with a null `releasesAt`, and that
+    // TRA-4266 — this was `manual_restage` with a null release instant, and that
     // pair is precisely what the sibling ticket calls a permanent disarm. While
     // the breaker still has retests, no human is required and the fold must not
     // ask for one.
@@ -521,7 +521,7 @@ describe('TRA-4225 AC4 — "no automated release" is not "no way out"', () => {
     expect(g.recovery).toEqual({
       automatic: 1, config_change: 0, manual_restage: 0, close_position_only: 0,
     });
-    expect(g.releasesAt).toBe(new Date(FIRST_PROBE_AT).toISOString());
+    expect(g.nextHoldReleaseAt).toBe(new Date(FIRST_PROBE_AT).toISOString());
   });
 
   it('an EXHAUSTED engine-opened latch is a Close button away — `manual_restage`', () => {
@@ -529,7 +529,7 @@ describe('TRA-4225 AC4 — "no automated release" is not "no way out"', () => {
     expect(g.recovery).toEqual({
       automatic: 0, config_change: 0, manual_restage: 1, close_position_only: 0,
     });
-    expect(g.releasesAt).toBeNull();
+    expect(g.nextHoldReleaseAt).toBeNull();
   });
 
   it('an IMPORTED exhausted latch can only be un-held by giving up the position', () => {
@@ -596,7 +596,7 @@ describe('TRA-4225 AC4 — "no automated release" is not "no way out"', () => {
     // starts 2026-09-01 00:00 ET. That date is inside EDT (UTC−4) ⇒ 04:00Z. The
     // fixture is frozen, so this instant is stable; it is NOT 05:00Z-under-EST,
     // because the fixture never moves into EST.
-    expect(g.releasesAt).toBe('2026-09-01T04:00:00.000Z');
+    expect(g.nextHoldReleaseAt).toBe('2026-09-01T04:00:00.000Z');
   });
 
   it('a config refusal is `config_change` — a settings write, not a human at the row', () => {
@@ -621,7 +621,7 @@ describe('TRA-4225 AC4 — "no automated release" is not "no way out"', () => {
     expect(g.heldBy).toEqual({ exit_transport_backoff: 1 });
     expect(g.byClass.held_with_release).toBe(1);
     expect(g.recovery.automatic).toBe(1);
-    expect(g.releasesAt).toBe(new Date(MEASURED_AT + 30_000).toISOString());
+    expect(g.nextHoldReleaseAt).toBe(new Date(MEASURED_AT + 30_000).toISOString());
     expect(g.breakerLatched.rows).toBe(0);
   });
 });
@@ -700,7 +700,7 @@ describe('TRA-4225 negative controls', () => {
     const g = summarizeLiveStopGovernance([], MONEY_BOOK);
     expect(g.rows).toBe(0);
     expect(g.breakerLatched.byCause.transport_fault).toBe(0);
-    expect(g.releasesAt).toBeNull();
+    expect(g.nextHoldReleaseAt).toBeNull();
     // The blind shape is every key null, so a reader can tell "measured zero"
     // from "could not measure" — the TRA-3839 discipline, one field over.
     const blind = blindLiveStopGovernance();
@@ -744,16 +744,16 @@ describe('TRA-4225 — the fleet fold', () => {
     expect(fleet.breakerLatched.lastTrippedAt)
       .toBe(new Date(MEASURED_AT - 3_600_000).toISOString());
     // TRA-4266 — both books' latches are still probing, so the fleet's recovery
-    // path is the clock, not a person. `releasesAt` extremises to the EARLIEST.
+    // path is the clock, not a person. `nextHoldReleaseAt` extremises to the EARLIEST.
     expect(fleet.recovery.automatic).toBe(2);
     expect(fleet.recovery.manual_restage).toBe(0);
-    expect(fleet.releasesAt).toBe(new Date(FIRST_PROBE_AT).toISOString());
+    expect(fleet.nextHoldReleaseAt).toBe(new Date(FIRST_PROBE_AT).toISOString());
   });
 
   it('folds an empty fleet to zeros', () => {
     const fleet = mergeLiveStopGovernance([]);
     expect(fleet.rows).toBe(0);
-    expect(fleet.releasesAt).toBeNull();
+    expect(fleet.nextHoldReleaseAt).toBeNull();
     expect(fleet.byClass.governed).toBe(0);
   });
 });
