@@ -276,6 +276,15 @@ const STORED_RESOLVERS = {
     reads: ['ENABLE_OPTION_MAKER_TELEMETRY'],
     resolve: (env) => (flagOn(env['ENABLE_OPTION_MAKER_TELEMETRY']) ? 'on' : 'off'),
   },
+  // option-exec-flag.ts (isShortPremiumIvFloorArmed) — plain `flagOn`; the
+  // TRA-5292 ARM switch for the short-premium elevated-IV percentile floor,
+  // intended 'off' until TRA-5173 releases the floor by decision. Added in the
+  // same train as its manifest row so the checker never reads BLIND on a lever
+  // the manifest grew (the TRA-5295 defect shape).
+  ENABLE_SHORT_PREMIUM_IV_FLOOR: {
+    reads: ['ENABLE_SHORT_PREMIUM_IV_FLOOR'],
+    resolve: (env) => (flagOn(env['ENABLE_SHORT_PREMIUM_IV_FLOOR']) ? 'on' : 'off'),
+  },
   // TRA-5222 / TRA-5279 — numeric board caps, ported from the manifest rows in
   // env-intent.ts (post-clamp, as live-learning-budget.ts `capFromEnv` and
   // option-exec-flag.ts resolveLiveOptionTestAggregateCapUsd resolve them).
