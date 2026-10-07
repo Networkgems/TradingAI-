@@ -4,7 +4,7 @@
 // the manual Tradier sync) is owned by the useStockOptionClose hook.
 import type { AccountState, OptionsAccountState, OptionPosition } from '@trading-app/shared';
 import { displayOptionMark } from '@trading-app/shared';
-import { fmt, fmtDollar, fmtPct, formatTime, formatExpirationShort, signalLabel } from '../../lib/format';
+import { fmt, fmtDollar, fmtPct, formatTime, formatExpirationShort, optionSourceLabel } from '../../lib/format';
 import { useTableSort, sortRows, SortableTH } from '../../lib/sort.tsx';
 import { getOptionOpenSortValue, getOptionClosedSortValue } from '../../lib/stockSort';
 import type { OptionOpenSortKey, OptionClosedSortKey } from '../../lib/stockSort';
@@ -174,7 +174,7 @@ export function StockOptionsPanel({
                           ? `$${fmt(o.trailingStopPremium)} (trail${breach === 'breached' ? ' · breached' : ''})`
                           : `$${fmt(o.stopLossPremium)} (SL${breach === 'breached' ? ' · breached' : ''})`}
                     </td>
-                    <td>{signalLabel(o.signalType)}</td>
+                    <td>{optionSourceLabel(o.signalType, { journalStructure: o.journalStructure })}</td>
                     <td className="muted">{formatTime(o.openedAt)}</td>
                     <td>
                       {/* TRA-348 / TRA-358 — a working sell_to_close swaps the
@@ -330,7 +330,7 @@ export function StockOptionsPanel({
                       {hasEntry ? fmtPct(pnlPct) : '—'}
                     </td>
                     <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
-                    <td>{signalLabel(o.signalType)}</td>
+                    <td>{optionSourceLabel(o.signalType, { journalStructure: o.journalStructure })}</td>
                     <td className="muted">{o.closedAt ? formatTime(o.closedAt) : '—'}</td>
                   </tr>
                 );
@@ -342,7 +342,7 @@ export function StockOptionsPanel({
 
       {openOptions.length === 0 && closedOptions.length === 0 && (
         <div className="empty">
-          No open option positions. Stock options are opened by the <strong>Relative Value</strong> scanner — it pulls each ticker's full chain, fits the IV skew across nearby strikes, and buys long premium on contracts that are statistically cheap vs. the local curve / monotonic price / no-arb checks.
+          No open option positions. Stock options are opened by the engine's option sleeves — <strong>Directional (trend)</strong> buys a near-the-money call or put on a 5-minute trend confluence, and <strong>OTM Mispricing</strong> / <strong>Relative Value</strong> buy contracts that price cheap against the fitted volatility curve.
           <br /><br />
           <strong>Strategy:</strong> long premium only · cheap call → buy CALL · cheap put → buy PUT · no naked short legs<br />
           <strong>Take profit:</strong> +40% partial exit (50%) → trailing stop activates at +25%, trails 15% below peak · <strong>Stop loss:</strong> −25% · <strong>Cap:</strong> {optionsDailyLimit} option trades/day per env

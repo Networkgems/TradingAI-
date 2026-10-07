@@ -23,8 +23,9 @@ const RULED_PROD_ENV: NodeJS.ProcessEnv = {
   // the LIVE directional learning budget ($800 loss cap / $150 per-open / 40
   // opens / 40-session box) — both keys written to bqb1 by single-key PUTs and
   // applied by a same-SHA env-apply (TRA-5213). The two rows move together.
-  ENABLE_OPTION_LIVE_DIRECTIONAL: '1',
-  ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET: '1',
+  // OWNER DIRECTIVE 2026-10-07: live testing STOPPED — both keys written off.
+  ENABLE_OPTION_LIVE_DIRECTIONAL: '0',
+  ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET: '0',
   // TRA-5222 — the three ca66df94 board cap numbers, written by the same
   // TRA-5213 five-PUT batch. MAX_LOSS and MAX_OPENS sit below their code
   // ceilings (1000/60), so their rows exist precisely to catch a raise;
@@ -351,10 +352,10 @@ describe('overlay-backed levers (TRA-5014)', () => {
       // overlay must be as inert for a loosening as it was for a disarm.
       ENABLE_OPTION_LIVE_OTM: 'true',
       ENABLE_OPTION_MAKER_TELEMETRY: 'false',
-      // And a DISARM attempt on the ca66df94-armed pair (TRA-5213): an overlay
-      // write must not be able to kill the live budget either.
-      ENABLE_OPTION_LIVE_DIRECTIONAL: 'false',
-      ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET: '0',
+      // And a RE-ARM attempt on the stood-down pair (owner directive 2026-10-07):
+      // an overlay write must not be able to arm live directional either.
+      ENABLE_OPTION_LIVE_DIRECTIONAL: '1',
+      ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET: '1',
     };
     const s = summarizeEnvIntent(RULED_PROD_ENV, hostileOverlay);
     expect(s.ok).toBe(true);
@@ -369,43 +370,33 @@ describe('overlay-backed levers (TRA-5014)', () => {
     const DIR = 'ENABLE_OPTION_LIVE_DIRECTIONAL';
     const BUDGET = 'ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET';
 
-    it('armed-as-ruled reads ok: lever and budget both on', () => {
+    it('stood-down-as-ruled reads ok: lever and budget both off (owner directive 2026-10-07)', () => {
       const s = graded(RULED_PROD_ENV);
       expect(s.ok).toBe(true);
       for (const key of [DIR, BUDGET]) {
         expect(s.levers.find((l) => l.key === key), key).toMatchObject({
-          intended: 'on',
-          effective: 'on',
-          present: true,
+          intended: 'off',
+          effective: 'off',
           matches: true,
         });
       }
     });
 
-    it('THE KILL SWITCH: budget off while the directional lever is still on is a named mismatch', () => {
-      const s = graded({ ...RULED_PROD_ENV, [BUDGET]: '0' });
-      expect(s.ok).toBe(false);
-      expect(s.mismatches).toEqual([BUDGET]);
+    it('a wipe of either key still reads ok — both default off', () => {
+      const { [DIR]: _a, [BUDGET]: _b, ...wiped } = RULED_PROD_ENV;
+      expect(graded(wiped).ok).toBe(true);
     });
 
-    it('a WIPE of the budget key grades like the kill switch — absence is never a quiet pass', () => {
-      const { [BUDGET]: _gone, ...wiped } = RULED_PROD_ENV;
-      const s = graded(wiped);
-      expect(s.ok).toBe(false);
-      expect(s.mismatches).toEqual([BUDGET]);
-      expect(s.levers.find((l) => l.key === BUDGET)).toMatchObject({
-        present: false,
-        effective: 'off',
-        intended: 'on',
-        matches: false,
-      });
-    });
-
-    it('the directional lever wiped while the budget stays armed is a named mismatch (the arm did not survive)', () => {
-      const { [DIR]: _gone, ...wiped } = RULED_PROD_ENV;
-      const s = graded(wiped);
+    it('THE RE-ARM: the directional lever found on is a named mismatch', () => {
+      const s = graded({ ...RULED_PROD_ENV, [DIR]: '1' });
       expect(s.ok).toBe(false);
       expect(s.mismatches).toEqual([DIR]);
+    });
+
+    it('the budget found on is a named mismatch too', () => {
+      const s = graded({ ...RULED_PROD_ENV, [BUDGET]: '1' });
+      expect(s.ok).toBe(false);
+      expect(s.mismatches).toEqual([BUDGET]);
     });
 
     it('both rows state the ruling: the card and the disarm/expiry condition, not just the value', () => {

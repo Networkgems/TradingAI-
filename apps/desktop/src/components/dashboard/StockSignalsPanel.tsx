@@ -4,7 +4,7 @@ import type { TradeSignal, Sma200Signal, EngineMarketReviewState } from '@tradin
 import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
 import { useToast } from '../../lib/toast.tsx';
-import { fmtSignedIntPct, fmtQuoteLevel, formatTime, signalLabel } from '../../lib/format';
+import { fmtSignedIntPct, fmtQuoteLevel, formatTime, optionSourceLabel } from '../../lib/format';
 import { RegimeBanner } from '../RegimeBanner';
 import { SignalOptionRow } from '../SignalOptionRow';
 import { Sma200SignalCard, isSma200Signal } from '../Sma200SignalCard';
@@ -106,7 +106,7 @@ export function StockSignalsPanel({
                   <div className="signal-header">
                     <span className="signal-symbol">{sig.symbol}</span>
                     <span className={`signal-side ${sig.side}`}>{sig.side.toUpperCase()}</span>
-                    <span className="signal-type">{signalLabel(sig.type)}</span>
+                    <span className="signal-type">{optionSourceLabel(sig.type, { sleeve: (sig as { sleeve?: string }).sleeve })}</span>
                     <span className="signal-time">{formatTime(sig.timestamp)}</span>
                   </div>
                   <div className="signal-body">

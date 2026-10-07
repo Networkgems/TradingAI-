@@ -281,9 +281,14 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
   },
   {
     key: 'ENABLE_OPTION_LIVE_DIRECTIONAL',
-    intended: 'on',
+    intended: 'off',
     provenance:
-      'TRA-1490 authorized BUILDING the live path, explicitly dark; arming was a separate gated ' +
+      'OWNER DIRECTIVE 2026-10-07 (chat with the owner, Enock): STOP live testing. Both rows return to ' +
+      "intended 'off' together, per the two-acts rule this row carried. The SOFI position opened under the " +
+      'budget stays OPEN and keeps its engine-managed stop/trail (exit management is not gated on this ' +
+      'arm). Re-arming needs a new owner decision AND positive paper results (~40 closed paper trades ' +
+      'per sleeve, net of costs), then 1 contract under a $100–150 loss cap. ' +
+      'HISTORY: TRA-1490 authorized BUILDING the live path, explicitly dark; arming was a separate gated ' +
       'approval — and board card ca66df94 on TRA-5207 (ask_user_questions, human_only, answered ' +
       '2026-10-05 23:03:52 ET / 2026-10-06T03:03:52Z) IS that approval: option B — chosen by the ' +
       "board AGAINST QuantTrader's own recommendation of option A — armed the LIVE directional learning budget " +
@@ -313,9 +318,14 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
     // ENABLE_OPTION_LIVE_DIRECTIONAL=1 standing would grade clean while the
     // directional arm ran unbudgeted on the money host.
     key: 'ENABLE_LIVE_DIRECTIONAL_LEARNING_BUDGET',
-    intended: 'on',
+    intended: 'off',
     provenance:
-      'Armed by board card ca66df94 on TRA-5207 (2026-10-06): $800 loss cap / $150 per-open / ' +
+      'OWNER DIRECTIVE 2026-10-07 (chat with the owner, Enock): STOP live testing. Both rows return to ' +
+      "intended 'off' together, per the two-acts rule this row carried. The SOFI position opened under the " +
+      'budget stays OPEN and keeps its engine-managed stop/trail (exit management is not gated on this ' +
+      'arm). Re-arming needs a new owner decision AND positive paper results (~40 closed paper trades ' +
+      'per sleeve, net of costs), then 1 contract under a $100–150 loss cap. ' +
+      'HISTORY: Armed by board card ca66df94 on TRA-5207 (2026-10-06): $800 loss cap / $150 per-open / ' +
       '40 opens / 40-session box. This flag is the env-level bound on the live directional arm: ' +
       'an `off`/absent reading here while ENABLE_OPTION_LIVE_DIRECTIONAL is still on means the ' +
       'kill switch was thrown (or the key wiped) without the paired manifest edit — the ' +

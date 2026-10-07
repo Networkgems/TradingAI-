@@ -200,6 +200,28 @@ export function signalLabel(type: string) {
   }
 }
 
+/**
+ * The label for an OPTION row or signal, which must name the engine that
+ * actually produced it. The directional trend sleeve (5m Supertrend/MA/MACD/RSI
+ * confluence → near-ATM call or put) reuses the `relative_value` signal type and
+ * the RV open path on the server, so `signalLabel(signalType)` alone printed
+ * "Relative Value" on trades the RV engine never made. The server stamps the
+ * real sleeve on the row (`journalStructure: 'single_leg_directional'`) and on
+ * the signal (`sleeve: 'directional'`); read those first.
+ */
+export function optionSourceLabel(
+  signalType: string,
+  opts: { journalStructure?: string | null; sleeve?: string | null } = {},
+): string {
+  if (
+    signalType === 'relative_value'
+    && (opts.journalStructure === 'single_leg_directional' || opts.sleeve === 'directional')
+  ) {
+    return 'Directional (trend)';
+  }
+  return signalLabel(signalType);
+}
+
 export function exitReasonLabel(reason?: string) {
   switch (reason) {
     case 'stop': return 'Stop';
