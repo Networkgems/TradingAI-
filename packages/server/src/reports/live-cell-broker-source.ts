@@ -200,6 +200,11 @@ export type LiveCellSourceStatus =
   | 'ok'
   /** A broker-tagged row whose stored figure contradicts the broker figure it states. */
   | 'broker_figure_overwritten'
+  /**
+   * TRA-5270 — a flat-book `tradier-balance` cell whose header and figure agree
+   * with each other but not with the broker's realized figure for the date.
+   */
+  | 'balance_cell_off_broker_realized'
   /** A broker-tagged row that no longer carries a readable broker computation. BLIND. */
   | 'broker_provenance_unreadable'
   /** Engine-sourced options P&L on a date the broker shows no realized options P&L. */
@@ -238,6 +243,11 @@ export interface LiveCellSourceInput {
   realizedPnl: number;
   optionsPnl: number;
   markdown: string | undefined;
+  /**
+   * Open positions on the row. Gates the TRA-5270 balance-vs-realized grade: a
+   * balance delta only equals realized P&L when nothing is marked to market.
+   */
+  openPositionCount?: number;
   /** Broker realized options P&L for the date. Omit only on a non-live book. */
   broker: BrokerDayEvidence;
 }
@@ -334,7 +344,37 @@ export function auditLiveCellSource(input: LiveCellSourceInput): LiveCellSourceV
           + `The calendar is showing a number the broker did not produce.`,
       };
     }
-    return ok(input, sourceClass, `Broker balance delta, confirmed against the row's own header (${signed(stated)}).`);
+    // TRA-5270 — the header check above is SELF-consistency: header and figure can
+    // agree and both be off the broker (07-01 +74.30, 07-08 +168.15). Grade the
+    // figure against broker realized, but only where the two measures coincide: a
+    // balance delta includes unrealized MTM, so on a cell carrying open positions a
+    // gap is normal (the 2026-08-05 control). Where it cannot be graded, SAY SO —
+    // `ok` here must not read the same as "tied to the broker".
+    const headerOk = `Broker balance delta, confirmed against the row's own header (${signed(stated)}).`;
+    const flat = input.openPositionCount === 0;
+    if (!flat || !input.broker.known || input.broker.source === 'sidecar_quiet') {
+      const why = !flat
+        ? 'the cell carries open positions or its count is unknown, so the balance delta includes unrealized'
+        : 'no broker realized figure was recorded for the date';
+      return ok(input, sourceClass, `${headerOk} Header only — not graded against broker realized: ${why}.`);
+    }
+    const brokerRealized = input.broker.realizedUsd;
+    if (Math.abs(input.combinedPnl - brokerRealized) > TOLERANCE_USD) {
+      return {
+        status: 'balance_cell_off_broker_realized',
+        sourceClass,
+        renderedPnl: input.combinedPnl,
+        engineOptionsPnl: input.optionsPnl,
+        brokerPnl: brokerRealized,
+        brokerEvidenceSource: brokerEvidenceSourceOf(input),
+        detail:
+          `${input.reportDate} renders ${signed(input.combinedPnl)} from a broker balance delta on a flat book, `
+          + `but the broker's realized P&L for the date is ${signed(brokerRealized)}, a gap of `
+          + `${usd(input.combinedPnl - brokerRealized)}. Its own header agrees with the rendered figure, so the `
+          + `header check could not see it. Realized broker fills own a settled cell.`,
+      };
+    }
+    return ok(input, sourceClass, `${headerOk} Ties to broker realized (${signed(brokerRealized)}).`);
   }
 
   // ── engine-sourced or unlabelled ──────────────────────────────────────────

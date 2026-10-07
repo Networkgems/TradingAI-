@@ -6681,6 +6681,7 @@ export interface EodReport {
       | 'engine_options_diverges_from_broker'
       | 'broker_realized_without_cell_pnl'
       | 'broker_figure_overwritten'
+      | 'balance_cell_off_broker_realized'
       | 'broker_evidence_unreadable'
       | 'broker_provenance_unreadable';
     /** The figure the calendar renders for this day. */
@@ -6730,6 +6731,7 @@ export interface EodReport {
       | 'engine_options_diverges_from_broker'
       | 'broker_realized_without_cell_pnl'
       | 'broker_figure_overwritten'
+      | 'balance_cell_off_broker_realized'
       | 'broker_evidence_unreadable'
       | 'broker_provenance_unreadable'
       | 'not_graded';

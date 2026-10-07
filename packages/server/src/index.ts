@@ -2458,6 +2458,7 @@ async function generateAndSaveReport(
         realizedPnl: finalReport.realizedPnl,
         optionsPnl: finalReport.optionsPnl,
         markdown: finalReport.markdown,
+        openPositionCount: finalReport.openPositionCount,
         // TRA-5118 — never `totals[date] ?? 0`: a date the windowed sidecar
         // does not cover is not evidence the broker was quiet. The resolver
         // falls back to the row's own TRA-4201 FIFO block and labels the basis.
@@ -3554,6 +3555,7 @@ async function stampBrokerSourceAudit(
       realizedPnl: report.realizedPnl,
       optionsPnl: report.optionsPnl,
       markdown: report.markdown,
+      openPositionCount: report.openPositionCount,
       // ⛔ `{}` from a corrupt read must not read as "the broker was quiet" — see
       // `readTradierDailyTotalsForEvidence`. A missing file is `ok` with no rows
       // (a new account genuinely has none); a FAILED read is `known: false` and

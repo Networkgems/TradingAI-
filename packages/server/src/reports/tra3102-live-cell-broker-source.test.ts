@@ -233,6 +233,81 @@ describe('a broker-tagged cell whose figure its own header contradicts', () => {
   });
 });
 
+// ── TRA-5270: a tradier-balance cell whose header AGREES with the figure but both are off the broker ──
+
+describe('TRA-5270 — a flat-book tradier-balance cell off broker realized', () => {
+  // 2026-07-01 / 07-08, live, read before the TRA-5149 forced backfill: the header
+  // and the rendered figure agreed with each other (so `broker_figure_overwritten`
+  // could not fire) while broker realized was +74.30 / +168.15 away.
+  const LIVE = [
+    { date: '2026-07-01', rendered: -42.18, broker: -116.48, gap: 74.3 },
+    { date: '2026-07-08', rendered: 61.91, broker: -106.24, gap: 168.15 },
+  ] as const;
+
+  for (const row of LIVE) {
+    it(`flags ${row.date} — renders ${row.rendered}, broker realized ${row.broker}`, () => {
+      const stated = (row.rendered >= 0 ? '+' : '') + row.rendered.toFixed(2);
+      const v = auditLiveCellSource(
+        cell({
+          reportDate: row.date,
+          pnlSource: 'tradier-balance',
+          combinedPnl: row.rendered,
+          optionsPnl: 0,
+          openPositionCount: 0,
+          markdown: tra359Header(row.date, '468.58', '2026-06-30', '510.76', stated),
+          broker: { known: true, realizedUsd: row.broker },
+        }),
+      );
+      expect(v.status).toBe('balance_cell_off_broker_realized');
+      expect(v.brokerPnl).toBe(row.broker);
+      expect(v.detail).toContain(`${row.gap.toFixed(2)}`);
+      expect(isUnreconciled(v)).toBe(true);
+    });
+  }
+
+  it('does NOT flag a flat-book cell that ties to broker realized', () => {
+    const v = auditLiveCellSource(
+      cell({
+        pnlSource: 'tradier-balance',
+        combinedPnl: -116.48,
+        openPositionCount: 0,
+        markdown: tra359Header('2026-07-01', '468.58', '2026-06-30', '585.06', '-116.48'),
+        broker: { known: true, realizedUsd: -116.48 },
+      }),
+    );
+    expect(v.status).toBe('ok');
+  });
+
+  it('does NOT flag a cell carrying open positions (balance delta includes unrealized) — and says it was not graded', () => {
+    const v = auditLiveCellSource(
+      cell({
+        reportDate: '2026-08-05',
+        pnlSource: 'tradier-balance',
+        combinedPnl: -240.64,
+        openPositionCount: 2,
+        markdown: tra359Header('2026-08-05', '1,283.58', '2026-08-04', '1,524.22', '-240.64'),
+        broker: { known: true, realizedUsd: -424 },
+      }),
+    );
+    expect(v.status).toBe('ok');
+    expect(v.detail).toContain('not graded against broker realized');
+  });
+
+  it('does NOT read an unrecorded sidecar date as a broker zero', () => {
+    const v = auditLiveCellSource(
+      cell({
+        pnlSource: 'tradier-balance',
+        combinedPnl: 50,
+        openPositionCount: 0,
+        markdown: tra359Header('2026-07-20', '518.58', '2026-07-17', '468.58', '+50.00'),
+        broker: { known: true, realizedUsd: 0, source: 'sidecar_quiet' },
+      }),
+    );
+    expect(v.status).toBe('ok');
+    expect(v.detail).toContain('not graded against broker realized');
+  });
+});
+
 // ── NEGATIVE CONTROLS: real healthy rows that must not flag ──────────────────
 
 describe('healthy real rows are NOT flagged', () => {
