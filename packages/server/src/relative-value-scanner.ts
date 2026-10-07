@@ -417,6 +417,8 @@ export interface OtmMispricingScanResult {
   spot: number | null;
   expiration: string | null;
   candidates: OtmMispricingCandidate[];
+  /** Every expiration actually priced (primary first). Absent on failure paths. */
+  scannedExpirations?: string[];
   /**
    * TRA-161 — widened from `'ok' | 'unavailable'`. `scanOtm` used to flatten
    * every distinct failure of the snapshot path into a single `'unavailable'`,
@@ -462,6 +464,18 @@ export interface SelectorChainResolution {
 
 export interface RelativeValueScannerDiagnostics {
   configured: boolean;
+  /** Where chains come from. A config fact, named as one — not feed liveness. */
+  marketData?: { env: 'sandbox' | 'production'; source: string; delayedQuotes: boolean; vendorGreeks: boolean };
+  /** Self-imposed upstream chain budget (see `chainCallBudgetPerMin`). */
+  chainBudget?: {
+    limitPerMin: number | null;
+    usedLastMin: number;
+    upstreamCalls: number;
+    deferred: number;
+    lastDeferredAtMs: number | null;
+  };
+  /** Expirations priced per OTM scan. */
+  otmMaxExpirations?: number;
   breakerOpen: boolean;
   breakerOpenedAtMs: number | null;
   cacheSize: number;
@@ -999,6 +1013,34 @@ export interface RelativeValueScannerConfig {
   dteMin?: number;
   dteMax?: number;
   dteTarget?: number;
+  /**
+   * Self-imposed ceiling on UPSTREAM expirations+chain calls per rolling minute.
+   * Needed once chains ride the production market-data token, which they then
+   * share with quotes and timesales (Tradier: 120 req/min per token). `null` /
+   * absent = no ceiling (legacy). A call over budget is suppressed and reported
+   * as `quota_held` with its own `chainBudget` counters — our suppression, not
+   * a vendor refusal.
+   */
+  chainCallBudgetPerMin?: number | null;
+  /**
+   * How many in-window expirations `scanOtm` prices (the DTE-picked one plus
+   * the nearest others). Default 1 = legacy single-expiration scan.
+   */
+  otmMaxExpirations?: number;
+  /** Label for diagnostics: which Tradier environment the chains come from. */
+  marketDataSource?: string;
+}
+
+/**
+ * Raised INSTEAD of an upstream call when {@link RelativeValueScannerConfig.chainCallBudgetPerMin}
+ * is spent. Subclasses the quota hold so every caller already maps it to
+ * `quota_held` and the breaker already declines to trip on it.
+ */
+export class TradierChainBudgetHoldError extends TradierQuotaHoldError {
+  constructor(endpoint: 'expirations' | 'chain', detail: string, heldUntilMs: number) {
+    super(endpoint, `${detail}; self-imposed chain budget spent`, heldUntilMs);
+    this.name = 'TradierChainBudgetHoldError';
+  }
 }
 
 /**
@@ -1143,11 +1185,56 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     } else {
       this.client = null;
     }
+    const budget = config.chainCallBudgetPerMin;
+    this.chainBudgetPerMin =
+      typeof budget === 'number' && Number.isFinite(budget) && budget > 0 ? Math.floor(budget) : null;
+    const maxExp = config.otmMaxExpirations;
+    this.otmMaxExpirations =
+      typeof maxExp === 'number' && Number.isFinite(maxExp) && maxExp >= 1 ? Math.min(6, Math.floor(maxExp)) : 1;
+    this.marketDataEnv = env;
+    this.marketDataSource = config.marketDataSource ?? `TRADIER_ENV=${env}`;
+  }
+
+  private readonly chainBudgetPerMin: number | null;
+  private readonly otmMaxExpirations: number;
+  private readonly marketDataEnv: 'sandbox' | 'production';
+  private readonly marketDataSource: string;
+  /** Upstream call stamps inside the rolling minute (budget accounting). */
+  private upstreamCallStamps: number[] = [];
+  private readonly chainBudgetCounters = { upstreamCalls: 0, deferred: 0, lastDeferredAtMs: null as number | null };
+
+  /** Spend one unit of the self-imposed chain budget, or throw if it is spent. */
+  private spendChainBudget(endpoint: 'expirations' | 'chain', detail: string): void {
+    const now = this.now();
+    const cutoff = now - 60_000;
+    while (this.upstreamCallStamps.length > 0 && this.upstreamCallStamps[0]! <= cutoff) {
+      this.upstreamCallStamps.shift();
+    }
+    if (this.chainBudgetPerMin != null && this.upstreamCallStamps.length >= this.chainBudgetPerMin) {
+      this.chainBudgetCounters.deferred += 1;
+      this.chainBudgetCounters.lastDeferredAtMs = now;
+      throw new TradierChainBudgetHoldError(endpoint, detail, this.upstreamCallStamps[0]! + 60_000);
+    }
+    this.upstreamCallStamps.push(now);
+    this.chainBudgetCounters.upstreamCalls += 1;
   }
 
   diagnostics(): RelativeValueScannerDiagnostics {
     return {
       configured: this.client !== null,
+      marketData: {
+        env: this.marketDataEnv,
+        source: this.marketDataSource,
+        // Sandbox chains are 15-min delayed and carry no greeks/IV (Tradier docs).
+        delayedQuotes: this.marketDataEnv === 'sandbox',
+        vendorGreeks: this.marketDataEnv === 'production',
+      },
+      chainBudget: {
+        limitPerMin: this.chainBudgetPerMin,
+        usedLastMin: this.upstreamCallStamps.filter((t) => t > this.now() - 60_000).length,
+        ...this.chainBudgetCounters,
+      },
+      otmMaxExpirations: this.otmMaxExpirations,
       breakerOpen: this.isBreakerOpen(),
       breakerOpenedAtMs: this.breakerState?.openedAt ?? null,
       cacheSize: this.chainCache.size,
@@ -1519,8 +1606,40 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
         ...(errorMessage === undefined ? {} : { errorMessage }),
       };
     }
-    const candidates = findMispricedOtmContracts(snap.rows, snap.spot, { now: this.now(), ...opts });
-    return { symbol: snap.symbol, spot: snap.spot, expiration: snap.expiration, candidates, reason: 'ok' };
+    // Price more than the one DTE-picked expiration when configured: the
+    // nearest other in-window expirations (by distance to the target) are
+    // appended. Extras ride the same 60s cache, budget and breaker; a failure
+    // on an extra drops that extra only — the primary result still stands.
+    let rows = snap.rows;
+    const scannedExpirations = [snap.expiration];
+    if (this.otmMaxExpirations > 1) {
+      try {
+        const windowed = await this.resolveWindowedExpirations(upper, dtePrefs);
+        const extras = (windowed?.inWindow ?? [])
+          .filter((e) => e.d !== snap.expiration)
+          .sort((a, b) => Math.abs(a.ms - windowed!.targetMs) - Math.abs(b.ms - windowed!.targetMs))
+          .slice(0, this.otmMaxExpirations - 1);
+        for (const e of extras) {
+          try {
+            const extra = await this.fetchChain(upper, e.d);
+            if (extra.length > 0) {
+              rows = rows.concat(extra);
+              scannedExpirations.push(e.d);
+            }
+          } catch (err) {
+            this.tripBreaker(`getChainSnapshot(${upper},${e.d}) failed`, err);
+            break;
+          }
+        }
+      } catch (err) {
+        this.tripBreaker(`getExpirations(${upper}) failed`, err);
+      }
+    }
+    const candidates = findMispricedOtmContracts(rows, snap.spot, { now: this.now(), ...opts });
+    return {
+      symbol: snap.symbol, spot: snap.spot, expiration: snap.expiration, candidates, reason: 'ok',
+      scannedExpirations,
+    };
   }
 
   /**
@@ -2147,6 +2266,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       // property of this key, so there is no point asking a per-key map about it.
       this.throwIfQuotaHeld('expirations', symbol);
       this.throwIfCooling('expirations', symbol);
+      this.spendChainBudget('expirations', symbol);
       const client = this.client!;
       if (typeof client.fetchExpirations === 'function') {
         const r = await client.fetchExpirations(symbol);
@@ -2217,6 +2337,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     // TRA-5005 — see `resolveWindowedExpirations`: global gate before per-key.
     this.throwIfQuotaHeld('chain', `${symbol},${expiration}`);
     this.throwIfCooling('chain', `${symbol},${expiration}`);
+    this.spendChainBudget('chain', `${symbol},${expiration}`);
     const client = this.client!;
     let rows: OptionChainRow[];
     if (typeof client.fetchChainSnapshot === 'function') {

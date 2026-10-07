@@ -807,6 +807,12 @@ const QUOTE_CACHE_TTL_MS = (() => {
 interface QuoteCacheEntry {
   quote: QuoteResult;
   storedAt: number;
+  /**
+   * When REST last wrote this row. Set only by a stream overlay (absent ⇒ the
+   * row IS a REST write at `storedAt`). Lets the overlay keep price/book live
+   * while still letting REST refresh the fields the stream lacks (volume).
+   */
+  restAt?: number;
 }
 const quoteCache = new Map<string, QuoteCacheEntry>();
 // TRA-739: singleflight for Tradier quote batches. The previous approach keyed
@@ -846,6 +852,101 @@ export function partitionCachedQuotes(input: {
 
 function cacheFreshQuotes(entries: Iterable<readonly [string, QuoteResult]>, now: number): void {
   for (const [sym, q] of entries) quoteCache.set(sym, { quote: q, storedAt: now });
+}
+
+// ── Tradier stream overlay ─────────────────────────────────────────────────
+// The REST quote path refreshes every ~20–30s (QUOTE_CACHE_TTL_MS + the engine's
+// QUOTE_REFRESH_MS). When the `/markets/events` WebSocket is on, its ticks are
+// written straight into this cache, so every reader of `fetchQuotes` — the
+// engine tick, exit checks, the RV/OTM spot read — sees a sub-second quote for
+// the streamed symbols, and those symbols stop costing REST quote calls while
+// the stream is live (their entries stay inside the TTL). The stream does not
+// count against Tradier's REST per-minute limit.
+//
+// A tick only UPDATES an entry REST already seeded: the stream carries no
+// session volume or previous close, so `change`/`changePct` are carried forward
+// from the REST row against its implied previous close. Unseeded symbols are
+// left to REST.
+
+/** A stream tick: an L1 quote (bid/ask) and/or a last-trade print. */
+export interface StreamTick {
+  bid?: number;
+  ask?: number;
+  bidSize?: number;
+  askSize?: number;
+  /** Last trade price, when the tick is a print. */
+  last?: number;
+  /** Exchange event time, ms epoch. */
+  eventTime: number;
+}
+
+/** Pure: fold a stream tick into the REST-seeded quote. Null ⇒ tick unusable. */
+export function mergeStreamTick(prev: QuoteResult, tick: StreamTick): QuoteResult | null {
+  const bid = typeof tick.bid === 'number' && tick.bid > 0 ? tick.bid : prev.bid;
+  const ask = typeof tick.ask === 'number' && tick.ask > 0 ? tick.ask : prev.ask;
+  let price: number | null = null;
+  if (typeof tick.last === 'number' && tick.last > 0) price = tick.last;
+  else if (typeof bid === 'number' && typeof ask === 'number' && bid > 0 && ask >= bid) price = (bid + ask) / 2;
+  if (price == null || !Number.isFinite(price)) return null;
+  const prevClose = prev.price - prev.change;
+  const change = prevClose > 0 ? price - prevClose : prev.change;
+  const changePct = prevClose > 0 ? (change / prevClose) * 100 : prev.changePct;
+  return {
+    ...prev,
+    price,
+    change,
+    changePct,
+    ...(typeof bid === 'number' ? { bid } : {}),
+    ...(typeof ask === 'number' ? { ask } : {}),
+    ...(typeof tick.bidSize === 'number' ? { bidSize: tick.bidSize } : {}),
+    ...(typeof tick.askSize === 'number' ? { askSize: tick.askSize } : {}),
+  };
+}
+
+const streamOverlayCounters = {
+  applied: 0,
+  skippedUnseeded: 0,
+  skippedStale: 0,
+  skippedUnusable: 0,
+  lastAppliedAtMs: null as number | null,
+};
+/** Ticks older than this (exchange time) are not written — a halted book is not a quote. */
+const STREAM_TICK_MAX_AGE_MS = 15_000;
+/** REST still refreshes a streamed row at least this often (volume, prev close). */
+const STREAM_REST_REFRESH_MS = 120_000;
+
+/** Write a stream tick into the quote cache. Returns true when the entry was refreshed. */
+export function applyStreamTickToQuoteCache(symbol: string, tick: StreamTick, now: number = Date.now()): boolean {
+  const sym = symbol.trim().toUpperCase();
+  const entry = quoteCache.get(sym);
+  if (!entry) {
+    streamOverlayCounters.skippedUnseeded += 1;
+    return false;
+  }
+  if (!Number.isFinite(tick.eventTime) || now - tick.eventTime > STREAM_TICK_MAX_AGE_MS) {
+    streamOverlayCounters.skippedStale += 1;
+    return false;
+  }
+  const merged = mergeStreamTick(entry.quote, tick);
+  if (!merged) {
+    streamOverlayCounters.skippedUnusable += 1;
+    return false;
+  }
+  // Keep the row fresh for readers, but at most STREAM_REST_REFRESH_MS past the
+  // last REST write — after that `storedAt` is held back so the next
+  // `fetchQuotes` refetches it over REST (session volume, a corrected previous
+  // close). Price/book stay the stream's either way.
+  const restAt = entry.restAt ?? entry.storedAt;
+  const storedAt = now - restAt < STREAM_REST_REFRESH_MS ? now : entry.storedAt;
+  quoteCache.set(sym, { quote: merged, storedAt, restAt });
+  streamOverlayCounters.applied += 1;
+  streamOverlayCounters.lastAppliedAtMs = now;
+  return true;
+}
+
+/** Counters for `/api/market-data/stream` — what the overlay actually did. */
+export function getStreamOverlayCounters(): Readonly<typeof streamOverlayCounters> {
+  return { ...streamOverlayCounters };
 }
 
 /** Clear every cached quote — called on a Tradier credential change so the

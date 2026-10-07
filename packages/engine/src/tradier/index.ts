@@ -68,6 +68,8 @@ export {
   parseTradierCorporateActions,
   parseTradierGainLoss,
   roundToCent,
+  parseGreeksUpdatedAt,
+  resolveGreeksUpdatedAtZone,
 } from './options-client.js';
 export type {
   TradierOptionsContract,
