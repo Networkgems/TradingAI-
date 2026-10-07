@@ -1865,9 +1865,12 @@ export function resolveLiveOptionTestFleetRiskFraction(
 /**
  * One book's contribution to `Σ E_i`, as the cross-engine read publishes it.
  *
- * ⚠ BALANCES ONLY. Deliberately NOT the full `LiveOtmFleetBoundRow` (no
- * `capUsd`): a budget is now a function of the fleet sum, so a row carrying a
- * budget would make resolving one re-enter the read that produced it.
+ * ⚠ BALANCES AND RAW COUNTS ONLY. Deliberately NOT the full
+ * `LiveOtmFleetBoundRow` (no `capUsd`): a budget is now a function of the
+ * fleet sum, so a row carrying a budget would make resolving one re-enter the
+ * read that produced it. The TRA-5283 count fields are raw per-book state like
+ * the balances — nothing on this row is DERIVED from the fleet, which is the
+ * property the recursion guard actually needs.
  */
 export interface LiveOtmFleetCapitalRow {
   /** `alertUsername`. */
@@ -1892,6 +1895,26 @@ export interface LiveOtmFleetCapitalRow {
    * the cash-only basis is the defect. The compiler makes every producer say.
    */
   openPremiumAtRiskUsd: number;
+  /**
+   * TRA-5283 — this book's OPEN LIVE OPTION ROW COUNT, taken from the SAME
+   * `openPremiumAtRiskForMode('live')` fold as {@link openPremiumAtRiskUsd},
+   * so the dollar and the count cannot disagree about what is open.
+   *
+   * Carried so the hard-controls 3-position cap can be graded against the
+   * FLEET its label and refusal text promise, not against the one book that
+   * happens to be placing the order — per-book grading made the effective
+   * fleet cap `3 × gate-open books` (6, measured with 2 armed books).
+   * Required, not optional-with-a-default: an absent count could only be read
+   * as "unreadable ⇒ refuse", and a producer that cannot say should be a
+   * compile error, not a runtime refusal (the TRA-3897 rule).
+   */
+  openLiveOptionRows: number;
+  /**
+   * TRA-5283 — open positions on this book's EQUITY account (in live mode the
+   * Tradier mirrors): the other half of the open-position count the order
+   * site has always supplied to the hard controls, now fleet-readable.
+   */
+  openEquityPositions: number;
 }
 
 /** Why the φ in force is what it is. Published so a small budget is attributable. */

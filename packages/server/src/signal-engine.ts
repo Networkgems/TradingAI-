@@ -161,7 +161,10 @@ import type { LiveOtmFleetCapitalRow, LiveOtmFleetSizingReason, UnsettledLivePre
 // A read of a derived scalar, not the shared mutable accumulator TRA-3445
 // avoided; unwired it returns `null` and sizing falls back to the per-book
 // bound already in force (it never darks a book).
-import { readLiveOtmFleetCapitalRows } from './live-otm-fleet-capital.js';
+import {
+  readLiveOtmFleetCapitalRows,
+  isLiveOtmFleetCapitalProviderWired,
+} from './live-otm-fleet-capital.js';
 /** TRA-3979 — fleet concentration (advisory; refuses nothing). */
 import type { FleetConcentrationBookRow } from './fleet-concentration.js';
 import {
@@ -440,7 +443,10 @@ import {
   takeLiveLearningGrant,
   commitLiveLearningOpen,
 } from './live-learning-budget.js';
-import { admitOrderThroughHardControls } from './hard-controls.js'; // TRA-4650 (choke point: TRA-4655)
+import {
+  admitOrderThroughHardControls, // TRA-4650 (choke point: TRA-4655)
+  resolveFleetOpenPositionCount, // TRA-5283 (the 3-position cap counts the FLEET)
+} from './hard-controls.js';
 // TRA-4657 — paper-trading tees at the alert-emitter seams (observe-only; the
 // recorders swallow their own throws and are inert while the flag is off).
 import {
@@ -12969,6 +12975,9 @@ export class SignalEngine {
    * apart into a fleet summed on one predicate and graded on another.
    */
   getLiveOtmFleetCapitalRow(): LiveOtmFleetCapitalRow {
+    // TRA-5283 — ONE fold for the dollar AND the count, so the two fields on
+    // the published row cannot disagree about which rows are open.
+    const liveAtRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
     return {
       book: this.alertUsername ?? null,
       // ⚠ SUM THE FLEET ON **THIS**, NOT ON `mode`. Measured on bqb1 the night
@@ -12988,7 +12997,13 @@ export class SignalEngine {
       // against a basis that shrank whenever the fleet took a position. Same
       // fold the order site and the exposure row use, so the three cannot
       // disagree about what this book's basis is.
-      openPremiumAtRiskUsd: this.optionsAccount.openPremiumAtRiskForMode('live').usd,
+      openPremiumAtRiskUsd: liveAtRisk.usd,
+      // TRA-5283 — the raw open-position counts the fleet-wide 3-position hard
+      // cap is graded on (resolveFleetOpenPositionCount at the live
+      // buy_to_open seam). Counts, not budgets: nothing derived from the
+      // fleet, so the recursion guard on this row's shape still holds.
+      openLiveOptionRows: liveAtRisk.rows,
+      openEquityPositions: this.account.getState().openPositions.length,
     };
   }
 
@@ -14918,13 +14933,34 @@ export class SignalEngine {
     // vetoes, slow ticks) is refused as stale rather than priced off an old
     // quote. An ALLOW consumes the idempotency key; that is safe here because
     // a voided open deletes the position and any retry arrives as a NEW row id.
+    // TRA-5283 — the 3-position cap is labelled, documented and refused as
+    // FLEET-WIDE, so the count supplied to it is the FLEET's: this book's live
+    // option rows (excluding this row — it is already in the book pre-mirror,
+    // see the TRA-3872 note above) + this book's equity mirrors, PLUS every
+    // OTHER `liveEntryGateOpen` book's open live option rows and equity
+    // positions, off the same cross-engine read `aggregateFleetBound` sums on.
+    // Before this the count was per-book, so with 2 gate-open books the
+    // effective fleet cap was 6 (masked today only by the learning budget's
+    // fleet-wide maxConcurrent: 2, which OTM admissions do not pass through).
+    // Degrade is REFUSE (`open_positions_unreadable`): a wired fleet read
+    // that breaks, or any gate-open row with unreadable counts, yields NaN —
+    // never "count the books we can see" (the `canary_ceiling_unreadable`
+    // posture). Only a context with NO fleet read at all (provider unwired —
+    // single-engine tests; production wires it once at boot in index.ts)
+    // falls back to the per-book count, the TRA-3879 AC4 never-dark-a-book
+    // degrade.
+    const fleetOpenPositionCount = resolveFleetOpenPositionCount(
+      readLiveOtmFleetCapitalRows(),
+      {
+        book: this.alertUsername ?? null,
+        openPositionCount: canaryAtRisk.rows + this.account.getState().openPositions.length,
+      },
+      isLiveOtmFleetCapitalProviderWired(),
+    );
     const hardVerdict = admitOrderThroughHardControls({
       kind: 'open',
       notionalUsd: notionalCost,
-      // Fleet-wide count: live option rows (excluding this row — it is already
-      // in the book pre-mirror, see the TRA-3872 note above) + the equity
-      // book's open positions, which in live mode are the Tradier mirrors.
-      openPositionCount: canaryAtRisk.rows + this.account.getState().openPositions.length,
+      openPositionCount: fleetOpenPositionCount,
       quoteAsOfMs: opened.openedAt,
       idempotencyKey: `live-option-open:${opened.id}`,
     });

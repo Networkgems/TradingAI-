@@ -22,6 +22,8 @@ import {
   registerForceCloseHandler,
   releaseHardKillSwitch,
   requestForceCloseAll,
+  resolveFleetOpenPositionCount,
+  type FleetOpenPositionCountRow,
   type HardControlIntent,
 } from './hard-controls.js';
 
@@ -137,6 +139,75 @@ describe('control 4 — 3 open positions max', () => {
     expect(admitOrderThroughHardControls(intent({ openPositionCount: -1 }), NOW).reasonCode)
       .toBe('open_positions_unreadable');
     expect(admitOrderThroughHardControls(intent({ openPositionCount: 2 }), NOW).allowed).toBe(true);
+  });
+});
+
+describe('control 4 fleet count — TRA-5283: "3 positions max" counts the FLEET, not one book', () => {
+  const row = (
+    book: string, open: boolean, options: number, equity: number,
+  ): FleetOpenPositionCountRow =>
+    ({ book, liveEntryGateOpen: open, openLiveOptionRows: options, openEquityPositions: equity });
+  const WIRED = true;
+  const UNWIRED = false;
+
+  it('the filing scenario: 2 gate-open books × 2 open rows — a 5th position on EITHER book is REFUSED', () => {
+    // self = admin, holding 2 open live rows (its own count excludes the row
+    // being graded, TRA-3872); sibling v0nni holds 2 more. Fleet = 4 ≥ cap 3.
+    const rows = [row('admin', true, 2, 0), row('v0nni', true, 2, 0)];
+    const count = resolveFleetOpenPositionCount(rows, { book: 'admin', openPositionCount: 2 }, WIRED);
+    expect(count).toBe(4);
+    const v = admitOrderThroughHardControls(intent({ openPositionCount: count }), NOW);
+    expect(v.allowed).toBe(false);
+    expect(v.reasonCode).toBe('max_open_positions');
+    expect(v.reason).toContain('fleet-wide cap');
+    // The PRE-FIX supplier — this book's own count alone — admits the same
+    // order. That admit is the defect this suite now pins: per-book grading
+    // makes the effective fleet cap `3 × gate-open books`.
+    expect(admitOrderThroughHardControls(intent({ openPositionCount: 2 }), NOW).allowed).toBe(true);
+  });
+
+  it('a sibling book\'s EQUITY mirrors count toward the cap too', () => {
+    const rows = [row('admin', true, 0, 0), row('v0nni', true, 1, 2)];
+    expect(resolveFleetOpenPositionCount(rows, { book: 'admin', openPositionCount: 0 }, WIRED)).toBe(3);
+  });
+
+  it('a gate-CLOSED book\'s rows do NOT count — live-MODE-on-sandbox phantoms must not tighten the cap (TRA-3445)', () => {
+    const rows = [row('admin', true, 1, 0), row('Richard', false, 4, 3)];
+    expect(resolveFleetOpenPositionCount(rows, { book: 'admin', openPositionCount: 1 }, WIRED)).toBe(1);
+  });
+
+  it('the self row is matched by book and never double-counted — the caller\'s own figure wins', () => {
+    // The fleet row for admin says 3 (it cannot exclude the row being graded);
+    // the caller's figure says 2 (it can). The caller's figure is used.
+    const rows = [row('admin', true, 3, 0), row('v0nni', true, 1, 0)];
+    expect(resolveFleetOpenPositionCount(rows, { book: 'admin', openPositionCount: 2 }, WIRED)).toBe(3);
+  });
+
+  it.each([
+    ['wired read returned null (provider threw)', null],
+    ['a null row element', [row('admin', true, 0, 0), null]],
+    ['an unreadable gate', [{ ...row('v0nni', true, 0, 0), liveEntryGateOpen: 'yes' as unknown as boolean }]],
+    ['a non-integer sibling count', [row('v0nni', true, 1.5, 0)]],
+    ['a negative sibling count', [row('v0nni', true, -1, 0)]],
+    ['a NaN sibling count', [row('v0nni', true, Number.NaN, 0)]],
+  ])('fail-closed: %s yields NaN, which the admit refuses as open_positions_unreadable — never "count the books we can see"', (_label, rows) => {
+    const count = resolveFleetOpenPositionCount(
+      rows as readonly FleetOpenPositionCountRow[] | null, { book: 'admin', openPositionCount: 0 }, WIRED,
+    );
+    expect(Number.isNaN(count)).toBe(true);
+    expect(admitOrderThroughHardControls(intent({ openPositionCount: count }), NOW).reasonCode)
+      .toBe('open_positions_unreadable');
+  });
+
+  it('an unreadable SELF count is NaN even with readable siblings', () => {
+    const rows = [row('v0nni', true, 0, 0)];
+    expect(Number.isNaN(
+      resolveFleetOpenPositionCount(rows, { book: 'admin', openPositionCount: Number.NaN }, WIRED),
+    )).toBe(true);
+  });
+
+  it('UNWIRED (a context with no fleet read at all) degrades to the per-book count — the TRA-3879 AC4 never-dark-a-book posture, not a refusal', () => {
+    expect(resolveFleetOpenPositionCount(null, { book: 'admin', openPositionCount: 1 }, UNWIRED)).toBe(1);
   });
 });
 

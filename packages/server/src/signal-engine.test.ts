@@ -8993,9 +8993,10 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         setLiveOtmFleetCapitalProvider(() => [
           // TRA-3897 — flat books (`openPremiumAtRiskUsd: 0`), so the capital
           // basis reduces to cash and every number below is unchanged.
-          { book: 'admin', liveEntryGateOpen: true, availableCashUsd: 1143.96, openPremiumAtRiskUsd: 0 },
-          { book: 'v0nni', liveEntryGateOpen: true, availableCashUsd: 400, openPremiumAtRiskUsd: 0 },
-          { book: 'newcomer', liveEntryGateOpen: true, availableCashUsd: 5000, openPremiumAtRiskUsd: 0 },
+          // TRA-5283 — counts 0: flat fleet, this test grades the dollar bound.
+          { book: 'admin', liveEntryGateOpen: true, availableCashUsd: 1143.96, openPremiumAtRiskUsd: 0, openLiveOptionRows: 0, openEquityPositions: 0 },
+          { book: 'v0nni', liveEntryGateOpen: true, availableCashUsd: 400, openPremiumAtRiskUsd: 0, openLiveOptionRows: 0, openEquityPositions: 0 },
+          { book: 'newcomer', liveEntryGateOpen: true, availableCashUsd: 5000, openPremiumAtRiskUsd: 0, openLiveOptionRows: 0, openEquityPositions: 0 },
         ]);
         const admin = bookWithCash(liveStub(), 1143.96).getLiveOtmAggregateExposure();
         expect(admin.fleetSizingReason).toBe('phi_fleet_derived');
@@ -9044,8 +9045,12 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
           // premium (seeded above), so its declared row says so: `E_admin` is
           // $110 of CAPITAL, not $100 of cash. Declaring 0 here would have the
           // fleet read contradict the book it is reading.
-          { book: 'admin', liveEntryGateOpen: true, availableCashUsd: 100, openPremiumAtRiskUsd: 10 },
-          { book: 'whale', liveEntryGateOpen: true, availableCashUsd: 10_000, openPremiumAtRiskUsd: 0 },
+          // TRA-5283 — admin's declared row says 1 open live row (the $10 of
+          // seeded premium above); whale is flat. The fleet count stays under
+          // the 3-position cap so THIS test's refusal remains attributable to
+          // the aggregate dollar cap alone.
+          { book: 'admin', liveEntryGateOpen: true, availableCashUsd: 100, openPremiumAtRiskUsd: 10, openLiveOptionRows: 1, openEquityPositions: 0 },
+          { book: 'whale', liveEntryGateOpen: true, availableCashUsd: 10_000, openPremiumAtRiskUsd: 0, openLiveOptionRows: 0, openEquityPositions: 0 },
         ]);
         const tightStub = liveStub();
         const tight = bookWithCash(tightStub, 100);
@@ -9059,6 +9064,54 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         expect(tight.getLiveOtmAggregateExposure()).toMatchObject({
           fleetSizingReason: 'phi_fleet_derived', fleetCapitalBooks: 2,
         });
+      } finally {
+        setLiveOtmFleetCapitalProvider(null);
+        if (saved === undefined) delete process.env[VAR];
+        else process.env[VAR] = saved;
+      }
+    });
+
+    // ─── TRA-5283 — the 3-position hard cap counts the FLEET ───────────────
+    // `HARD_MAX_OPEN_POSITIONS = 3` is documented and refused as fleet-wide,
+    // but the count supplied at this seam was per-engine, so with 2 gate-open
+    // books the effective fleet cap was 6. Same discriminator shape as the
+    // TRA-3879 vacuity control above: the book under test is held FIXED — its
+    // cash, its (empty) exposure, φ, the candidate — and only the SIBLING
+    // book's open-row count moves. Both verdicts are asserted, so "blocks
+    // everything" cannot pass as success; and the dollar gates are asserted
+    // unblocked on the refused run, so the refusal cannot be a canary/aggregate
+    // refusal wearing this test's clothes. On the pre-fix build the second run
+    // reaches the broker — the sibling's rows were invisible here.
+    it('TRA-5283 — a SIBLING book\'s open positions refuse THIS book\'s open at the 3-position fleet cap', async () => {
+      const VAR = 'LIVE_OPTION_TEST_FLEET_RISK_FRACTION';
+      const saved = process.env[VAR];
+      try {
+        process.env[VAR] = '1'; // φ = 1 so no dollar gate can be the refuser
+        // CONTROL — fleet read dark (unwired): the per-book degrade, count 0.
+        // The $82 entry is admitted and reaches the broker, proving every
+        // OTHER gate admits this exact configuration.
+        const looseStub = liveStub();
+        const loose = bookWithCash(looseStub, 100);
+        await runOtm(loose, ['AAPL']);
+        expect(looseStub.buyContractsLimit).toHaveBeenCalledTimes(1);
+
+        // TREATMENT — the one knob that moves: v0nni now publishes 3 open
+        // live rows (its premium kept small so ΣE and the reachable bound
+        // still admit on dollars). Fleet count = self 0 + sibling 3 = 3 ≥ cap.
+        setLiveOtmFleetCapitalProvider(() => [
+          { book: 'admin', liveEntryGateOpen: true, availableCashUsd: 100, openPremiumAtRiskUsd: 0, openLiveOptionRows: 0, openEquityPositions: 0 },
+          { book: 'v0nni', liveEntryGateOpen: true, availableCashUsd: 400, openPremiumAtRiskUsd: 50, openLiveOptionRows: 3, openEquityPositions: 0 },
+        ]);
+        const tightStub = liveStub();
+        const tight = bookWithCash(tightStub, 100);
+        await runOtm(tight, ['AAPL']);
+        expect(tightStub.buyContractsLimit).not.toHaveBeenCalled();
+        // The voided paper open is rolled back — no phantom row survives.
+        expect(tight.getState().options.openOptions).toHaveLength(0);
+        // Attribution: the dollar gates saw BOTH runs and blocked NEITHER —
+        // the canary ceiling recorded two admits, so the only refuser between
+        // that record and the broker submit is the hard-controls count.
+        expect(gateOf('canary_ceiling')).toMatchObject({ evaluated: 2, blocked: 0 });
       } finally {
         setLiveOtmFleetCapitalProvider(null);
         if (saved === undefined) delete process.env[VAR];

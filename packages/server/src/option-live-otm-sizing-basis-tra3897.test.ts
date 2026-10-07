@@ -51,6 +51,8 @@ const row = (
   book: string, availableCashUsd: number | null, openPremiumAtRiskUsd: number,
 ): LiveOtmFleetCapitalRow => ({
   book, liveEntryGateOpen: true, availableCashUsd, openPremiumAtRiskUsd,
+  // TRA-5283 — required count fields; this suite grades dollar bases only.
+  openLiveOptionRows: 0, openEquityPositions: 0,
 });
 
 describe('TRA-3897 — E_i is CAPITAL (cash + at-risk), not cash', () => {

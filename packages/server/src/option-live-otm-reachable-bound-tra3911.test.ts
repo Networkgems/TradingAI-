@@ -47,13 +47,17 @@ import {
 const A = 500;
 
 /** The 2026-08-21T00:19:40Z fleet, as `getLiveOtmFleetCapitalRow()` publishes it. */
+// TRA-5283 — the count fields mirror the captured night: admin held 1 open
+// live row ($358 at risk), v0nni was flat, Richard's sandbox rows are behind a
+// closed gate. Nothing in this file grades the position cap; the fields exist
+// because the row shape requires every producer to say (TRA-3897 rule).
 const LIVE_CAPITAL_ROWS: LiveOtmFleetCapitalRow[] = [
-  { book: 'admin', liveEntryGateOpen: true, availableCashUsd: 274.68, openPremiumAtRiskUsd: 358 },
-  { book: 'v0nni', liveEntryGateOpen: true, availableCashUsd: 400, openPremiumAtRiskUsd: 0 },
+  { book: 'admin', liveEntryGateOpen: true, availableCashUsd: 274.68, openPremiumAtRiskUsd: 358, openLiveOptionRows: 1, openEquityPositions: 0 },
+  { book: 'v0nni', liveEntryGateOpen: true, availableCashUsd: 400, openPremiumAtRiskUsd: 0, openLiveOptionRows: 0, openEquityPositions: 0 },
   // Richard is `mode: 'live'` on SANDBOX with no options client — gate CLOSED.
   // Present so every fold below is exercised against the discriminating field
   // rather than against a pre-filtered array (TRA-3445).
-  { book: 'Richard', liveEntryGateOpen: false, availableCashUsd: 9_000, openPremiumAtRiskUsd: 4_000 },
+  { book: 'Richard', liveEntryGateOpen: false, availableCashUsd: 9_000, openPremiumAtRiskUsd: 4_000, openLiveOptionRows: 2, openEquityPositions: 0 },
 ];
 
 /** The same fleet as the GRADE reads it, on bytes that predate the AC1 gate. */
@@ -144,6 +148,7 @@ describe('TRA-3911 AC1 — the order path bounds REACHABLE, not Σ B_i', () => {
         const rows: LiveOtmFleetCapitalRow[] = books.map(x => ({
           book: x.book, liveEntryGateOpen: true, availableCashUsd: x.cash,
           openPremiumAtRiskUsd: x.atRisk,
+          openLiveOptionRows: 0, openEquityPositions: 0, // TRA-5283 — dollar walk only
         }));
         const adm = resolveLiveOtmAdmissibleEntryUsd(
           b.cap, b.atRisk, A,
@@ -207,7 +212,7 @@ describe('TRA-3911 AC1 — the order path bounds REACHABLE, not Σ B_i', () => {
     // Dropping it is the loosening direction: the caller is about to ADD to the
     // very at-risk figure the sum would be missing.
     const rows: LiveOtmFleetCapitalRow[] = [
-      { book: 'v0nni', liveEntryGateOpen: true, availableCashUsd: 400, openPremiumAtRiskUsd: 0 },
+      { book: 'v0nni', liveEntryGateOpen: true, availableCashUsd: 400, openPremiumAtRiskUsd: 0, openLiveOptionRows: 0, openEquityPositions: 0 },
     ];
     const fold = sumLiveOtmFleetAtRiskUsd(rows, { book: 'admin', openPremiumAtRiskUsd: 358 });
     expect(fold.fleetAtRiskUsd).toBe(358);

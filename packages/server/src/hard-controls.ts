@@ -91,12 +91,97 @@ export interface HardControlIntent {
   kind: 'open' | 'close';
   /** Order notional, USD (price × qty × multiplier). Required for opens. */
   notionalUsd: number;
-  /** CURRENT fleet-wide open position count, supplied by the order site. */
+  /**
+   * CURRENT fleet-wide open position count, supplied by the order site.
+   * TRA-5283 — "fleet-wide" is load-bearing: resolve it with
+   * {@link resolveFleetOpenPositionCount} over the cross-engine fleet read,
+   * never from one engine's own book (per-book supply made the effective
+   * fleet cap `3 × gate-open books`). Unreadable (NaN) refuses below.
+   */
   openPositionCount: number;
   /** Epoch-ms timestamp of the quote this order prices against. */
   quoteAsOfMs: number;
   /** Caller-chosen unique key for this order intent; duplicates are refused. */
   idempotencyKey: string;
+}
+
+/**
+ * TRA-5283 — one book's contribution to the FLEET open-position count, as the
+ * cross-engine read (`readLiveOtmFleetCapitalRows`) publishes it. A structural
+ * subset of `LiveOtmFleetCapitalRow`, declared here so this module stays free
+ * of imports from the options seam while the compiler still checks the call
+ * site field-for-field.
+ */
+export interface FleetOpenPositionCountRow {
+  /** `alertUsername`. */
+  book: string | null;
+  /** The population gate — the same predicate `aggregateFleetBound` sums on. */
+  liveEntryGateOpen: boolean;
+  /** Open live option rows on this book. */
+  openLiveOptionRows: number;
+  /** Open equity positions on this book (live mode: the Tradier mirrors). */
+  openEquityPositions: number;
+}
+
+/**
+ * TRA-5283 — resolve the FLEET-WIDE open position count the 3-position hard
+ * cap is labelled with ("3 positions max", fleet-wide): `self`'s own count
+ * plus every OTHER `liveEntryGateOpen` book's open live option rows + equity
+ * positions, off the same cross-engine read `aggregateFleetBound` sums on.
+ *
+ * `self` is counted from the CALLER's own figure, never from its fleet row:
+ * the order site excludes the row being graded (it is already in the book
+ * pre-mirror, TRA-3872) and the fleet row cannot. The self row in `rows` is
+ * matched by `book` and skipped; a self row with a `null` book cannot be
+ * matched and is counted AS WELL — an overcount, i.e. the error lands on the
+ * refusing side, same direction as `sumLiveOtmFleetCapitalUsd`'s self fold.
+ *
+ * FAIL-CLOSED: returns `NaN` — which `admitOrderThroughHardControls` refuses
+ * as `open_positions_unreadable` — whenever the count cannot be proven,
+ * rather than ever counting only the books it can see (the
+ * `canary_ceiling_unreadable` posture, TRA-3827):
+ *   • `self.openPositionCount` not a non-negative integer;
+ *   • the fleet read is WIRED but returned `null` (the provider threw) or a
+ *     row element is null/undefined;
+ *   • a gate-open row's gate or counts are not readable non-negative integers.
+ *
+ * The ONE degrade that is not a refusal: `fleetReadWired === false` with
+ * `rows === null` falls back to `self.openPositionCount` — the per-book bound
+ * in force before this ticket. That is a context with NO fleet (single-engine
+ * tests; production wires the provider once at boot in `index.ts`, so an
+ * order site cannot come into existence unwired there), and darking every
+ * book in it would be the TRA-3879 AC4 failure, not a safety posture.
+ *
+ * ⚠ Gate-CLOSED books are excluded, deliberately: `liveEntryGateOpen` is what
+ * separates a real-money book from a live-MODE book on sandbox creds whose
+ * phantom rows must not tighten the fleet cap (TRA-3445 — three `live` books,
+ * two armed). The cost is that a book disarmed while still holding open live
+ * rows drops out of the count; that book can no longer OPEN (the cap's
+ * subject), and its dollars stay graded by the canary ceiling.
+ */
+export function resolveFleetOpenPositionCount(
+  rows: readonly (FleetOpenPositionCountRow | null | undefined)[] | null | undefined,
+  self: { book: string | null; openPositionCount: number },
+  fleetReadWired: boolean,
+): number {
+  const usableCount = (v: unknown): v is number =>
+    typeof v === 'number' && Number.isInteger(v) && v >= 0;
+  if (!usableCount(self.openPositionCount)) return Number.NaN;
+  if (!Array.isArray(rows)) {
+    return fleetReadWired ? Number.NaN : self.openPositionCount;
+  }
+  let total = self.openPositionCount;
+  for (const row of rows) {
+    if (row === null || row === undefined) return Number.NaN;
+    if (typeof row.liveEntryGateOpen !== 'boolean') return Number.NaN;
+    if (row.book !== null && row.book === self.book) continue; // self counted above
+    if (!row.liveEntryGateOpen) continue;
+    if (!usableCount(row.openLiveOptionRows) || !usableCount(row.openEquityPositions)) {
+      return Number.NaN;
+    }
+    total += row.openLiveOptionRows + row.openEquityPositions;
+  }
+  return total;
 }
 
 interface HardControlsPersisted {

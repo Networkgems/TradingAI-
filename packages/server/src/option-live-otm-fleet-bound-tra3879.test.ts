@@ -77,6 +77,10 @@ function capitalRows(
     // `cash` EXACTLY. Every claim below is therefore preserved verbatim across
     // the basis change; that is the strict-generalization proof, not a re-base.
     openPremiumAtRiskUsd: 0,
+    // TRA-5283 — flat fleet, so the open-position counts are 0 by the same
+    // construction; nothing in this file grades the position cap.
+    openLiveOptionRows: 0,
+    openEquityPositions: 0,
   }));
 }
 
