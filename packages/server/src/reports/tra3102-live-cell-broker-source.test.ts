@@ -23,6 +23,7 @@ import {
   auditLiveCellSource,
   auditStampFromStoredBlock,
   balanceGradeCoverage,
+  summarizeBalanceClassSweep,
   brokerFigureFromHeader,
   classifyCellPnlSource,
   decideLiveCellSourceDisposition,
@@ -790,5 +791,47 @@ describe('TRA-5118 — the verdict is stamped on every graded row, ok included',
     });
     expect(s.status).toBe('engine_close_without_broker_fill');
     expect(s.at).toBe('2026-08-06T15:00:00.000Z');
+  });
+});
+
+describe('TRA-5281 — tradier-balance coverage is printed beside the flag count', () => {
+  const fifo = { status: 'ok', balanceGrade: 'ungraded_fifo_basis' as const };
+
+  it('negative control: an all-fifo population reads graded 0 and is NOT clean', () => {
+    const r = summarizeBalanceClassSweep([fifo, fifo, fifo]);
+    expect(r.coverage?.graded).toBe(0);
+    expect(r.flagged).toBe(0);
+    expect(r.clean).toBe(false);
+    expect(r.line).toContain('0 flagged of 0 graded, 3 ungraded');
+    expect(r.line).toContain('NOT a clean bill');
+  });
+
+  it('prints flagged-of-graded with the ungraded breakdown and keeps unstamped separate', () => {
+    const r = summarizeBalanceClassSweep([
+      { status: 'balance_cell_off_broker_realized', balanceGrade: 'graded' },
+      { status: 'ok', balanceGrade: 'graded' },
+      fifo,
+      { status: 'ok', balanceGrade: 'ungraded_no_broker_figure' },
+      { status: 'ok' },
+    ]);
+    expect(r.coverage).toEqual({
+      total: 5, graded: 2, ungraded_fifo_basis: 1, ungraded_no_broker_figure: 1, unstamped: 1,
+    });
+    expect(r.flagged).toBe(1);
+    expect(r.line).toContain('1 flagged of 2 graded, 2 ungraded');
+    expect(r.line).toContain('1 unstamped');
+  });
+
+  it('is clean only when every cell was graded and none flagged', () => {
+    expect(summarizeBalanceClassSweep([{ status: 'ok', balanceGrade: 'graded' }]).clean).toBe(true);
+    expect(summarizeBalanceClassSweep([]).clean).toBe(false);
+  });
+
+  it('tri-state: an unreadable population is null, never a zero fold', () => {
+    const r = summarizeBalanceClassSweep(null);
+    expect(r.readable).toBe(false);
+    expect(r.coverage).toBeNull();
+    expect(r.flagged).toBeNull();
+    expect(r.clean).toBe(false);
   });
 });

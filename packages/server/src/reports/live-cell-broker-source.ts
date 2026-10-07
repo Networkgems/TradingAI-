@@ -336,6 +336,48 @@ export function balanceGradeCoverage(
   return c;
 }
 
+export interface BalanceClassSweep {
+  /** `false` = the sweep could not read the population. Absent, NEVER zero. */
+  readable: boolean;
+  /** `null` exactly when `readable` is false — never a fabricated all-zero fold. */
+  coverage: ReturnType<typeof balanceGradeCoverage> | null;
+  /** Stamps whose verdict is a flag (anything but `ok` / `not_graded`). `null` when unreadable. */
+  flagged: number | null;
+  /** True only when EVERY cell in a non-empty population was actually graded and none flagged. */
+  clean: boolean;
+  /** The publishable sentence: a flag count is never printed without its denominator. */
+  line: string;
+}
+
+/**
+ * TRA-5281 — fold the served `tradier-balance` stamps into ONE publishable line.
+ * `stamps = null` means the population could not be read (tri-state: absent != 0).
+ * "3 flagged" alone is not a verdict; "3 flagged of 12 graded, 40 ungraded" is.
+ */
+export function summarizeBalanceClassSweep(
+  stamps: ReadonlyArray<{ status?: string; balanceGrade?: BalanceGrade | null }> | null,
+): BalanceClassSweep {
+  if (stamps === null) {
+    return {
+      readable: false,
+      coverage: null,
+      flagged: null,
+      clean: false,
+      line: 'tradier-balance coverage UNREADABLE — the population could not be read; this is not "0 flagged".',
+    };
+  }
+  const coverage = balanceGradeCoverage(stamps);
+  const flagged = stamps.filter(s => s.status !== undefined && s.status !== 'ok' && s.status !== 'not_graded').length;
+  const ungraded = coverage.ungraded_fifo_basis + coverage.ungraded_no_broker_figure;
+  const clean = coverage.total > 0 && coverage.graded === coverage.total && flagged === 0;
+  const line =
+    `${flagged} flagged of ${coverage.graded} graded, ${ungraded} ungraded `
+    + `(${coverage.ungraded_fifo_basis} fifo basis, ${coverage.ungraded_no_broker_figure} no broker figure), `
+    + `${coverage.unstamped} unstamped — ${coverage.total} tradier-balance cells`
+    + (coverage.graded < coverage.total ? ` — NOT a clean bill: ${coverage.total - coverage.graded} never compared to a broker figure.` : '.');
+  return { readable: true, coverage, flagged, clean, line };
+}
+
 /**
  * Grade ONE live-calendar cell on the single question this ticket asks: is the
  * number the grid renders one the broker confirmed?

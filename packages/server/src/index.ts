@@ -493,6 +493,7 @@ import {
   decideLiveCellSourceDisposition,
   notGradedAuditStamp,
   resolveBrokerDayEvidence,
+  summarizeBalanceClassSweep,
 } from './reports/live-cell-broker-source.js';
 import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, consumeLegacyResetToken, recordResetFailure, hashSecretValue, initResetTokenStore, revokeResetTokensFor, MIN_PASSWORD_LENGTH } from './auth.js';
 import {
@@ -15764,6 +15765,35 @@ app.get('/api/reports', requireAuth, async (req, res) => {
 // consumes — `GET /api/reports/desk` → `{ dates: string[] }` (newest-first) and
 // `GET /api/reports/desk/:date` → the per-day `EodReport` cell — so the UI only
 // switches its `reportsPath`, not its rendering.
+// TRA-5281 — the `tradier-balance` grade DENOMINATOR. Reads every stored live
+// cell, serves it through the same audit stamp as the per-date route, and folds
+// the class into total / graded / ungraded-by-reason / unstamped beside the flag
+// count. An unreadable file makes the whole fold UNREADABLE (null), never a
+// smaller-but-clean-looking count. Registered BEFORE `/api/reports/:date`.
+app.get('/api/reports/balance-grade-coverage', requireAuth, requireAdmin, async (req, res) => {
+  const ctx = await userCtx(res);
+  const mode = resolveStockReportMode(req, ctx.username);
+  const stamps: Array<{ status?: string; balanceGrade?: 'graded' | 'ungraded_fifo_basis' | 'ungraded_no_broker_figure' | null }> = [];
+  let readable = true;
+  try {
+    const dir = stockReportsDirFor(ctx, mode);
+    const files = (await readdir(dir)).filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f));
+    for (const f of files) {
+      try {
+        const raw = JSON.parse(await readFile(join(dir, f), 'utf-8')) as EodReport;
+        if (raw.pnlSource !== 'tradier-balance') continue;
+        const served = await stampBrokerSourceAudit(ctx, mode, await stampStaleBalanceAnchorAudit(ctx, mode, raw));
+        stamps.push({ status: served.brokerSourceAudit?.status, balanceGrade: served.brokerSourceAudit?.balanceGrade ?? null });
+      } catch {
+        readable = false;
+      }
+    }
+  } catch {
+    readable = false;
+  }
+  res.json({ mode, ...summarizeBalanceClassSweep(readable ? stamps : null) });
+});
+
 app.get('/api/reports/desk', requireAuth, requireAdmin, async (req, res) => {
   try {
     // TRA-1475 — de-noise: drop QA/test books (`qa*`, `ctoverify*`, `monitor_qa`,
